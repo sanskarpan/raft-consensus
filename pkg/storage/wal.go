@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/raft-consensus/pkg/metrics"
 	"github.com/raft-consensus/pkg/raft"
 	bolt "go.etcd.io/bbolt"
 )
@@ -20,13 +21,23 @@ var (
 	ErrInvalidLogEntry = errors.New("invalid log entry")
 	ErrCorruptLog      = errors.New("corrupt log")
 	ErrNotFound        = errors.New("not found")
+	// ErrMidSegmentCorruption is returned by recovery when a CRC failure in the
+	// last segment is followed by a subsequently valid record. That pattern
+	// indicates genuine mid-file corruption (bit-rot), not a torn tail from a
+	// crash mid-append, so we refuse to open rather than silently truncate and
+	// lose committed entries after the corrupt one (M-R6).
+	ErrMidSegmentCorruption = errors.New("mid-segment WAL corruption detected")
 )
+
+// fsyncDirFn is the directory-fsync used by the WAL durability paths (H-C2). It
+// is a package var so tests can inject a failing/counting implementation to
+// verify that segment create/rotate/delete actually fsync the directory. It
+// defaults to fsyncDir (defined in snapshot.go).
+var fsyncDirFn = fsyncDir
 
 const (
 	segmentFileExt = ".wal"
 	segmentSize    = 64 * 1024 * 1024
-
-	magicNumber = 0x58eb6b0d
 
 	// recordHeaderSize is the fixed header size for each WAL record:
 	//   [0:4]   = CRC32 checksum
@@ -49,8 +60,6 @@ type WAL struct {
 	lastIndex      uint64
 	lastTerm       uint64
 
-	writer *segmentWriter
-
 	// syncCount counts successful fsyncs of the current segment. Used by tests
 	// to assert that Append durably flushes before returning (C1).
 	syncCount atomic.Uint64
@@ -69,15 +78,6 @@ type segment struct {
 	readerOffset int64
 
 	indexes map[uint64]int64
-
-	reader *segmentReader
-}
-
-type segmentWriter struct {
-	mu      sync.Mutex
-	buf     []byte
-	pending []*logRecord
-	crc     uint32
 }
 
 type logRecord struct {
@@ -88,11 +88,8 @@ type logRecord struct {
 }
 
 type segmentReader struct {
-	mu    sync.Mutex
-	file  *os.File
-	buf   []byte
-	pos   int
-	index int
+	file *os.File
+	buf  []byte
 }
 
 type logIndex struct {
@@ -109,7 +106,6 @@ type indexEntry struct {
 	// scanning for the largest baseIndex <= idx (M8).
 	baseIndex uint64
 	offset    int64
-	pos       int
 	length    int
 }
 
@@ -122,7 +118,10 @@ func NewWAL(path string, opts *WALOptions) (*WAL, error) {
 		return nil, err
 	}
 
-	meta, err := bolt.Open(filepath.Join(path, "meta.db"), 0600, nil)
+	// L4: give bolt.Open a timeout so a locked meta.db (e.g. another process
+	// still holding the file lock) fails fast at startup instead of hanging
+	// indefinitely, matching the StableStore open below.
+	meta, err := bolt.Open(filepath.Join(path, "meta.db"), 0600, &bolt.Options{Timeout: time.Second})
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +215,20 @@ func (w *WAL) rebuildIndex(seg *segment, isLast bool) error {
 			// good offset and recover everything before it. On an earlier
 			// segment it indicates genuine corruption we must not silently drop.
 			if isLast {
+				// M-R6: before treating this as a torn tail, probe forward from
+				// just past this offset for any subsequent VALID record. A torn
+				// tail (crash mid-append) has only garbage after the failure
+				// point; a genuinely valid record after the failure means the
+				// bytes at `offset` rotted in place (mid-file corruption) and
+				// truncating here would silently discard committed entries after
+				// it. In that case refuse to open.
+				corrupt, perr := probeForwardHasValidRecord(seg.file, offset)
+				if perr != nil {
+					return perr
+				}
+				if corrupt {
+					return fmt.Errorf("%w: segment %s at offset %d", ErrMidSegmentCorruption, seg.path, offset)
+				}
 				if terr := seg.file.Truncate(offset); terr != nil {
 					return terr
 				}
@@ -234,9 +247,45 @@ func (w *WAL) rebuildIndex(seg *segment, isLast bool) error {
 	return nil
 }
 
+// probeForwardHasValidRecord scans the segment file starting just after
+// failOffset, looking for any byte position at which a well-formed, CRC-valid
+// record begins. It reports true if such a record exists — the signature of
+// genuine mid-file corruption (a valid record survives past the corrupt bytes)
+// rather than a torn tail (only garbage follows a crash mid-append). Used by
+// M-R6 recovery to decide between refusing to open and truncating.
+func probeForwardHasValidRecord(file *os.File, failOffset int64) (bool, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return false, err
+	}
+	size := info.Size()
+
+	// A record needs at least recordHeaderSize bytes; stop once fewer remain.
+	for pos := failOffset + 1; pos+recordHeaderSize <= size; pos++ {
+		// Pass the known file size so a coincidental header with an absurd length
+		// is rejected cheaply (bounded allocation) instead of triggering a giant
+		// make(). A CRC-valid record found here is strong evidence of a real
+		// record surviving past the corruption (genuine mid-file corruption).
+		if _, err := readRecordAtBounded(file, pos, size); err != nil {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
 func (w *WAL) createNewSegment(baseIndex uint64) error {
 	seg, err := createSegment(w.path, baseIndex)
 	if err != nil {
+		return err
+	}
+
+	// H-C2: fsync the WAL directory so the newly-created segment's directory
+	// entry is durable. Append only fsyncs the segment file's data; without a
+	// directory fsync a freshly-created (or freshly-rotated) segment can vanish
+	// on power loss even though its bytes reached the platter, because the
+	// directory entry naming the new file was never persisted.
+	if err := fsyncDirFn(w.path); err != nil {
 		return err
 	}
 
@@ -325,7 +374,9 @@ func (w *WAL) fsyncCurrentLocked() error {
 	}
 	if w.currentSegment != nil {
 		w.currentSegment.mu.Lock()
+		t0 := time.Now()
 		err := w.currentSegment.file.Sync()
+		metrics.RecordWALFsync(time.Since(t0).Seconds())
 		w.currentSegment.mu.Unlock()
 		if err != nil {
 			return err
@@ -357,7 +408,10 @@ func (w *WAL) appendEntry(entry *raft.LogEntry) error {
 		return err
 	}
 
-	n, err := w.currentSegment.file.Write(data)
+	// L6: writeRecordFull surfaces a short write (n < len(data) with no error) as
+	// an error. A silently truncated write would leave a CRC-invalid record on
+	// disk while the in-memory index below records a complete entry.
+	n, err := writeRecordFull(w.currentSegment.file, data)
 	if err != nil {
 		return err
 	}
@@ -374,6 +428,20 @@ func (w *WAL) appendEntry(entry *raft.LogEntry) error {
 	}
 
 	return nil
+}
+
+// writeRecordFull writes data to w and returns an error if the underlying
+// writer reports a short write (n < len(data)) with no error of its own. This
+// prevents a partially-written record from being treated as durable (L6).
+func writeRecordFull(w io.Writer, data []byte) (int, error) {
+	n, err := w.Write(data)
+	if err != nil {
+		return n, err
+	}
+	if n != len(data) {
+		return n, fmt.Errorf("wal: short write: wrote %d of %d bytes", n, len(data))
+	}
+	return n, nil
 }
 
 func (w *WAL) rotateSegment() error {
@@ -430,33 +498,20 @@ func (w *WAL) getEntry(idx uint64) (*raft.LogEntry, error) {
 		return nil, ErrNotFound
 	}
 
-	// Open a fresh read-only file descriptor for this read.
-	// Multiple goroutines call getEntry concurrently (e.g. replicateTo spawns
-	// one goroutine per follower, each holding r.mu.RLock).  Sharing a single
-	// file handle among concurrent readers causes seek-position races that
-	// corrupt reads.  Opening a private fd per call eliminates the problem
-	// without adding extra locking.  w.mu.RLock() is held by the caller so
-	// the segment cannot be deleted while we read it.
+	// H-P2: read the record with a positional ReadAt on the segment's shared
+	// file descriptor instead of opening a fresh fd (os.Open + seek + close) on
+	// every read. getEntry is on the hot path — called many times per commit/
+	// apply cycle and concurrently by per-follower replication goroutines (each
+	// holding w.mu.RLock). ReadAt is safe for concurrent use and takes an
+	// explicit offset, so it needs no seek and introduces no shared read-cursor
+	// race — eliminating the very seek-position race the old per-fd-open code
+	// was working around, without the per-read open/close syscalls. w.mu.RLock
+	// is held by the caller so the segment (and its fd) cannot be closed/deleted
+	// out from under us.
 	seg.mu.RLock()
-	segPath := seg.file.Name()
+	segSize := seg.size
 	seg.mu.RUnlock()
-
-	readFile, err := os.Open(segPath)
-	if err != nil {
-		return nil, err
-	}
-	defer readFile.Close()
-
-	reader, err := newSegmentReader(readFile)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := reader.seek(ientry.offset); err != nil {
-		return nil, err
-	}
-
-	rec, err := reader.nextRecord()
+	rec, err := readRecordAtBounded(seg.file, ientry.offset, segSize)
 	if err != nil {
 		return nil, err
 	}
@@ -466,6 +521,62 @@ func (w *WAL) getEntry(idx uint64) (*raft.LogEntry, error) {
 		Index: rec.index,
 		Type:  raft.EntryType(rec.recordTy),
 		Data:  rec.data,
+	}, nil
+}
+
+// readRecordAtBounded reads and decodes a single WAL record at the given byte
+// offset using positional reads (ReadAt), so it performs no seek and is safe
+// for concurrent callers sharing the same *os.File. It applies the same CRC and
+// length validation as nextRecord. A statSize <= 0 disables the remaining-bytes
+// bound (used when the size is unknown); callers that know the file size pass it
+// so a corrupt/misaligned length field can never drive a huge allocation.
+func readRecordAtBounded(r io.ReaderAt, offset, statSize int64) (*logRecord, error) {
+	header := make([]byte, recordHeaderSize)
+	if _, err := r.ReadAt(header, offset); err != nil {
+		return nil, err
+	}
+
+	storedCRC := binary.BigEndian.Uint32(header[0:4])
+	length := binary.BigEndian.Uint32(header[4:8])
+	recType := header[8]
+	term := binary.BigEndian.Uint64(header[9:17])
+	index := binary.BigEndian.Uint64(header[17:25])
+
+	dataLen := int(length) - 9 // subtract type(1) + term(8)
+	if dataLen < 0 {
+		return nil, ErrCorruptLog
+	}
+
+	// Bound the allocation by the bytes actually remaining after the header so a
+	// corrupt/misaligned length field cannot drive a gigantic make() (allocation
+	// DoS / probe blow-up). Only applied when we know the file size.
+	if statSize > 0 {
+		remaining := statSize - (offset + recordHeaderSize)
+		if int64(dataLen) > remaining {
+			return nil, ErrCorruptLog
+		}
+	}
+
+	data := make([]byte, dataLen)
+	if dataLen > 0 {
+		if _, err := r.ReadAt(data, offset+recordHeaderSize); err != nil {
+			return nil, err
+		}
+	}
+
+	// Verify CRC over header[4:] followed by data.
+	hasher := crc32.NewIEEE()
+	hasher.Write(header[4:])
+	hasher.Write(data)
+	if hasher.Sum32() != storedCRC {
+		return nil, ErrCorruptLog
+	}
+
+	return &logRecord{
+		term:     term,
+		index:    index,
+		data:     data,
+		recordTy: recType,
 	}, nil
 }
 
@@ -589,6 +700,12 @@ func (w *WAL) deleteRangeLocked(min, max uint64) error {
 		if !hasEntries || (lo >= min && hi <= max) {
 			seg.file.Close()
 			if err := os.Remove(seg.path); err != nil {
+				return err
+			}
+			// H-C2: fsync the directory so the segment's removal (a directory
+			// entry change) is durable; otherwise a deleted segment could
+			// reappear after a crash, resurrecting compacted entries.
+			if err := fsyncDirFn(w.path); err != nil {
 				return err
 			}
 
@@ -757,24 +874,24 @@ func (w *WAL) Close() error {
 //	[17:25] index
 //	[25:]   entry data
 func encodeRecord(rec *logRecord) ([]byte, error) {
-	header := make([]byte, recordHeaderSize)
+	// M-P5: allocate a SINGLE result buffer and write the header fields plus the
+	// entry data in place, then compute the CRC directly over result[4:] (the
+	// length/type/term/index header bytes followed by the data). This avoids the
+	// prior 3 allocations (separate header + crcPayload + result) and the double
+	// copy of the entry data.
+	result := make([]byte, recordHeaderSize+len(rec.data))
 
 	dataLen := uint32(len(rec.data))
-	binary.BigEndian.PutUint32(header[4:8], dataLen+9) // 9 = type(1) + term(8)
-	header[8] = rec.recordTy
-	binary.BigEndian.PutUint64(header[9:17], rec.term)
-	binary.BigEndian.PutUint64(header[17:25], rec.index)
-
-	// CRC covers everything from byte 4 onward (header[4:] + data).
-	crcPayload := make([]byte, 0, (recordHeaderSize-4)+len(rec.data))
-	crcPayload = append(crcPayload, header[4:]...)
-	crcPayload = append(crcPayload, rec.data...)
-	crc := crc32.ChecksumIEEE(crcPayload)
-	binary.BigEndian.PutUint32(header[0:4], crc)
-
-	result := make([]byte, recordHeaderSize+len(rec.data))
-	copy(result, header)
+	binary.BigEndian.PutUint32(result[4:8], dataLen+9) // 9 = type(1) + term(8)
+	result[8] = rec.recordTy
+	binary.BigEndian.PutUint64(result[9:17], rec.term)
+	binary.BigEndian.PutUint64(result[17:25], rec.index)
 	copy(result[recordHeaderSize:], rec.data)
+
+	// CRC covers everything from byte 4 onward (result[4:], which is the header
+	// tail plus the data we just copied in place).
+	crc := crc32.ChecksumIEEE(result[4:])
+	binary.BigEndian.PutUint32(result[0:4], crc)
 
 	return result, nil
 }
@@ -859,11 +976,6 @@ func (r *segmentReader) nextRecord() (*logRecord, error) {
 		data:     data,
 		recordTy: recType,
 	}, nil
-}
-
-func (r *segmentReader) seek(offset int64) error {
-	_, err := r.file.Seek(offset, io.SeekStart)
-	return err
 }
 
 // remainingBytes reports how many bytes are left in the file after the current
@@ -982,14 +1094,21 @@ func (s *StableStore) LastIndex() (uint64, error) {
 	return 0, nil
 }
 
+// ErrNotLogStore is returned by StableStore's LogStore methods. StableStore
+// persists only Raft stable state (term/voted-for); it is not a log store.
+// L6: these methods previously returned nil (silent no-ops), so a caller that
+// mistakenly routed log operations here would appear to succeed while writing
+// nothing — a silent data-loss trap. They now fail loudly instead.
+var ErrNotLogStore = errors.New("storage: StableStore is not a log store")
+
 func (s *StableStore) Append(entries []*raft.LogEntry) error {
-	return nil
+	return ErrNotLogStore
 }
 
 func (s *StableStore) GetEntry(idx uint64) (*raft.LogEntry, error) {
-	return nil, nil
+	return nil, ErrNotLogStore
 }
 
 func (s *StableStore) DeleteRange(min, max uint64) error {
-	return nil
+	return ErrNotLogStore
 }

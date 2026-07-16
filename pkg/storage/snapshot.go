@@ -457,12 +457,6 @@ func (s *FileSnapshotStore) Delete(id string) error {
 	return s.deleteLocked(id)
 }
 
-func (s *FileSnapshotStore) prune() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.pruneLocked()
-}
-
 // pruneLocked removes the oldest snapshots to make room for a new one,
 // keeping at most (retainCount - 1) so that after the new snapshot is
 // closed the total stays at retainCount.
@@ -486,9 +480,14 @@ func (s *FileSnapshotStore) deleteLocked(id string) error {
 	if err := os.Remove(snapPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	// Remove sidecar; ignore if missing (legacy snapshot has no sidecar).
+	// Remove sidecar; a missing sidecar is fine (legacy snapshot has none), but
+	// L6: a real removal error (e.g. permissions, I/O) must be surfaced rather
+	// than swallowed, otherwise a stale sidecar could silently outlive its
+	// snapshot and be resurrected by loadSnapshots on restart.
 	sidecarPath := filepath.Join(s.path, snapshotDir, id+snapMetaExt)
-	os.Remove(sidecarPath) //nolint:errcheck
+	if err := os.Remove(sidecarPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 
 	for i, m := range s.snapshots {
 		if m.ID == id {
@@ -507,7 +506,10 @@ type fileSnapshotSink struct {
 	tmpPath string
 	meta    *raft.SnapshotMeta
 	store   *FileSnapshotStore
-	hasher  interface{ Write([]byte) (int, error); Sum32() uint32 }
+	hasher  interface {
+		Write([]byte) (int, error)
+		Sum32() uint32
+	}
 }
 
 type fileSnapshot struct {
