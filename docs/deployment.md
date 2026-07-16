@@ -1,553 +1,246 @@
 # Deployment Guide
 
-This guide covers building, configuring, and deploying the Raft consensus cluster in various environments.
+This guide covers building and deploying a `raftd` cluster as a binary, with
+Docker Compose, and on Kubernetes via the bundled Helm chart. It also covers TLS
+certificate generation, sizing, and upgrade/rollback.
+
+- [Prerequisites](#prerequisites)
+- [Cluster fundamentals](#cluster-fundamentals)
+- [Binary deployment](#binary-deployment)
+- [Docker and Docker Compose](#docker-and-docker-compose)
+- [Kubernetes / Helm](#kubernetes--helm)
+- [TLS certificate generation](#tls-certificate-generation)
+- [Sizing](#sizing)
+- [Upgrades and rollback](#upgrades-and-rollback)
 
 ## Prerequisites
 
-- **Go 1.24+** — required to build from source
-- **Linux or macOS** — the server binary targets both platforms
-- **OpenSSL** — for TLS certificate generation (optional but recommended for production)
-- **Docker** — for containerized deployment
-- **kubectl + Helm 3** — for Kubernetes deployment
+- **Go 1.25+** to build from source (the module pins toolchain `go1.26.5`).
+- **Docker** (with Buildx) for container builds / Compose.
+- **Kubernetes + Helm 3** for the chart.
+- **openssl** for the cert generation script.
 
----
+## Cluster fundamentals
 
-## 1. Building from Source
+- Run an **odd number** of voting nodes (3 or 5) so a majority is well-defined.
+  A 3-node cluster tolerates 1 failure; a 5-node cluster tolerates 2.
+- Every node needs the **same `cluster` list** with matching IDs and addresses.
+- Each node uses two addresses: `listen_addr` (Raft peer RPCs) and `http_addr`
+  (client API). `cluster[].http_address` must be reachable by peers so the leader
+  can be reached for forwarding.
+- Each node stores state under `data_dir/<node_id>/`; this must be durable
+  (a real disk / PVC, not tmpfs).
+- Configure authentication (`admin_token`/`admin_tokens`) before exposing the API;
+  otherwise auth fails closed and every request is rejected.
 
-### Binary build
+## Binary deployment
+
+Build:
 
 ```bash
-git clone https://github.com/your-org/raft-consensus.git
-cd raft-consensus
-
-# Build with version info
-VERSION=v1.0.0
-COMMIT=$(git rev-parse --short HEAD)
-DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-CGO_ENABLED=0 go build \
-  -trimpath \
-  -ldflags="-s -w \
-    -X github.com/raft-consensus/pkg/version.Version=${VERSION} \
-    -X github.com/raft-consensus/pkg/version.GitCommit=${COMMIT} \
-    -X github.com/raft-consensus/pkg/version.BuildDate=${DATE}" \
+go build -o raftd ./cmd/raftd
+go build -o kvctl ./cmd/kvctl
+# with version metadata:
+go build -trimpath \
+  -ldflags="-s -w -X github.com/raft-consensus/pkg/version.Version=v1.0.0" \
   -o raftd ./cmd/raftd
 ```
 
-The resulting `raftd` binary is statically linked with no external dependencies.
-
-### Docker build
-
-The project ships a multi-stage Dockerfile that produces a minimal distroless image:
+Write a config per node (see [configuration.md](configuration.md#example-configurations))
+and start each:
 
 ```bash
-docker build --build-arg VERSION=v1.0.0 -t raftd:v1.0.0 .
+./raftd -config /etc/raftd/node1.yaml
+./raftd -config /etc/raftd/node2.yaml
+./raftd -config /etc/raftd/node3.yaml
 ```
 
-The build stage uses `golang:1.24-alpine` and the runtime stage uses
-`gcr.io/distroless/static-debian12:nonroot`, keeping the final image under 10 MB.
-
-Cross-compile for Linux/amd64 from macOS:
-
-```bash
-GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
-  -o raftd-linux-amd64 ./cmd/raftd
-```
-
----
-
-## 2. Single-Node Deployment (Development)
-
-Single-node mode is useful for local development and integration testing. The
-cluster list in the config must still include the node itself.
-
-```yaml
-# config.yaml
-node_id: node1
-listen_addr: :8080
-http_addr: :8081
-data_dir: ./data
-election_tick: 10
-heartbeat_tick: 1
-cluster:
-  - id: node1
-    address: localhost:8080
-```
-
-Start the server:
-
-```bash
-./raftd -config config.yaml
-```
-
-Verify the node is healthy:
-
-```bash
-curl http://localhost:8081/health
-curl http://localhost:8081/ready
-```
-
-Write and read a value:
-
-```bash
-curl -X PUT http://localhost:8081/kv/hello -d '{"value":"world"}'
-curl http://localhost:8081/kv/hello
-```
-
----
-
-## 3. Three-Node Cluster on Bare Metal
-
-### Configuration
-
-Create three config files — one per node. Example for a cluster on hosts
-`192.168.1.10`, `192.168.1.11`, `192.168.1.12`:
-
-**node1 (`/etc/raftd/config.yaml` on host 192.168.1.10):**
-
-```yaml
-node_id: node1
-listen_addr: :8080
-http_addr: :8081
-data_dir: /var/lib/raftd
-election_tick: 10
-heartbeat_tick: 1
-admin_token: "change-me-in-production"
-cluster:
-  - id: node1
-    address: 192.168.1.10:8080
-  - id: node2
-    address: 192.168.1.11:8080
-  - id: node3
-    address: 192.168.1.12:8080
-```
-
-Repeat for node2 and node3, changing only `node_id` and `listen_addr` as appropriate.
-
-### Systemd service
-
-Place the binary at `/usr/local/bin/raftd` and create the following unit file
-on each host at `/etc/systemd/system/raftd.service`:
+### systemd unit (example)
 
 ```ini
 [Unit]
-Description=Raft Consensus Node
-After=network.target
+Description=raftd
+After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=raftd
-Group=raftd
 ExecStart=/usr/local/bin/raftd -config /etc/raftd/config.yaml
 Restart=on-failure
-RestartSec=5s
+RestartSec=2
+User=raftd
+Group=raftd
+# graceful leadership transfer happens on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=30
 LimitNOFILE=65536
-
-# Restrict permissions
-CapabilityBoundingSet=
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/raftd
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start on each node:
+On `SIGTERM`, a leader transfers leadership before exiting, so give it enough
+`TimeoutStopSec` (the transfer waits up to ~3s, then HTTP/raft shutdown up to ~10s).
+
+## Docker and Docker Compose
+
+### Image
+
+The root `Dockerfile` is a two-stage build producing a distroless, non-root static
+binary:
 
 ```bash
-# Create the raftd user and data directory
-sudo useradd -r -s /bin/false raftd
-sudo mkdir -p /var/lib/raftd
-sudo chown raftd:raftd /var/lib/raftd
-
-# Install and enable the service
-sudo systemctl daemon-reload
-sudo systemctl enable raftd
-sudo systemctl start raftd
-
-# Check status
-sudo systemctl status raftd
-sudo journalctl -u raftd -f
+docker build -t raftd:local .
+# with a version:
+docker build --build-arg VERSION=v1.0.0 -t raftd:v1.0.0 .
 ```
 
-Start the nodes in any order. The cluster will elect a leader automatically once
-a quorum (2 of 3) is reachable.
+The runtime image `ENTRYPOINT` is `/raftd` with default args
+`-config /etc/raftd/config.yaml`; mount your config there.
 
----
-
-## 4. Docker Compose Deployment
-
-For local multi-node testing with Docker Compose, create `docker-compose.yml`:
-
-```yaml
-version: "3.9"
-
-networks:
-  raft:
-    driver: bridge
-
-volumes:
-  data-node1:
-  data-node2:
-  data-node3:
-
-services:
-  node1:
-    image: raftd:latest
-    build:
-      context: .
-    command: ["-config", "/etc/raftd/config.yaml"]
-    ports:
-      - "8081:8081"
-    networks:
-      - raft
-    volumes:
-      - data-node1:/data
-      - ./config-node1.yaml:/etc/raftd/config.yaml:ro
-    environment:
-      - NODE_ID=node1
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  node2:
-    image: raftd:latest
-    command: ["-config", "/etc/raftd/config.yaml"]
-    ports:
-      - "8082:8081"
-    networks:
-      - raft
-    volumes:
-      - data-node2:/data
-      - ./config-node2.yaml:/etc/raftd/config.yaml:ro
-    environment:
-      - NODE_ID=node2
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  node3:
-    image: raftd:latest
-    command: ["-config", "/etc/raftd/config.yaml"]
-    ports:
-      - "8083:8081"
-    networks:
-      - raft
-    volumes:
-      - data-node3:/data
-      - ./config-node3.yaml:/etc/raftd/config.yaml:ro
-    environment:
-      - NODE_ID=node3
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-```
-
-The `config-nodeN.yaml` files are the per-node configs already present at the
-project root. Start the cluster:
+### Compose (3-node local cluster)
 
 ```bash
-# Build the image first
-docker build -t raftd:latest .
-
-# Start all three nodes
-docker-compose up -d
-
-# Tail logs
-docker-compose logs -f
-
-# Stop and clean up volumes
-docker-compose down -v
+docker compose -f scripts/docker/docker-compose.yml up --build
 ```
 
----
+This starts `node1`/`node2`/`node3` on an internal bridge network. The Raft ports
+(8001/8003/8005) are **network-internal only**; only the HTTP API ports are
+published to the host:
 
-## 5. Kubernetes Deployment with Helm
+| Node | HTTP API (host) | Config |
+|------|-----------------|--------|
+| node1 | `localhost:8002` | `scripts/docker/node1.yaml` (`data_dir: /data`) |
+| node2 | `localhost:8004` | `scripts/docker/node2.yaml` |
+| node3 | `localhost:8006` | `scripts/docker/node3.yaml` |
 
-The project ships a Helm chart in `charts/raft/`. It creates:
-
-- A **StatefulSet** with a configurable replica count (default 3)
-- A **headless Service** for stable DNS-based peer discovery
-- A **ClusterIP Service** for client access
-- A **ConfigMap** with the per-node `config.yaml` templated from values
-
-### Prerequisites
+Each node uses a named volume (`nodeN-data`) mounted at `/data`. Verify:
 
 ```bash
-# Ensure kubectl is connected to a cluster
-kubectl cluster-info
-
-# Install Helm 3
-helm version
+curl -s localhost:8002/v1/status | jq .
 ```
 
-### Install the chart
+> The compose configs do not set an admin token and do not set `allow_no_auth`, so
+> auth fails closed. For a working local cluster, add `allow_no_auth: true` (dev) or
+> `admin_token: <token>` to each `scripts/docker/nodeN.yaml`.
+
+## Kubernetes / Helm
+
+The chart in `charts/raft` deploys:
+
+- a **StatefulSet** (`<release>-raft`) with a per-pod PVC (`data`, mounted at
+  `/data`), liveness probe on `/health`, readiness probe on `/ready`;
+- a **ClusterIP Service** (`<release>-raft`) exposing the raft and http ports;
+- a **headless Service** (`<release>-raft-headless`) for stable pod DNS;
+- a **ConfigMap** rendering `config.yaml` with the cluster membership derived from
+  `replicaCount` (member IDs `<release>-raft-0..N`, peer addresses via the headless
+  service).
+
+### Install
 
 ```bash
-# Dry run to verify template rendering
-helm install raft-cluster ./charts/raft --dry-run --debug
-
-# Install with default values (3-node cluster)
-helm install raft-cluster ./charts/raft
-
-# Override replica count or image tag
-helm install raft-cluster ./charts/raft \
-  --set replicaCount=5 \
-  --set image.tag=v1.0.0 \
-  --set config.adminToken=mysecrettoken
+helm install my-raft ./charts/raft \
+  --set replicaCount=3 \
+  --set image.repository=<registry>/raftd \
+  --set image.tag=1.0.0 \
+  --set config.adminToken=$(openssl rand -hex 32)
 ```
 
-### Watch the rollout
+### Configurable values (defaults)
+
+| Value | Default |
+|-------|---------|
+| `replicaCount` | `3` |
+| `image.repository` | `raftd` |
+| `image.tag` | `0.1.0` |
+| `image.pullPolicy` | `IfNotPresent` |
+| `service.type` | `ClusterIP` |
+| `service.raftPort` | `8080` |
+| `service.httpPort` | `8081` |
+| `resources.requests` | `100m` CPU / `128Mi` |
+| `resources.limits` | `500m` CPU / `512Mi` |
+| `persistence.size` | `10Gi` |
+| `persistence.storageClass` | `""` (cluster default) |
+| `config.electionTick` | `10` |
+| `config.heartbeatTick` | `1` |
+| `config.adminToken` | `""` |
+
+Notes and caveats when running the chart:
+
+- The chart mounts the ConfigMap and pushes an `admin_token` when
+  `config.adminToken` is set. **Set it** — otherwise auth fails closed.
+- `config.yaml` uses `node_id: "${HOSTNAME}"` while the generated cluster member IDs
+  are `<release>-raft-<ordinal>`. For the node ID to match the membership, the pod
+  hostname must equal the StatefulSet pod name (the default) — verify pod names
+  match member IDs before relying on this in production, and adjust the ConfigMap if
+  your environment differs.
+- `persistence.enabled` exists in `values.yaml` but the StatefulSet always creates
+  the `volumeClaimTemplate`; storage is not conditional.
+- The chart does not currently wire TLS/mTLS or advanced config keys; for those,
+  supply your own ConfigMap or extend the chart.
+
+### Scaling
+
+Do **not** simply change `replicaCount` and upgrade to grow the voting set — the
+initial `cluster` list is fixed at bootstrap and new voters must be added through
+the membership API so quorum is preserved. See
+[operations.md](operations.md#scaling-membership).
+
+## TLS certificate generation
+
+`scripts/certs/generate.sh` produces a self-signed CA and server/client
+certificates for development into `scripts/certs/generated/` (created `0700`; keys
+written `0600`):
 
 ```bash
-kubectl rollout status statefulset/raft-cluster-raft
-kubectl get pods -l app=raft-cluster-raft -w
+./scripts/certs/generate.sh
 ```
 
-### Access the cluster
+Outputs:
 
-```bash
-# Port-forward the HTTP API of the leader
-kubectl port-forward svc/raft-cluster-raft 8081:8081
+| File | Purpose |
+|------|---------|
+| `ca.crt` | CA certificate (`tls_ca`). |
+| `server.crt` / `server.key` | Node cert/key (`tls_cert` / `tls_key`, and `https_cert`/`https_key`). |
+| `client.crt` / `client.key` | Client cert/key for mTLS. |
 
-# Check health
-curl http://localhost:8081/health
-```
+The server certificate carries SANs `DNS:localhost, DNS:*.raft.local, IP:127.0.0.1`.
+For production, issue certificates from your own CA/PKI with SANs matching each
+node's real hostnames/IPs, and reference them via the TLS config keys. Enable
+`require_tls: true` so plaintext peer connections are refused.
 
-### Uninstall
+## Sizing
 
-```bash
-helm uninstall raft-cluster
+Starting points — adjust to your workload and measure (see [tuning.md](tuning.md)):
 
-# PVCs are not deleted automatically; remove them explicitly if needed
-kubectl delete pvc -l app=raft-cluster-raft
-```
+| Profile | CPU | Memory | Disk |
+|---------|-----|--------|------|
+| Dev / small | 100m–500m | 128–512 Mi | 10 Gi SSD |
+| Production (moderate) | 1–2 cores | 1–2 Gi | 50–100 Gi NVMe SSD |
+| High write throughput | 2–4 cores | 2–4 Gi | Fast NVMe (fsync latency dominates) |
 
----
+- Write latency is bounded by **fsync latency** on the WAL plus one network round
+  trip to a quorum. Fast, low-latency disks matter most.
+- Memory scales with the working set held in the KV FSM (in-memory map) plus
+  in-flight replication and watch buffers.
+- The KV FSM keeps all keys/values in memory; size RAM for the full dataset plus
+  headroom for snapshots.
 
-## 6. Configuration Reference
+## Upgrades and rollback
 
-All fields are in `config.yaml` (YAML format).
+The Raft wire protocol, WAL, and snapshot formats are stable across compatible
+releases (see [versioning.md](versioning.md)). Perform a **rolling upgrade**, one
+node at a time:
 
-| Field            | Type     | Default    | Description                                                      |
-|------------------|----------|------------|------------------------------------------------------------------|
-| `node_id`        | string   | (required) | Unique identifier for this node within the cluster               |
-| `listen_addr`    | string   | `:8080`    | TCP address for Raft peer-to-peer communication                  |
-| `http_addr`      | string   | `:8081`    | TCP address for the admin HTTP API                               |
-| `data_dir`       | string   | `./data`   | Directory for WAL segments, stable store, and snapshot files     |
-| `election_tick`  | int      | `10`       | Number of heartbeat intervals before triggering a new election   |
-| `heartbeat_tick` | int      | `1`        | Interval (in ticks) at which the leader sends heartbeats         |
-| `admin_token`    | string   | `""`       | Bearer token required for admin API endpoints; empty = disabled  |
-| `cluster`        | list     | (required) | List of all cluster members (id + address); must include self    |
-| `cluster[].id`   | string   | (required) | Node ID matching the `node_id` of the corresponding node         |
-| `cluster[].address` | string | (required) | Host:port for Raft peer communication                           |
-| `tls.cert_file`  | string   | `""`       | Path to TLS certificate file (enables TLS when set)              |
-| `tls.key_file`   | string   | `""`       | Path to TLS private key file                                     |
-| `tls.ca_file`    | string   | `""`       | Path to CA certificate for mTLS client verification              |
-| `otlp_endpoint`  | string   | `""`       | OTLP gRPC endpoint for distributed traces (e.g. `localhost:4317`)|
+1. Snapshot for a clean backup point: `curl -X POST .../admin/snapshot`.
+2. Upgrade a **follower** first. Drain it with `SIGTERM` (graceful shutdown), swap
+   the binary/image, restart, and wait for `/ready` = 200 and its replication lag to
+   return to ~0 (`raft_replication_lag` ≈ 0).
+3. Repeat for each remaining follower.
+4. Upgrade the **leader last**. `SIGTERM` triggers a graceful leadership transfer;
+   confirm a new leader before proceeding.
 
----
-
-## 7. TLS / mTLS Setup
-
-TLS certificates are generated using the script at `scripts/certs/generate.sh`.
-The script creates a CA, server certificate, and client certificate for mTLS.
-
-```bash
-# Generate all certificates
-bash scripts/certs/generate.sh
-
-# Output is written to scripts/certs/generated/:
-#   ca.crt     - CA certificate (distribute to all nodes and clients)
-#   server.key - Server private key (keep secret)
-#   server.crt - Server certificate
-#   client.key - Client private key
-#   client.crt - Client certificate (for mTLS)
-```
-
-Add TLS configuration to each node's config:
-
-```yaml
-tls:
-  cert_file: /etc/raftd/certs/server.crt
-  key_file:  /etc/raftd/certs/server.key
-  ca_file:   /etc/raftd/certs/ca.crt    # enables mTLS client verification
-```
-
-For Kubernetes, store certs in a Secret and mount them:
-
-```bash
-kubectl create secret generic raftd-tls \
-  --from-file=ca.crt=scripts/certs/generated/ca.crt \
-  --from-file=server.crt=scripts/certs/generated/server.crt \
-  --from-file=server.key=scripts/certs/generated/server.key
-```
-
-Add a `volumeMount` for the secret in your Helm `values.yaml` override or patch the StatefulSet.
-
----
-
-## 8. Monitoring Setup
-
-### Prometheus scrape configuration
-
-The HTTP API exposes Prometheus metrics at `/metrics` on the `http_addr` port.
-Add the following to your `prometheus.yml`:
-
-```yaml
-scrape_configs:
-  - job_name: 'raftd'
-    static_configs:
-      - targets:
-          - 'node1:8081'
-          - 'node2:8081'
-          - 'node3:8081'
-    metrics_path: /metrics
-    scrape_interval: 15s
-```
-
-For Kubernetes, use a `ServiceMonitor` (requires Prometheus Operator):
-
-```yaml
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
-metadata:
-  name: raftd
-spec:
-  selector:
-    matchLabels:
-      app: raft-cluster-raft
-  endpoints:
-    - port: http
-      path: /metrics
-      interval: 15s
-```
-
-### Key metrics
-
-| Metric                          | Type    | Description                                  |
-|---------------------------------|---------|----------------------------------------------|
-| `raft_leader_changes_total`     | counter | Number of leader elections completed         |
-| `raft_commit_index`             | gauge   | Current commit index                         |
-| `raft_applied_index`            | gauge   | Last FSM-applied log index                   |
-| `raft_log_entries_total`        | counter | Total log entries appended                   |
-| `raft_snapshot_total`           | counter | Number of snapshots taken                    |
-| `raft_rpc_duration_seconds`     | hist.   | Latency of AppendEntries / RequestVote RPCs  |
-
-### Grafana dashboard
-
-Import the dashboard by creating a panel with the following example queries:
-
-```
-# Leader changes rate
-rate(raft_leader_changes_total[5m])
-
-# Commit lag (commit index - applied index) per node
-raft_commit_index - raft_applied_index
-
-# RPC p99 latency
-histogram_quantile(0.99, rate(raft_rpc_duration_seconds_bucket[5m]))
-```
-
----
-
-## 9. Upgrade Procedures (Rolling Upgrade)
-
-The rolling upgrade procedure ensures no downtime for a 3-node (or larger) cluster.
-
-1. **Build and publish the new binary / image** for the target version.
-
-2. **Upgrade follower nodes first.** For a 3-node cluster, upgrade nodes 2 and 3
-   (whichever are followers) before the leader:
-
-   ```bash
-   # Bare metal: deploy new binary, restart service
-   sudo cp raftd-new /usr/local/bin/raftd
-   sudo systemctl restart raftd
-
-   # Kubernetes StatefulSet: update image, Kubernetes will restart pods one at a time
-   kubectl set image statefulset/raft-cluster-raft raftd=raftd:v1.1.0
-   kubectl rollout status statefulset/raft-cluster-raft
-   ```
-
-3. **Trigger a leadership transfer** before upgrading the current leader node
-   to minimize client disruption:
-
-   ```bash
-   curl -X POST http://leader:8081/admin/transfer-leader \
-     -H "Authorization: Bearer $ADMIN_TOKEN"
-   ```
-
-4. **Upgrade the (former) leader node** using the same steps as step 2.
-
-5. **Verify cluster health** after all nodes are upgraded:
-
-   ```bash
-   curl http://node1:8081/health
-   curl http://node1:8081/v1/cluster/status
-   ```
-
-For Kubernetes StatefulSets the `RollingUpdate` strategy is used by default,
-which restarts pods in reverse ordinal order (highest pod number first), which
-naturally upgrades followers before the pod-0 leader in most cases.
-
----
-
-## 10. Backup and Snapshot Procedures
-
-### Automatic snapshots
-
-The Raft node takes snapshots automatically when the log grows beyond a
-configurable threshold (default: 8192 entries since the last snapshot). Snapshot
-files are stored under `<data_dir>/snapshots/`.
-
-### Manual snapshot trigger
-
-Trigger a snapshot via the admin API:
-
-```bash
-curl -X POST http://node1:8081/admin/snapshot \
-  -H "Authorization: Bearer $ADMIN_TOKEN"
-```
-
-### Backup
-
-To back up a node's data directory:
-
-```bash
-# Stop the node, copy, restart (safest method)
-sudo systemctl stop raftd
-sudo tar -czf raftd-backup-$(date +%Y%m%d).tar.gz /var/lib/raftd
-sudo systemctl start raftd
-```
-
-For online backup, copy only the snapshot directory (WAL segments are not
-sufficient alone because they may reference snapshot state):
-
-```bash
-# Copy latest snapshot (while node is running)
-SNAPSHOT_DIR=/var/lib/raftd/snapshots
-LATEST=$(ls -1t "$SNAPSHOT_DIR" | head -1)
-cp -r "$SNAPSHOT_DIR/$LATEST" /backup/raft-snapshot-$(date +%Y%m%d)/
-```
-
-### Restore from snapshot
-
-1. Stop the node.
-2. Clear the data directory: `rm -rf /var/lib/raftd/*`
-3. Place the snapshot directory into `<data_dir>/snapshots/`.
-4. Start the node. The Raft state machine will load the snapshot on startup.
-
-For a full cluster restore from backup:
-1. Restore the snapshot on all nodes (or a majority).
-2. Start all nodes simultaneously.
-3. The cluster will replay any WAL entries after the snapshot index.
+**Rollback**: reverse the process. Because the on-disk formats are backward
+compatible within a major version, a rolled-back binary reads the existing WAL and
+snapshots. Never mix incompatible major versions in one cluster. Keep a snapshot
+from before the upgrade as a restore point (see
+[operations.md](operations.md#backup--restore)).

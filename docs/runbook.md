@@ -2,6 +2,11 @@
 
 This runbook covers day-to-day operations of a `raftd` cluster.
 
+> **See also:** [operations.md](operations.md) is the canonical operations reference
+> — it documents the full metric catalog (with exact `/metrics` names), example
+> Prometheus queries, suggested alerts, failure remediation, backup/restore, and
+> membership scaling. This file retains cluster-bring-up procedures.
+
 ---
 
 ## Starting a 3-Node Cluster
