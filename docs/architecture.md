@@ -1,427 +1,428 @@
 # Architecture
 
-This document describes the design and internal structure of the Go-based Raft consensus implementation at `github.com/raft-consensus`.
+This document is a technical deep dive into how `raftd` is built and how the Raft
+algorithm is actually implemented in this codebase. It reflects the code, not an
+idealized description.
 
-## Overview
+- [Component overview](#component-overview)
+- [The Raft core](#the-raft-core)
+  - [Ticks, timers, and the run loop](#ticks-timers-and-the-run-loop)
+  - [Leader election and pre-vote](#leader-election-and-pre-vote)
+  - [Log replication](#log-replication)
+  - [Commit advancement](#commit-advancement)
+  - [Apply and group commit](#apply-and-group-commit)
+  - [Linearizable reads (ReadIndex)](#linearizable-reads-readindex)
+  - [Snapshots and compaction](#snapshots-and-compaction)
+  - [Joint-consensus membership](#joint-consensus-membership)
+- [The KV state machine (FSM)](#the-kv-state-machine-fsm)
+- [Watches](#watches)
+- [Transport](#transport)
+- [The HTTP server](#the-http-server)
+- [The Go client](#the-go-client)
+- [Data flow: a write](#data-flow-a-write)
+- [Data flow: a linearizable read](#data-flow-a-linearizable-read)
+- [On-disk formats](#on-disk-formats)
 
-The implementation provides a production-quality Raft consensus engine with:
-
-- Full leader election with pre-vote support
-- Log replication with per-follower progress tracking
-- Snapshotting via a pluggable FSM snapshot interface
-- Joint-consensus membership changes
-- A TCP transport (primary) and a gRPC transport (alternative)
-- A built-in in-memory KV store FSM for demonstration
-- Prometheus metrics exposure via the HTTP server
-
-The entry point for embedding the engine is `raft.NewRaft(...)`, which returns a `raft.Raft` interface. The server binary (`cmd/raftd`) wraps this interface behind an HTTP API.
-
----
-
-## Module Structure
-
-```
-github.com/raft-consensus
-├── cmd/raftd/           Server binary: HTTP API, config loading, signal handling
-├── pkg/raft/            Core Raft state machine
-│   ├── raft.go          State machine implementation
-│   ├── types.go         Public types, interfaces (Raft, FSM, LogStore, …)
-│   ├── joint.go         Joint-consensus configuration types and helpers
-│   └── snapshot.go      Snapshot restore helpers
-├── pkg/storage/         Persistence layer
-│   ├── wal.go           Write-Ahead Log (segment files, CRC32, index)
-│   └── wal.go (cont.)   StableStore (bbolt), FileSnapshotStore
-├── pkg/transport/       Network transports
-│   ├── tcp.go           JSON-over-TCP transport
-│   └── grpc.go          gRPC transport
-├── pkg/fsm/             Finite state machine implementations
-│   └── kv.go            In-memory key-value store
-├── pkg/metrics/         Prometheus metrics registration
-│   └── raft.go          Gauge, counter, histogram definitions
-├── pkg/client/          HTTP client library for cluster interaction
-│   └── client.go
-├── pkg/tracing/         OpenTelemetry tracing helpers
-├── proto/               gRPC protobuf definitions
-├── tools/testharness/   Process-based integration test harness
-├── charts/              Helm chart for Kubernetes deployment
-├── scripts/certs/       TLS certificate generation
-│   └── generate.sh
-└── docs/                Architecture and operations documentation
-```
-
----
-
-## Core State Machine (`pkg/raft/`)
-
-### States and Transitions
-
-The state machine (`raft` struct in `raft.go`) cycles through five states:
-
-| State         | Description                                              |
-|---------------|----------------------------------------------------------|
-| `StateFollower`   | Default; receives heartbeats and log entries from leader |
-| `StateCandidate`  | Starts elections after election timeout expires          |
-| `StateLeader`     | Sends heartbeats, accepts client proposals               |
-| `StateLearner`    | Non-voting member; receives log replication only         |
-| `StateShutdown`   | Terminal state after `Shutdown()` is called              |
-
-Transitions:
+## Component overview
 
 ```
-Follower   --election timeout--> Candidate
-Candidate  --quorum votes--> Leader
-Candidate  --sees higher term or leader--> Follower
-Leader     --sees higher term--> Follower
-Any        --Shutdown()--> Shutdown
+cmd/raftd            Server binary: config, HTTP API, wires everything together
+cmd/kvctl            CLI client
+
+pkg/raft             Core consensus state machine (raft.go, joint.go, types.go)
+pkg/storage          WAL + BoltDB stable store (wal.go), snapshots (snapshot.go)
+pkg/fsm              KV state machine (kv.go), transactions (txn.go), watches (watch.go)
+pkg/transport        JSON-over-TCP transport (tcp.go), gRPC transport (grpc.go)
+pkg/client           Go client library
+pkg/metrics          Prometheus metric registration
+pkg/tracing          OpenTelemetry (OTLP) providers and spans
+pkg/version          Build-time version metadata
+proto                gRPC service definitions (RaftService, RaftAdmin)
+ui                   React/Vite admin dashboard
+charts/raft          Helm chart
 ```
 
-### Key Fields on the `raft` struct
-
-```go
-type raft struct {
-    localID     ServerID
-    state       RaftState
-    term        uint64
-    votedFor    ServerID
-
-    log         LogStore       // WAL-backed log
-    stable      StableStore    // bbolt-backed durable KV
-    snapshot    SnapshotStore  // file-based snapshot store
-    fsm         FSM            // pluggable state machine
-
-    lastIndex   uint64         // last appended log index
-    commitIndex uint64         // highest committed index
-    applyIndex  uint64         // highest index applied to FSM
-
-    nextIndex   map[ServerID]uint64  // per-follower: next index to send
-    matchIndex  map[ServerID]uint64  // per-follower: highest known replicated index
-
-    pendingFutures map[uint64]*ApplyFuture  // index -> waiting client future
-    proposalCh     chan proposalFuture       // client proposals enter via this channel
-    electionTicks  int                       // ticks until election timeout
-}
-```
-
-### Timers
-
-A single `time.Ticker` drives all timer logic inside the `run()` goroutine. The tick interval defaults to the heartbeat period. Timer behaviour per state:
-
-- **Follower/Candidate**: `electionTicks` decrements on each tick. When it reaches zero an election starts. The value is randomised (`electionTick + rand(electionTick)`) to prevent split votes.
-- **Leader**: sends heartbeats (AppendEntries with empty entries) to all followers on every heartbeat tick.
-
-### Proposal Pipeline
-
-Client commands flow through `proposalCh`:
-
-1. `Apply(ctx, data)` creates an `ApplyFuture` and sends a `proposalFuture` to `proposalCh`.
-2. The `run()` goroutine's `handleProposal()` appends the entry to the log and persists it to the WAL.
-3. The leader replicates the entry via `sendAppendEntries()` to all followers.
-4. `advanceCommitIndex()` counts `matchIndex` values to find the highest index replicated to a quorum; `commitIndex` is updated accordingly.
-5. `applyCommitted()` applies entries from `applyIndex+1` to `commitIndex` to the FSM. Each applied entry resolves the corresponding `ApplyFuture`.
-
-### Commit Advancement
-
-The leader maintains `nextIndex[id]` and `matchIndex[id]` for each peer. After receiving a successful `AppendEntriesResponse`, `matchIndex[id]` is updated and `advanceCommitIndex()` finds the median of all `matchIndex` values (including the leader's own `lastIndex`). A new commit index is accepted only when it corresponds to an entry in the current term (Raft's log-matching safety guarantee).
-
-### Election Protocol
-
-Pre-vote is supported. When `inPreVote` is true the candidate sends `RequestVote` RPCs with `PreVote=true`; it only increments its term and persists `votedFor` once it has gathered a pre-vote quorum. This prevents disruptions from a partitioned node with an inflated term.
-
----
-
-## Write-Ahead Log (`pkg/storage/wal.go`)
-
-### Segment Files
-
-The WAL is stored as a directory of segment files (`*.wal`). Each segment holds up to 64 MiB of records. When a segment fills, a new one is created with a higher base index. Only the current segment is written; all segments can be read.
-
-Segment files are named by the base log index they start at (e.g., `00000000000000000001.wal`).
-
-### Record Layout
-
-Each WAL record has a fixed 25-byte header followed by a variable-length payload:
-
-```
-Offset  Size  Field
-0       4     CRC32 checksum (covers bytes [4:end])
-4       4     payload length (entryDataLen + 9)
-8       1     entry type (0=normal, 1=config, 2=snapshot)
-9       8     term (big-endian uint64)
-17      8     index (big-endian uint64)
-25      N     entry data bytes
-```
-
-The constant `recordHeaderSize = 25` defines this layout. CRC32 uses the Castagnoli polynomial.
-
-### In-Memory Index
-
-`WAL` maintains a `logIndex` structure mapping each log index to its byte offset within its segment file. The index is rebuilt on restart by scanning all segment files using `file.Seek(0, io.SeekCurrent)` before each `nextRecord()` call to record the actual offset.
-
-This allows O(1) random reads: `getEntry(idx)` looks up the segment and offset in the index, seeks to that offset, and reads the record.
-
-### Compaction
-
-`Compact(index)` truncates the WAL by deleting all segments whose entries are fully below `index`. It uses internal `firstIndexLocked()` and `deleteRangeLocked()` helpers to avoid deadlocking on the WAL mutex.
-
----
-
-## Storage Layer (`pkg/storage/`)
-
-### StableStore (bbolt)
-
-`StableStore` wraps a [bbolt](https://github.com/etcd-io/bbolt) database (`stable.db`). It stores durable Raft metadata:
-
-| Key                    | Value                              |
-|------------------------|------------------------------------|
-| `raft_term`            | Current term (uint64, big-endian)  |
-| `raft_voted_for`       | Voted-for server ID (string)       |
-| `raft_last_snapshot`   | Last snapshot ID (string)          |
-| `raft_last_index`      | Last log index (uint64)            |
-| `raft_config`          | Serialised cluster configuration   |
-
-All writes use `bolt.DB.Update()` (serialisable transactions). Reads use `bolt.DB.View()`.
-
-### FileSnapshotStore
-
-`FileSnapshotStore` stores snapshots as files under the data directory. Each snapshot is a directory named by its ID (a combination of index and term). The store retains up to N snapshots (default 2) and automatically prunes older ones.
-
-Snapshot creation:
-1. `Create()` returns a `SnapshotSink` wrapping a temporary file.
-2. The FSM's `Snapshot()` method writes its serialised state to the sink.
-3. `Close()` on the sink renames the temporary file to the final snapshot path and triggers pruning via `pruneLocked()`.
-
-Snapshot restoration:
-1. `restoreSnapshotData()` writes incoming snapshot bytes to a new snapshot store entry.
-2. `fsm.Restore()` is called with a reader over the snapshot file.
-
----
-
-## Transport Layer (`pkg/transport/`)
-
-### TCP Transport (`tcp.go`)
-
-The primary transport. It establishes persistent TCP connections to peers and encodes Raft RPCs as newline-delimited JSON messages.
-
-Each message has an envelope:
-
-```json
-{"type": "AppendEntries", "payload": {...}}
-```
-
-Supported message types: `AppendEntries`, `RequestVote`, `InstallSnapshot`, `TimeoutNow`.
-
-The `TCPTransport` uses a `Handler` interface:
-
-```go
-type Handler interface {
-    HandleAppendEntries(req *AppendEntriesReq) *AppendEntriesResp
-    HandleRequestVote(req *RequestVoteReq) *RequestVoteResp
-    HandleInstallSnapshot(req *InstallSnapshotReq) *InstallSnapshotResp
-    HandleTimeoutNow(req *TimeoutNowReq) *TimeoutNowResp
-}
-```
-
-In `cmd/raftd`, a `raftHandlerWrapper` bridges from `transport.Handler` to the `raft.Raft` internal RPC handlers. The wrapper is created before the raft node, then wired in after (`wrapper.raftNode = raftNode`) to break the circular dependency.
-
-Peers are registered with `AddPeer(id, address)`. The transport dials on demand and reconnects on failure.
-
-### gRPC Transport (`grpc.go`)
-
-An alternative transport that uses the protobuf definitions in `proto/`. It implements the same `raft.Transport` interface. It can be used as a drop-in replacement for the TCP transport when tighter schema control or streaming is required.
-
----
-
-## FSM Interface and KV Store (`pkg/fsm/`)
-
-### FSM Interface
-
-```go
-type FSM interface {
-    Apply(entry []byte) (result []byte, err error)
-    Snapshot() (Snapshot, error)
-    Restore(reader io.Reader) error
-}
-```
-
-`Apply` receives the raw bytes of a committed log entry and returns a result to the waiting client. `Snapshot` serialises the current state. `Restore` replaces the current state from a reader.
-
-### KVStore Implementation
-
-`KVStore` is an in-memory `map[string]string` protected by a `sync.RWMutex`.
-
-Commands are JSON-encoded `kvCommand` structs:
-
-```json
-{"op": "set",    "key": "foo", "value": "bar"}
-{"op": "get",    "key": "foo"}
-{"op": "delete", "key": "foo"}
-{"op": "list"}
-```
-
-Helper functions (`EncodeSet`, `EncodeGet`, `EncodeDelete`) are provided for clients.
-
-Snapshot serialisation uses `json.Marshal(k.data)`. Restore uses `json.Unmarshal`.
-
----
-
-## Metrics and Observability (`pkg/metrics/`)
-
-Prometheus metrics are registered via `promauto` (auto-registered with the default registry):
-
-| Metric                                    | Type      | Description                              |
-|-------------------------------------------|-----------|------------------------------------------|
-| `raft_term`                               | Gauge     | Current Raft term                        |
-| `raft_commit_index`                       | Gauge     | Last committed log index                 |
-| `raft_applied_index`                      | Gauge     | Last applied log index                   |
-| `raft_leader_id`                          | Gauge     | 1 if node has a known leader             |
-| `raft_elections_total`                    | Counter   | Total election rounds started            |
-| `raft_votes_granted_total`                | Counter   | Total votes granted                      |
-| `raft_append_entries_sent_total`          | CounterVec| AppendEntries RPCs sent, labelled by target and success |
-| `raft_append_entries_latency_seconds`     | HistogramVec | AppendEntries RPC latency             |
-| `raft_request_vote_latency_seconds`       | Histogram | RequestVote RPC latency                  |
-
-Metrics are exposed at `GET /metrics` by the HTTP server using the standard Prometheus handler (`promhttp.Handler()`).
-
----
-
-## Configuration and Membership Changes
-
-### Server Configuration (`cmd/raftd/`)
-
-The server is configured via a YAML file (default `raftd.yaml`). Key fields:
-
-```yaml
-node_id:        node1
-listen_addr:    :8080        # TCP transport address
-http_addr:      :8081        # HTTP API address
-data_dir:       ./data
-election_tick:  10
-heartbeat_tick: 1
-admin_token:    ""           # if non-empty, /admin/* requires Bearer token
-cluster:
-  - id: node1
-    address: localhost:8080
-  - id: node2
-    address: localhost:8082
-  - id: node3
-    address: localhost:8084
-```
-
-### Raft Configuration (`pkg/raft/types.go`)
-
-```go
-type Config struct {
-    LocalID           ServerID
-    ElectionTick      int           // default 10
-    HeartbeatTick     int           // default 1
-    MaxSizePerMsg     uint64        // default max int64
-    MaxInflight       int           // default 256
-    SnapshotInterval  time.Duration // default 120s
-    SnapshotThreshold uint64
-    TrailingLogs      uint64
-    PreVote           bool
-    InitialConfiguration Configuration
-}
-```
-
-Defaults are applied inside `newRaft()` before `Config.Validate()` is called, so zero values are safe.
-
-### Membership Changes (Joint Consensus)
-
-The implementation uses the two-phase joint-consensus protocol from the Raft paper:
-
-1. **Phase 1 — Joint entry**: A `ChangeJoint` configuration entry is appended. While this entry is uncommitted, quorum requires agreement from both the old and new configuration.
-2. **Phase 2 — Commit entry**: Once the joint entry is committed, a `ChangeCommitJoint` entry is automatically appended by the leader. When this commits, the new configuration takes effect and the old one is discarded.
-
-`JointConfiguration` holds both `OldConfig` and `NewConfig`. Its `QuorumSize()` returns the maximum quorum required by either configuration.
-
-Supported operations (all via the `Raft` interface):
-- `AddLearner(ctx, id, addr)` — add a non-voting learner
-- `PromoteLearner(ctx, id)` — promote learner to voter (checks it is caught up within `TrailingLogs`)
-- `RemoveServer(ctx, id)` — remove a server via joint consensus
-- `Demote(ctx, id)` — demote a voter to learner
-
----
-
-## Client Library (`pkg/client/`)
-
-`client.Client` provides a Go API for interacting with a cluster over HTTP. It supports leader tracking with an optional lease cache to avoid redundant `/admin/cluster` queries.
-
-Key methods:
-
-```go
-c := client.NewClient(
-    client.WithAddresses([]string{"localhost:8081", "localhost:8083", "localhost:8085"}),
-    client.WithTimeout(5 * time.Second),
-)
-
-// Write
-result, err := c.Set(ctx, "key", "value")
-
-// Read (routes to current leader)
-result, err := c.Get(ctx, "key")
-
-// Cluster info
-info, err := c.ClusterInfo(ctx)
-```
-
-The client automatically re-discovers the leader when a node returns a 503 or forwards to a different node. Read consistency is configurable (`ReadDefault`, `ReadLinearizable`, `ReadStale`).
-
----
-
-## Key Data Flows
-
-### Election Flow
+The `raft` package exposes the `Raft` interface (see `pkg/raft/types.go`). It is
+storage-, transport-, and FSM-agnostic: `NewRaft` is handed a `LogStore`, a
+`StableStore`, a `SnapshotStore`, an `FSM`, and a `Transport`. `cmd/raftd` provides
+the concrete implementations (WAL + BoltDB, file snapshots, the KV FSM, and a
+TCP or gRPC transport).
+
+## The Raft core
+
+### Ticks, timers, and the run loop
+
+A single `run()` goroutine owns all state transitions, driven by a `time.Ticker`
+firing every **heartbeat interval = `HeartbeatTick × 50ms`**. Each tick:
+
+- Followers and candidates decrement an `electionTicks` counter; when it reaches
+  zero they start an election.
+- The leader sends a heartbeat round.
+- Coalesced signals (proposals, ReadIndex heartbeat triggers, commit-index
+  persistence, snapshot triggers) are drained.
+
+The election timeout is randomized per node: a follower waits a tick count drawn
+uniformly from `[ElectionTick, 2 × ElectionTick]` before starting an election.
+`Config.Validate()` **hard-fails** if `ElectionTick < 3 × HeartbeatTick` and
+**warns** below the recommended `10×` ratio, because too little headroom lets a
+healthy leader's heartbeats fail to reset follower timers, causing spurious
+elections.
+
+### Leader election and pre-vote
+
+When `PreVote` is enabled (`Config.PreVote`), a follower whose timer fires first
+runs a **pre-vote round**: it sends `RequestVote` with `PreVote=true` and
+`Term = currentTerm + 1` **without** incrementing its own term or recording a
+vote. Peers grant a pre-vote only if (a) the proposed term is at least their
+current term, (b) they have **not** heard from a leader recently (a node that has
+heard a leader within its election window refuses, which is what stops a
+partitioned node from forcing needless elections), and (c) the candidate's log is
+at least as up-to-date. Only if a quorum of pre-votes is collected does the node
+run the real election: it increments its term, votes for itself, **persists term
+and vote** to the stable store (with `Sync()`), and sends real `RequestVote`
+RPCs.
+
+Vote granting in the real election follows the Raft rules: reject a stale term;
+step down on a higher term; grant only if `votedFor` is empty or already this
+candidate **and** the candidate's log is up-to-date
+(`LastLogTerm > localLastTerm || (equal && LastLogIndex >= localLastIndex)`).
+Granting a vote resets the election timer.
+
+Quorum counting is **joint-aware**: during a joint configuration a candidate needs
+a majority in **both** the old and new configurations. Learners never vote and
+never count toward quorum. A single-voter cluster wins instantly.
+
+On becoming leader the node: clears its heartbeat-ack tracking (so linearizable
+reads must re-confirm quorum), initializes `nextIndex[peer] = lastIndex + 1` and
+`matchIndex[peer] = 0` for every other server, appends a **no-op entry** (to
+establish its term's commit point), and sends an immediate heartbeat.
+
+### Log replication
+
+Each heartbeat round spawns at most **one in-flight replication goroutine per
+follower** (`inflightReplication` guards against unbounded goroutine growth).
+For a follower, `replicateTo` builds an `AppendEntriesRequest` starting at
+`nextIndex[peer]`, batching up to **100 entries** per RPC. It captures the request
+term and, on the response, only acts if the node is **still leader** and still in
+the **same term** — this rejects stale responses that arrive after a step-down or
+re-election.
+
+On the follower side, `handleAppendEntries`:
+
+- Rejects a request whose term is older than the follower's.
+- Steps down and resets its election timer on an equal/higher term.
+- On a `PrevLogIndex`/`PrevLogTerm` mismatch, **rejects without truncating** and
+  returns a **conflict hint**: `ConflictTerm` = the term of its entry at
+  `PrevLogIndex`, and `Index` = the first index it holds for that term.
+- When entries match up to the append point, it refuses to overwrite already
+  **committed** entries, truncates from the first genuine conflict, and appends
+  the new suffix in a single durable write.
+- Advances its commit index to `min(LeaderCommit, lastIndexInRequest)` so it never
+  marks entries beyond what this request actually carried as committed.
+
+The leader uses the conflict hint for **fast backup** (the M7 optimization): if
+`ConflictTerm` is set, it rewinds `nextIndex` to just past its own last entry for
+that term — skipping an entire divergent term in one round trip instead of
+decrementing `nextIndex` one index at a time. `nextIndex` only ever moves backward
+on failure.
+
+### Commit advancement
+
+After a successful `AppendEntries`, the leader records the follower's ack
+timestamp (used by ReadIndex) and updates `matchIndex`/`nextIndex`, then runs
+`advanceCommitIndex`. For each candidate index above the current commit index it:
+
+- Only considers entries **from the current term** (the classic Raft safety rule
+  that prevents committing a stale-term entry by counting).
+- Counts itself (if a voter) plus every non-learner voter whose `matchIndex`
+  reaches that index; commits when the count reaches `QuorumSize()`.
+- In a joint configuration, requires a quorum in **both** the old and new configs.
+
+The commit index is persisted to the stable store through a coalescing channel,
+written to disk outside the main lock so persistence never blocks replication.
+
+### Apply and group commit
+
+`Apply(ctx, data)` (leader only) enqueues a proposal future and blocks until it is
+committed and applied (or `ctx`/shutdown fires). The run loop drains up to **256**
+queued proposals and appends them to the WAL in a **single fsync** (group commit),
+which is the main write-throughput lever. Proposals are rejected with
+`ErrNotLeader` off the leader, `ErrLeadershipLost` during a leadership transfer,
+and `ErrNodeBusy` when too many futures are pending.
+
+`applyCommitted` applies entries in the range `(applyIndex, commitIndex]` to the
+FSM in order. A panicking FSM apply is **recovered** (the error is recorded and the
+entry skipped) so one bad command cannot crash the node. After applying, it
+resolves the corresponding futures and signals `WaitApplied` waiters via a
+dedicated condition variable (no busy-polling).
+
+If a storage write fails or the FSM panics fatally, the node records a fatal error,
+transitions to `Shutdown`, and reports itself unhealthy so it is excluded from
+quorum rather than silently corrupting state.
+
+### Linearizable reads (ReadIndex)
+
+Linearizable reads use a **heartbeat-confirmed ReadIndex**, not a wall-clock lease
+(so no inter-node clock synchronization is assumed). `ReadIndex(ctx)`:
+
+1. Returns `ErrNotLeader` if the node is not the leader. A single-node cluster
+   returns the current commit index immediately.
+2. Records `start = time.Now()` on the **leader's own monotonic clock** and
+   triggers an immediate heartbeat round.
+3. Waits until a **quorum of followers have acked** a heartbeat sent *after*
+   `start` (comparing ack timestamps to `start`, all on the leader's clock).
+4. Returns the commit index captured in step 1 as the read index.
+
+The HTTP handler then calls `WaitApplied(readIndex)` so the local FSM reflects all
+committed entries up to that index before serving the value. No entry is written to
+the log for a read, making it far cheaper than an `Apply`.
+
+### Snapshots and compaction
+
+A snapshot ticker fires every `SnapshotInterval` (default **120s**). A snapshot is
+taken only when the log has grown enough:
+`SnapshotThreshold > 0 && (appliedIndex − lastSnapshotIndex) >= SnapshotThreshold`
+(default threshold **8192**). Snapshotting captures the applied index, its term,
+the current configuration, and `FSM.Snapshot()` atomically, writes them through the
+snapshot store, then **compacts the WAL** up to that index (retaining
+`TrailingLogs`, default **10240**, entries so slightly-lagging followers can still
+be caught up from the log rather than a full snapshot install).
+
+A follower that has fallen behind the leader's compacted log receives an
+`InstallSnapshot` stream. `handleInstallSnapshot` ignores stale snapshots
+(`LastIncludedIndex <= commitIndex`), restores the FSM, reconciles its own log
+(keeping a matching suffix or discarding all if the boundary term differs), and
+sets both commit and applied indexes to the snapshot's last-included index.
+
+### Joint-consensus membership
+
+Membership changes go through **joint consensus (C_old,new)** so quorum is never
+lost mid-change, and **at most one change is outstanding at a time**
+(`ErrConfigChangeInProgress` otherwise; the guard trips while either a joint config
+is active or a pending config entry is uncommitted).
+
+- **AddServer / RemoveServer / ReplaceServer** compute the target configuration and
+  append a **joint** configuration entry. When it commits, the node enters joint
+  mode (old ∪ new voters both required for quorum); the leader then appends a
+  **commit-joint** entry, and when *that* commits the configuration collapses to the
+  new one and stale replication trackers are cleaned up. **Demote** is implemented
+  as a remove.
+- **AddLearner** appends a single-step entry adding a non-voting server. Learners
+  receive replication but never vote.
+- **PromoteLearner** first checks the learner is caught up (its `matchIndex` is
+  within `TrailingLogs` of the leader's last index) and returns `ErrLearnerNotReady`
+  otherwise, then appends a promote entry. This is the safe path for scaling: add as
+  a learner, let it catch up, then promote.
+
+The server exposes these via `/admin/members`, `/admin/members/{id}`,
+`/admin/members/{id}/promote`, and `/admin/members/{id}/demote` (see
+[api.md](api.md)); all are leader-only and require the `write` role.
+
+## The KV state machine (FSM)
+
+The FSM (`pkg/fsm/kv.go`) is a revision-versioned key/value store. Commands are
+JSON-encoded (`op`, `key`, `value`, optional `txn`, optional `client_id`/`seq_num`)
+and produced by `EncodeCommand` / `EncodeCommandWithID` / `EncodeTxn`. Supported
+ops include `put`, `get`, `delete`, `range`, and `txn` (plus legacy `set`/`list`).
+
+Each stored value is a `KeyValue`:
+
+| JSON field | Meaning |
+|------------|---------|
+| `key` | the key |
+| `value` | the value |
+| `create_revision` | revision at which the key was first created |
+| `mod_revision` | revision of the last modification |
+| `version` | number of modifications to this key |
+
+A single global, monotonic **revision** counter increments **only on mutations**
+(all ops in one transaction share a single increment). A separate `index` counter
+increments on **every** applied command and drives the snapshot index.
+
+**Idempotency / dedup**: when a command carries `client_id` + `seq_num`, the FSM
+records the result in a per-client dedup table. A replayed command with a
+sequence number at or below the last-seen one returns the cached result without
+re-applying — this makes client retries safe. The dedup table is included in
+snapshots. Its size is bounded with deterministic eviction.
+
+**Transactions** (`pkg/fsm/txn.go`) mirror etcd's mini-transactions:
+`TxnRequest{compare, success, failure}`. Each `compare` tests a key's `value`,
+`version`, `create_revision`, or `mod_revision` against a target with a result of
+`equal` / `not_equal` / `greater` / `less`. If **all** comparisons pass, the
+`success` ops run; otherwise the `failure` ops run. Ops are `put` (type `0`) or
+`delete` (type `1`). Transactions are **atomic**: every op is pre-validated before
+anything is written, so a partial transaction never mutates state, consumes a
+revision, or emits events. The response is
+`TxnResponse{succeeded, results[], revision}`.
+
+## Watches
+
+The `WatchManager` (`pkg/fsm/watch.go`) fans committed KV changes out to SSE
+subscribers on **every** node (watches are served locally — no leader forwarding —
+because all nodes apply the same committed log and therefore emit the same event
+sequence).
+
+- Events are `Event{type (put/delete), key, kv, prev_kv, revision}`; a batch from a
+  transaction shares one revision.
+- The FSM keeps a bounded **history ring buffer** (1024 entries) and does
+  non-blocking sends on an internal channel; when a consumer can't keep up, events
+  are **dropped** and a `DroppedEvents()` counter increments. Late or reconnecting
+  subscribers recover missed events via history replay from a revision.
+- Each subscription records the revision captured at registration time; live
+  dispatch delivers strictly newer revisions while history replay covers everything
+  at or before it, which guarantees exactly-once, in-order delivery and closes the
+  register/replay race.
+
+Clients pass `?key=` or `?prefix=` and an optional `?revision=` (or `Last-Event-ID`
+header) to resume. The HTTP handler streams `id: <revision>\ndata: <json>\n\n`
+frames and closes idle connections after `watch_idle_timeout`.
+
+## Transport
+
+Both transports implement the same `raft.Transport` interface (AppendEntries,
+RequestVote, InstallSnapshot, TimeoutNow) and are selected by the `transport`
+config key.
+
+**TCP (default, `pkg/transport/tcp.go`)** — newline-delimited JSON frames
+(`{id, type, payload}`) with a monotonic per-request correlation `id`; the server
+echoes it and the client drops the connection on any id/type mismatch. One
+persistent, lazily-dialed connection is pooled per peer. Per-message size is
+bounded (default 16 MiB). Optional TLS/mTLS pins **TLS 1.3**, requires and verifies
+client certs when a CA is set, and refuses group/other-readable key files.
+
+**gRPC (`pkg/transport/grpc.go`)** — uses the generated `RaftService`/`RaftAdmin`
+protos (`proto/raft.proto`). Maintains a small connection pool per peer with
+round-robin selection, health tracking, and background re-dial of stale/unhealthy
+peers. Message sizes default to 64 MiB (512 MiB aggregate for streamed snapshots).
+Optional TLS/mTLS pins TLS 1.3; `SetRequireTLS(true)` (config `require_tls`) fails
+closed with no plaintext fallback; a per-peer **member allowlist** authorizes each
+RPC by the verified peer certificate's CN or DNS SAN.
+
+## The HTTP server
+
+`cmd/raftd/main.go` builds a `http.ServeMux` with middleware layers:
+
+- **CORS** (deny-by-default; allowlist via `cors_origins`).
+- **Auth** (`authMiddleware` / `requireRole`) — token → role, fails closed when no
+  tokens are configured unless `allow_no_auth` is set.
+- **Rate limiting** (`rateLimitMiddleware`) — global and per-IP token buckets on
+  write methods only; GET/HEAD are never limited.
+
+Writes and linearizable reads that arrive at a follower are **forwarded to the
+leader** over HTTP (the forward hop validates the leader address from static config,
+propagates the request context, and uses `https://` when the API is TLS-enabled).
+Watches are never forwarded.
+
+## The Go client
+
+`pkg/client/client.go` is an HTTP/JSON client with automatic leader discovery and
+retry. It queries `/admin/cluster` to learn the leader, caches it, and retries write
+operations across all endpoints with exponential backoff and jitter. Mutating calls
+attach a stable `client_id` and a single `seq_num` **reused across all retries**, so
+the server-side dedup table makes retries idempotent. It provides `Put`, `GetKV`
+(linearizable), `GetKVStale`, `Range`, `DeleteKV`, `Txn`, `Watch`/`WatchPrefix`
+(auto-reconnecting SSE), and `GetClusterInfo`.
+
+## Data flow: a write
 
 ```
-1. Follower's electionTicks reaches 0
-2. If PreVote enabled:
-   a. Send PreVote RequestVote (PreVote=true, same term) to all peers
-   b. Collect pre-vote quorum; only then proceed
-3. Increment term; set votedFor = localID; persist to StableStore
-4. Broadcast RequestVote to all peers
-5. Collect responses:
-   - VoteGranted=true: increment voteCount
-   - Higher term in response: revert to Follower
-6. If voteCount >= quorum: transition to Leader
-7. Leader immediately sends empty AppendEntries (heartbeats) to establish authority
+client PUT /v1/kv/foo
+      │
+      ▼
+[any node] ── not leader? ──► forward to leader's http_address ──┐
+      │                                                          │
+      ▼ (leader)                                                 │
+Apply(data) ─► enqueue proposal ─► run loop batches up to 256    │
+      │                                                          │
+      ▼                                                          │
+append to WAL (one fsync for the batch) ─► replicate AppendEntries│
+      │                                                          │
+      ▼                                                          │
+quorum of matchIndex reaches the entry ─► commitIndex advances    │
+      │                                                          │
+      ▼                                                          │
+applyCommitted ─► KV FSM applies put ─► revision bumps            │
+      │                                                          │
+      ▼                                                          │
+future resolves ─► 200 OK with the new KeyValue ◄────────────────┘
 ```
 
-### Replication Flow
+## Data flow: a linearizable read
 
 ```
-1. Leader receives Apply(ctx, data) via proposalCh
-2. handleProposal(): append LogEntry{term, lastIndex+1, Normal, data}; persist to WAL
-3. Heartbeat tick or new entry: sendAppendEntries() to all followers
-4. Follower receives AppendEntries:
-   a. Check prevLogTerm/prevLogIndex (log-matching property)
-   b. Append new entries; truncate conflicting entries
-   c. Advance commitIndex to min(leaderCommit, lastIndex)
-   d. Return AppendEntriesResponse{Success: true, Index: lastIndex}
-5. Leader receives success: update matchIndex[follower]
-6. advanceCommitIndex(): sort matchIndex values, find median >= quorum
-7. New commitIndex must be in current term (safety check)
-8. applyCommitted(): apply entries [applyIndex+1 .. commitIndex] to FSM
-9. Resolve pending ApplyFutures for applied entries
+client GET /v1/kv/foo          (default consistency = linearizable)
+      │
+      ▼
+[any node] ── not leader? ──► forward to leader ──┐
+      │                                            │
+      ▼ (leader)                                   │
+ReadIndex(ctx):                                    │
+   readIdx = commitIndex; start = now()            │
+   trigger heartbeat round                         │
+   wait for quorum of acks newer than `start`      │
+      │                                            │
+      ▼                                            │
+WaitApplied(readIdx)  (FSM caught up)              │
+      │                                            │
+      ▼                                            │
+read from local KV FSM ─► 200 OK ◄─────────────────┘
 ```
 
-### Snapshot Flow
+With `?consistency=stale`, the node skips ReadIndex entirely and reads its local FSM
+directly (fast, may be slightly behind; the range endpoint marks the response with
+`X-Consistency: stale`).
+
+## On-disk formats
+
+Data for a node lives under `data_dir/<node_id>/`:
 
 ```
-1. Snapshot triggered by:
-   - Periodic SnapshotInterval timer
-   - Explicit POST /admin/snapshot (authenticated)
-   - log size exceeding SnapshotThreshold
-2. Leader/follower: fsm.Snapshot() produces a Snapshot with Reader()
-3. FileSnapshotStore.Create() returns a SnapshotSink
-4. Snapshot data is copied to the sink; sink.Close() finalises the file
-5. WAL.Compact(snapshotIndex) deletes segments below the snapshot point
-6. StableStore records raft_last_snapshot
-
-InstallSnapshot (leader to lagging follower):
-1. Leader detects follower's nextIndex is before the snapshot
-2. Send InstallSnapshotRequest with snapshot data in chunks
-3. Follower: restoreSnapshotData() writes data to SnapshotStore
-4. fsm.Restore(reader) replaces FSM state
-5. Follower updates lastIndex/lastTerm to snapshot's index/term
+data/<node_id>/
+  wal/
+    00000000000000000000.wal   segment file (base index in the name, 20 digits)
+    meta.db                    BoltDB metadata
+  stable.db                    BoltDB: term, votedFor, config, commit index
+  snapshots/
+    <term>-<index>.snap        snapshot data + trailing checksum footer
+    <term>-<index>.meta        JSON sidecar (durable before the .snap is visible)
 ```
+
+### WAL record layout
+
+Segment files are named by their base index (`%020d.wal`) and rotate at **64 MiB**.
+Each record is a 25-byte header followed by the entry data, big-endian:
+
+```
+offset  size  field
+0       4     CRC32 (IEEE) over bytes [4:] (header tail + data)
+4       4     payload length = len(data) + 9
+8       1     entry type (Normal / Configuration / Snapshot)
+9       8     term  (uint64)
+17      8     index (uint64)
+25      N     entry data
+```
+
+`Append` writes all entries in the batch and then issues **one fsync**; segment
+rotation and creation also fsync the directory so the new file's directory entry is
+durable. On recovery the WAL scans each segment; a torn tail in the **last** segment
+is truncated only if no valid record follows it (otherwise it refuses to open, since
+that indicates real mid-segment corruption), while corruption in an earlier segment
+is a hard error.
+
+### Snapshot layout
+
+`FileSnapshotStore` writes each snapshot as `<term>-<index>.snap` plus a JSON
+sidecar `<term>-<index>.meta`. The `.snap` file ends with an 8-byte footer
+(a 4-byte magic + 4-byte CRC32 of the payload). On write, the sidecar (marked
+`Checksummed`) is fsynced and renamed into place **first**, then the `.snap` is
+renamed in and the directory fsynced — so a visible `.snap` always has durable
+metadata. On read, a checksummed snapshot **must** verify its footer or the open
+fails. Retention keeps the newest `retainCount` snapshots (raftd configures 2),
+pruning the oldest before writing a new one.
+
+### Stable store
+
+Term, `votedFor`, the committed configuration, and the persisted commit index are
+stored in a BoltDB file (`stable.db`) under a single `stable` bucket, with keys
+`raft_term`, `raft_voted_for`, `raft_config`, `raft_commit_index`, and related
+constants (see `pkg/raft/types.go`).
