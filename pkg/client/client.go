@@ -1,0 +1,958 @@
+package client
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	mathrand "math/rand"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/raft-consensus/pkg/fsm"
+	"github.com/raft-consensus/pkg/raft"
+)
+
+// retryBackoff returns the wait duration before retry attempt n (0-indexed).
+// 50ms → 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms (capped).
+// Adds ±10% random jitter to spread thundering-herd retries.
+func retryBackoff(n int) time.Duration {
+	d := 50 * time.Millisecond
+	for i := 0; i < n; i++ {
+		d *= 2
+		if d >= 2*time.Second {
+			d = 2 * time.Second
+			break
+		}
+	}
+	// ±10% jitter
+	tenPct := int64(d / 10)
+	if tenPct < 1 {
+		tenPct = 1
+	}
+	jitter := time.Duration(mathrand.Int63n(tenPct*2+1)) - time.Duration(tenPct)
+	return d + jitter
+}
+
+// v2RetryMax is the number of full retry rounds for v2 API calls.
+const v2RetryMax = 4
+
+// doWithRetry runs fn up to v2RetryMax times, sleeping with exponential
+// backoff between attempts. Suitable for idempotent operations.
+func (c *Client) doWithRetry(fn func() error) error {
+	var err error
+	for i := 0; i < v2RetryMax; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if i < v2RetryMax-1 {
+			time.Sleep(retryBackoff(i))
+		}
+	}
+	return err
+}
+
+// idempotencyHeader names the HTTP request headers carrying idempotency info.
+const (
+	headerClientID = "X-Client-ID"
+	headerSeqNum   = "X-Seq-Num"
+)
+
+// defaultMaxLeaseDuration is the fallback leader-lease window used for
+// ReadLease consistency when no explicit duration is configured. Without a
+// non-zero value the lease is always considered expired (defeating its
+// purpose), so we default to a conservative sub-election-timeout window.
+const defaultMaxLeaseDuration = 500 * time.Millisecond
+
+type Client struct {
+	addrs      []string
+	httpClient *http.Client
+	timeout    time.Duration
+
+	// mu guards the mutable leader-tracking fields below, which are read and
+	// written both by foreground calls and by background Watch goroutines.
+	mu               sync.Mutex
+	currentAddr      string
+	leader           string
+	leaderTerm       uint64
+	leaseExpiry      time.Time
+	maxLeaseDuration time.Duration
+
+	// Idempotency: clientID uniquely identifies this client instance;
+	// seqNum is atomically incremented for every write so the FSM can
+	// deduplicate retried commands that already committed.
+	clientID string
+	seqNum   atomic.Uint64
+}
+
+type ClusterInfo struct {
+	NodeID    string             `json:"node_id"`
+	State     string             `json:"state"`
+	Leader    string             `json:"leader"`
+	Term      uint64             `json:"term"`
+	CommitIdx uint64             `json:"commit_idx"`
+	Config    raft.Configuration `json:"config"`
+}
+
+type ClientOption func(*Client)
+
+func WithAddresses(addrs []string) ClientOption {
+	return func(c *Client) {
+		c.addrs = addrs
+	}
+}
+
+func WithTimeout(timeout time.Duration) ClientOption {
+	return func(c *Client) {
+		c.timeout = timeout
+	}
+}
+
+// WithMaxLeaseDuration sets the leader-lease window used for ReadLease
+// consistency. Must be shorter than the cluster's election timeout to remain
+// safe. A non-positive value falls back to defaultMaxLeaseDuration.
+func WithMaxLeaseDuration(d time.Duration) ClientOption {
+	return func(c *Client) {
+		if d > 0 {
+			c.maxLeaseDuration = d
+		}
+	}
+}
+
+func NewClient(opts ...ClientOption) *Client {
+	c := &Client{
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		timeout:          10 * time.Second,
+		clientID:         newClientID(),
+		maxLeaseDuration: defaultMaxLeaseDuration,
+	}
+
+	for _, opt := range opts {
+		opt(c)
+	}
+
+	return c
+}
+
+// newClientID generates a random 128-bit hex string to uniquely identify this
+// client instance across retries.
+func newClientID() string {
+	var b [16]byte
+	rand.Read(b[:]) //nolint:errcheck — crypto/rand never errors on standard platforms
+	return hex.EncodeToString(b[:])
+}
+
+// nextSeqNum returns a monotonically increasing sequence number for the next
+// write command, used together with clientID for idempotency deduplication.
+func (c *Client) nextSeqNum() uint64 {
+	return c.seqNum.Add(1)
+}
+
+// getCurrentAddr returns the last-known good address under lock. It may be
+// empty before the first successful GetClusterInfo call.
+func (c *Client) getCurrentAddr() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.currentAddr
+}
+
+func (c *Client) GetClusterInfo() (*ClusterInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	for _, addr := range c.addrs {
+		url := fmt.Sprintf("http://%s/admin/cluster", addr)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			continue
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var info ClusterInfo
+			if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+				continue
+			}
+
+			c.mu.Lock()
+			c.currentAddr = addr
+			if info.Leader != "" && info.Leader != c.leader {
+				c.leader = info.Leader
+				c.leaderTerm = info.Term
+				c.leaseExpiry = time.Now().Add(c.maxLeaseDuration)
+			}
+			c.mu.Unlock()
+
+			return &info, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to get cluster info")
+}
+
+func (c *Client) GetLeader() (string, error) {
+	info, err := c.GetClusterInfo()
+	if err != nil {
+		return "", err
+	}
+
+	if info.Leader == "" {
+		return "", fmt.Errorf("no leader elected")
+	}
+
+	return info.Leader, nil
+}
+
+func (c *Client) SubmitCommand(key, value string) (string, error) {
+	info, err := c.GetClusterInfo()
+	if err != nil {
+		return "", err
+	}
+
+	if info.Leader == "" {
+		return "", fmt.Errorf("no leader")
+	}
+
+	data, err := fsm.EncodeSet(key, value)
+	if err != nil {
+		return "", err
+	}
+
+	// SubmitCommand is a mutating write and is retried across nodes below.
+	// Attach a single idempotency key (clientID + seqNum) so the FSM can
+	// deduplicate retries that already committed — never retry a write
+	// without one (H5).
+	seq := c.nextSeqNum()
+
+	url := fmt.Sprintf("http://%s/command", c.getCurrentAddr())
+	resp, err := c.sendCommandIdem(url, data, seq)
+	if err != nil {
+		for _, addr := range c.addrs {
+			url = fmt.Sprintf("http://%s/command", addr)
+			resp, err = c.sendCommandIdem(url, data, seq)
+			if err == nil {
+				break
+			}
+		}
+	}
+
+	if err != nil {
+		return "", err
+	}
+
+	var result fsm.KvResult
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", err
+	}
+
+	if result.Error != "" {
+		return "", fmt.Errorf("%s", result.Error)
+	}
+
+	return result.Value, nil
+}
+
+func (c *Client) sendCommand(url string, data []byte) ([]byte, error) {
+	return c.sendCommandIdem(url, data, 0)
+}
+
+// sendCommandIdem POSTs an encoded FSM command to the /command endpoint.
+// When seqNum > 0 the request carries idempotency headers (X-Client-ID +
+// X-Seq-Num) so mutating commands that are retried across nodes are
+// deduplicated by the FSM. Reads pass seqNum == 0 and send no headers.
+func (c *Client) sendCommandIdem(url string, data []byte, seqNum uint64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(string(data)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	if seqNum > 0 {
+		req.Header.Set(headerClientID, c.clientID)
+		req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("command failed: %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func (c *Client) GetValue(key string) (string, error) {
+	data, err := fsm.EncodeGet(key)
+	if err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("http://%s/command", c.getCurrentAddr())
+	resp, err := c.sendCommand(url, data)
+	if err != nil {
+		return "", err
+	}
+
+	var result fsm.KvResult
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", err
+	}
+
+	if result.Error != "" {
+		return "", fmt.Errorf("%s", result.Error)
+	}
+
+	return result.Value, nil
+}
+
+func (c *Client) DeleteValue(key string) error {
+	data, err := fsm.EncodeDelete(key)
+	if err != nil {
+		return err
+	}
+
+	// Delete is a mutating write; attach an idempotency key (H5).
+	seq := c.nextSeqNum()
+	url := fmt.Sprintf("http://%s/command", c.getCurrentAddr())
+	_, err = c.sendCommandIdem(url, data, seq)
+	return err
+}
+
+type ReadConsistency int
+
+const (
+	ReadDefault ReadConsistency = iota
+	ReadQuorum
+	ReadStale
+	ReadLease
+)
+
+func (c *Client) GetValueWithConsistency(key string, consistency ReadConsistency) (string, error) {
+	switch consistency {
+	case ReadQuorum:
+		return c.getValueQuorum(key)
+	case ReadStale:
+		return c.getValueStale(key)
+	case ReadLease:
+		return c.getValueLease(key)
+	default:
+		return c.getValue(key)
+	}
+}
+
+func (c *Client) getValueLease(key string) (string, error) {
+	c.mu.Lock()
+	expired := time.Now().After(c.leaseExpiry)
+	c.mu.Unlock()
+
+	if expired {
+		info, err := c.GetClusterInfo()
+		if err != nil {
+			return "", err
+		}
+		c.mu.Lock()
+		if info.Term != c.leaderTerm {
+			c.leaseExpiry = time.Time{}
+			c.mu.Unlock()
+			return "", fmt.Errorf("leader lease expired")
+		}
+		c.leaseExpiry = time.Now().Add(c.maxLeaseDuration)
+		c.mu.Unlock()
+	}
+
+	return c.getValue(key)
+}
+
+func (c *Client) getValue(key string) (string, error) {
+	info, err := c.GetClusterInfo()
+	if err != nil {
+		return "", err
+	}
+
+	if info.Leader == "" {
+		return "", fmt.Errorf("no leader")
+	}
+
+	data, err := fsm.EncodeGet(key)
+	if err != nil {
+		return "", err
+	}
+
+	url := fmt.Sprintf("http://%s/command", c.getCurrentAddr())
+	resp, err := c.sendCommand(url, data)
+	if err != nil {
+		return "", err
+	}
+
+	return string(resp), nil
+}
+
+func (c *Client) getValueQuorum(key string) (string, error) {
+	info, err := c.GetClusterInfo()
+	if err != nil {
+		return "", err
+	}
+
+	if info.Leader == "" {
+		return "", fmt.Errorf("no leader")
+	}
+
+	// Only count non-learner (voting) servers for quorum.
+	voters := 0
+	for _, s := range info.Config.Servers {
+		if !s.Learner {
+			voters++
+		}
+	}
+	// If the configuration is empty (e.g. not reported), fall back to the
+	// number of configured addresses so a majority can still be required.
+	if voters == 0 {
+		voters = len(c.addrs)
+	}
+	quorum := voters/2 + 1
+
+	data, err := fsm.EncodeGet(key)
+	if err != nil {
+		return "", err
+	}
+
+	// A quorum read is only meaningful if a majority of nodes agree on the
+	// same value. Counting bare HTTP 200s (the old behavior) returns the
+	// first reachable node's answer even if a majority disagree, which is
+	// not a quorum read at all (H7). Tally identical responses and only
+	// return a value once one distinct response reaches quorum.
+	counts := make(map[string]int)
+	replies := 0
+	for _, addr := range c.addrs {
+		url := fmt.Sprintf("http://%s/command", addr)
+		resp, err := c.sendCommand(url, data)
+		if err != nil {
+			continue
+		}
+		replies++
+		v := string(resp)
+		counts[v]++
+		if counts[v] >= quorum {
+			return v, nil
+		}
+	}
+
+	if replies < quorum {
+		return "", fmt.Errorf("quorum not reached: %d/%d nodes responded", replies, quorum)
+	}
+	return "", fmt.Errorf("quorum not reached: no value agreed by %d nodes (%d distinct responses from %d replies)", quorum, len(counts), replies)
+}
+
+func (c *Client) getValueStale(key string) (string, error) {
+	data, err := fsm.EncodeGet(key)
+	if err != nil {
+		return "", err
+	}
+
+	for _, addr := range c.addrs {
+		url := fmt.Sprintf("http://%s/command", addr)
+		resp, err := c.sendCommand(url, data)
+		if err == nil {
+			return string(resp), nil
+		}
+	}
+
+	return "", fmt.Errorf("all nodes failed")
+}
+
+func (c *Client) HealthCheck() error {
+	for _, addr := range c.addrs {
+		rawURL := fmt.Sprintf("http://%s/health", addr)
+		resp, err := c.httpClient.Get(rawURL)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return nil
+		}
+	}
+	return fmt.Errorf("all nodes unhealthy")
+}
+
+// ---------------------------------------------------------------------------
+// v2 types
+// ---------------------------------------------------------------------------
+
+// KVPair is the client-facing representation of a versioned key-value entry.
+type KVPair struct {
+	Key            string `json:"key"`
+	Value          string `json:"value"`
+	CreateRevision int64  `json:"create_revision"`
+	ModRevision    int64  `json:"mod_revision"`
+	Version        int64  `json:"version"`
+}
+
+// TxnCompare is a single condition in a client transaction.
+type TxnCompare struct {
+	Key    string `json:"key"`
+	Target string `json:"target"` // "value"|"version"|"create_revision"|"mod_revision"
+	Result string `json:"result"` // "equal"|"not_equal"|"greater"|"less"
+	Value  string `json:"value,omitempty"`
+	Rev    int64  `json:"rev,omitempty"`
+}
+
+// ClientTxnOp is a single operation (put or delete) within a transaction.
+type ClientTxnOp struct {
+	Type  int    `json:"type"` // 0=put, 1=delete
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+}
+
+// ClientTxnRequest is the transaction payload sent to /v1/txn.
+type ClientTxnRequest struct {
+	Compare []TxnCompare  `json:"compare"`
+	Success []ClientTxnOp `json:"success"`
+	Failure []ClientTxnOp `json:"failure"`
+}
+
+// ClientTxnResponse is the response from /v1/txn.
+type ClientTxnResponse struct {
+	Succeeded bool      `json:"succeeded"`
+	Results   []KVPair  `json:"results,omitempty"`
+	Revision  int64     `json:"revision"`
+}
+
+// ClientKVEvent is a single key change event delivered to Watch subscribers.
+type ClientKVEvent struct {
+	Type     int     `json:"type"` // 0=put, 1=delete
+	Key      string  `json:"key"`
+	KV       *KVPair `json:"kv,omitempty"`
+	PrevKV   *KVPair `json:"prev_kv,omitempty"`
+	Revision int64   `json:"revision"`
+}
+
+// ClientWatchEvent is what the Watch channel delivers to callers.
+type ClientWatchEvent struct {
+	Events   []ClientKVEvent `json:"events"`
+	Revision int64           `json:"revision"`
+	Err      error
+}
+
+// WatchOption is a functional option for Watch and WatchPrefix.
+type WatchOption func(*watchConfig)
+
+type watchConfig struct {
+	sinceRevision int64
+}
+
+// WithRevision makes the watch replay history from the given revision.
+func WithRevision(rev int64) WatchOption {
+	return func(cfg *watchConfig) {
+		cfg.sinceRevision = rev
+	}
+}
+
+// ---------------------------------------------------------------------------
+// v2 methods
+// ---------------------------------------------------------------------------
+
+// Put sets key to value via PUT /v1/kv/{key}.
+// Retries up to v2RetryMax times with exponential backoff.
+// The seqNum is generated once so all retries carry the same idempotency key.
+func (c *Client) Put(key, value string) (*KVPair, error) {
+	seq := c.nextSeqNum()
+	var result *KVPair
+	err := c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
+			kv, err := c.doPutKV(rawURL, []byte(value), seq)
+			if err == nil {
+				result = kv
+				return nil
+			}
+		}
+		return fmt.Errorf("Put: all nodes failed")
+	})
+	return result, err
+}
+
+// GetKV performs a linearizable GET via /v1/kv/{key}.
+// Retries up to v2RetryMax times with exponential backoff.
+func (c *Client) GetKV(key string) (*KVPair, error) {
+	var result *KVPair
+	err := c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
+			kv, err := c.doGetKV(rawURL)
+			if err == nil {
+				result = kv
+				return nil
+			}
+		}
+		return fmt.Errorf("GetKV: all nodes failed")
+	})
+	return result, err
+}
+
+// GetKVStale performs a stale (local FSM) GET via /v1/kv/{key}?consistency=stale.
+// Retries up to v2RetryMax times with exponential backoff.
+func (c *Client) GetKVStale(key string) (*KVPair, error) {
+	var result *KVPair
+	err := c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/kv/%s?consistency=stale", addr, url.PathEscape(key))
+			kv, err := c.doGetKV(rawURL)
+			if err == nil {
+				result = kv
+				return nil
+			}
+		}
+		return fmt.Errorf("GetKVStale: all nodes failed")
+	})
+	return result, err
+}
+
+// DeleteKV deletes key via DELETE /v1/kv/{key}.
+// Retries up to v2RetryMax times with exponential backoff.
+func (c *Client) DeleteKV(key string) error {
+	seq := c.nextSeqNum()
+	return c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
+			if err := c.doDeleteKV(rawURL, seq); err == nil {
+				return nil
+			}
+		}
+		return fmt.Errorf("DeleteKV: all nodes failed")
+	})
+}
+
+// Range returns all keys with prefix via GET /v1/kv?prefix={prefix}.
+// Retries up to v2RetryMax times with exponential backoff.
+func (c *Client) Range(prefix string) ([]*KVPair, error) {
+	var result []*KVPair
+	err := c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/kv?prefix=%s", addr, url.QueryEscape(prefix))
+			kvs, err := c.doGetKVList(rawURL)
+			if err == nil {
+				result = kvs
+				return nil
+			}
+		}
+		return fmt.Errorf("Range: all nodes failed")
+	})
+	return result, err
+}
+
+// Txn submits a transaction via POST /v1/txn.
+// Retries up to v2RetryMax times with exponential backoff.
+func (c *Client) Txn(req *ClientTxnRequest) (*ClientTxnResponse, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	// A transaction is a mutating write that doWithRetry replays across
+	// nodes; generate one idempotency key so all retries deduplicate to a
+	// single application (H5).
+	seq := c.nextSeqNum()
+	var result *ClientTxnResponse
+	err = c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			rawURL := fmt.Sprintf("http://%s/v1/txn", addr)
+			resp, err := c.doPost(rawURL, data, seq)
+			if err == nil {
+				var txnResp ClientTxnResponse
+				if err := json.Unmarshal(resp, &txnResp); err == nil {
+					result = &txnResp
+					return nil
+				}
+			}
+		}
+		return fmt.Errorf("Txn: all nodes failed")
+	})
+	return result, err
+}
+
+// Watch subscribes to SSE events for the given key.
+// Returns a channel that delivers events; close the context to stop.
+// Reconnects automatically using Last-Event-ID on disconnect.
+func (c *Client) Watch(ctx context.Context, key string, opts ...WatchOption) (<-chan ClientWatchEvent, error) {
+	cfg := &watchConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	ch := make(chan ClientWatchEvent, 64)
+	go c.watchLoop(ctx, fmt.Sprintf("/v1/watch?key=%s", url.QueryEscape(key)), cfg.sinceRevision, ch)
+	return ch, nil
+}
+
+// WatchPrefix subscribes to SSE events for all keys with prefix.
+func (c *Client) WatchPrefix(ctx context.Context, prefix string, opts ...WatchOption) (<-chan ClientWatchEvent, error) {
+	cfg := &watchConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	ch := make(chan ClientWatchEvent, 64)
+	go c.watchLoop(ctx, fmt.Sprintf("/v1/watch?prefix=%s", url.QueryEscape(prefix)), cfg.sinceRevision, ch)
+	return ch, nil
+}
+
+// watchLoop connects to an SSE endpoint and pushes events to ch.
+// On disconnect it reconnects with the last seen revision as Last-Event-ID.
+// Uses exponential backoff (100ms → 200ms → … → 30s) between reconnects.
+func (c *Client) watchLoop(ctx context.Context, path string, sinceRevision int64, ch chan<- ClientWatchEvent) {
+	defer close(ch)
+	lastRevision := sinceRevision
+	reconnects := 0
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		addr := c.addrs[0] // prefer first address; no leader forwarding needed
+		rawURL := fmt.Sprintf("http://%s%s", addr, path)
+
+		err := c.streamSSE(ctx, rawURL, lastRevision, ch, &lastRevision)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			// Exponential backoff: 100ms, 200ms, 400ms, … capped at 30s.
+			d := 100 * time.Millisecond
+			for i := 0; i < reconnects; i++ {
+				d *= 2
+				if d >= 30*time.Second {
+					d = 30 * time.Second
+					break
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d):
+			}
+			reconnects++
+		} else {
+			reconnects = 0 // clean disconnect; reset backoff
+		}
+	}
+}
+
+// streamSSE connects to an SSE URL and pushes parsed events to ch.
+// Updates *lastRevision as events arrive for reconnect continuity.
+func (c *Client) streamSSE(
+	ctx context.Context,
+	rawURL string,
+	sinceRevision int64,
+	ch chan<- ClientWatchEvent,
+	lastRevision *int64,
+) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	if sinceRevision > 0 {
+		req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", sinceRevision))
+	}
+
+	// Use a client with no timeout — the connection stays open.
+	streamClient := &http.Client{}
+	resp, err := streamClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	var dataLines []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if line == "" {
+			// Empty line dispatches the accumulated event.
+			if len(dataLines) > 0 {
+				raw := strings.Join(dataLines, "\n")
+				var we ClientWatchEvent
+				if err := json.Unmarshal([]byte(raw), &we); err == nil {
+					if we.Revision > *lastRevision {
+						*lastRevision = we.Revision
+					}
+					select {
+					case ch <- we:
+					case <-ctx.Done():
+						return nil
+					}
+				}
+				dataLines = dataLines[:0]
+			}
+			continue
+		}
+
+		if after, ok := strings.CutPrefix(line, "data: "); ok {
+			dataLines = append(dataLines, after)
+		}
+		// id: and event: lines are ignored; we track revision from JSON payload
+	}
+
+	return scanner.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Internal HTTP helpers for v2 API
+// ---------------------------------------------------------------------------
+
+func (c *Client) doPutKV(rawURL string, body []byte, seqNum uint64) (*KVPair, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set(headerClientID, c.clientID)
+	req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("PUT %s: status %d", rawURL, resp.StatusCode)
+	}
+
+	var kv KVPair
+	if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
+		return nil, err
+	}
+	return &kv, nil
+}
+
+func (c *Client) doGetKV(rawURL string) (*KVPair, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("key not found")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: status %d", rawURL, resp.StatusCode)
+	}
+
+	var kv KVPair
+	if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
+		return nil, err
+	}
+	return &kv, nil
+}
+
+func (c *Client) doDeleteKV(rawURL string, seqNum uint64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set(headerClientID, c.clientID)
+	req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("DELETE %s: status %d", rawURL, resp.StatusCode)
+	}
+	return nil
+}
+
+func (c *Client) doGetKVList(rawURL string) ([]*KVPair, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET list %s: status %d", rawURL, resp.StatusCode)
+	}
+
+	var kvs []*KVPair
+	if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
+		return nil, err
+	}
+	return kvs, nil
+}
+
+// doPost sends a mutating POST (currently transactions). When seqNum > 0 it
+// attaches idempotency headers so retries across nodes are deduplicated by the
+// FSM (H5); a mutating write must never be retried without one.
+func (c *Client) doPost(rawURL string, body []byte, seqNum uint64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if seqNum > 0 {
+		req.Header.Set(headerClientID, c.clientID)
+		req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("POST %s: status %d", rawURL, resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
