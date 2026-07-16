@@ -86,6 +86,54 @@ var (
 		},
 		[]string{"target"},
 	)
+
+	// WALFsyncLatencyHistogram records the time spent in each WAL fsync — a
+	// classic Raft write-latency source (C-O1).
+	WALFsyncLatencyHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "raft_wal_fsync_seconds",
+		Help:    "Latency of WAL fsync",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	// ApplyLagGauge is commitIndex-appliedIndex: how far the FSM trails the log
+	// (M-O1). The primary saturation signal for the apply pipeline.
+	ApplyLagGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "raft_apply_lag",
+		Help: "commitIndex - appliedIndex (entries committed but not yet applied)",
+	})
+
+	// ProposalsCounter counts proposals by outcome (M-O1: throughput + errors).
+	ProposalsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "raft_proposals_total",
+		Help: "Total client proposals by outcome",
+	}, []string{"outcome"})
+
+	// RejectionsCounter counts RPC/request rejections by kind (M-O1: error rate).
+	RejectionsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "raft_rejections_total",
+		Help: "Total rejections by kind (append_entries, vote, not_leader, forward)",
+	}, []string{"kind"})
+
+	// InstallSnapshotLatencyHistogram records outbound InstallSnapshot latency (M-O1).
+	InstallSnapshotLatencyHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "raft_install_snapshot_latency_seconds",
+		Help:    "Latency of outbound InstallSnapshot RPC",
+		Buckets: prometheus.DefBuckets,
+	})
+
+	// WatchConnectionsGauge exports the number of open watch (SSE) streams (M-O1).
+	WatchConnectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "raft_watch_connections",
+		Help: "Open watch (SSE) connections",
+	})
+
+	// HTTPRequestDuration is a per-route client-request latency histogram for the
+	// HTTP API, wired via promhttp.InstrumentHandlerDuration (M-O1).
+	HTTPRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "raft_http_request_duration_seconds",
+		Help:    "HTTP API request latency by handler and method",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"handler", "method", "code"})
 )
 
 func RecordTerm(term uint64) {
@@ -142,6 +190,32 @@ func RecordFSMApplyLatency(seconds float64) {
 
 func RecordReplicationLag(target string, lag uint64) {
 	ReplicationLagGauge.WithLabelValues(target).Set(float64(lag))
+}
+
+func RecordWALFsync(seconds float64) {
+	WALFsyncLatencyHistogram.Observe(seconds)
+}
+
+func RecordApplyLag(commitIndex, appliedIndex uint64) {
+	if commitIndex >= appliedIndex {
+		ApplyLagGauge.Set(float64(commitIndex - appliedIndex))
+	}
+}
+
+func RecordProposal(outcome string) {
+	ProposalsCounter.WithLabelValues(outcome).Inc()
+}
+
+func RecordRejection(kind string) {
+	RejectionsCounter.WithLabelValues(kind).Inc()
+}
+
+func RecordInstallSnapshotLatency(seconds float64) {
+	InstallSnapshotLatencyHistogram.Observe(seconds)
+}
+
+func SetWatchConnections(n int) {
+	WatchConnectionsGauge.Set(float64(n))
 }
 
 func boolToString(b bool) string {

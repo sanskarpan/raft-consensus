@@ -20,10 +20,10 @@ type chanTransport struct {
 	localID ServerID
 	peers   map[ServerID]*chanTransport
 
-	appendEntriesFn    func(req *AppendEntriesRequest) *AppendEntriesResponse
-	requestVoteFn      func(req *RequestVoteRequest) *RequestVoteResponse
-	installSnapshotFn  func(req *InstallSnapshotRequest) *InstallSnapshotResponse
-	drop               int32 // if 1, all RPCs are dropped (simulates partition)
+	appendEntriesFn   func(req *AppendEntriesRequest) *AppendEntriesResponse
+	requestVoteFn     func(req *RequestVoteRequest) *RequestVoteResponse
+	installSnapshotFn func(req *InstallSnapshotRequest) *InstallSnapshotResponse
+	drop              int32 // if 1, all RPCs are dropped (simulates partition)
 }
 
 func newChanTransport(id ServerID) *chanTransport {
@@ -94,7 +94,7 @@ func (t *chanTransport) InstallSnapshot(_ context.Context, target ServerID, req 
 }
 
 func (t *chanTransport) TimeoutNow(_ context.Context, _ ServerID) error { return nil }
-func (t *chanTransport) Close() error                                    { return nil }
+func (t *chanTransport) Close() error                                   { return nil }
 
 // ---- in-memory stores ---------------------------------------------------
 
@@ -250,9 +250,9 @@ type noopSink struct {
 }
 
 func (s *noopSink) Write(p []byte) (int, error) { return len(p), nil }
-func (s *noopSink) Close() error                 { return nil }
-func (s *noopSink) Cancel() error                { return nil }
-func (s *noopSink) ID() string                   { return s.id }
+func (s *noopSink) Close() error                { return nil }
+func (s *noopSink) Cancel() error               { return nil }
+func (s *noopSink) ID() string                  { return s.id }
 
 func (m *memSnapshotStore) Create(version SnapshotVersion, index, term uint64, configuration Configuration) (SnapshotSink, error) {
 	return &noopSink{id: fmt.Sprintf("%d-%d", term, index)}, nil
@@ -396,7 +396,10 @@ func TestServerIDString(t *testing.T) {
 }
 
 func TestRaftStateString(t *testing.T) {
-	cases := []struct{ state RaftState; want string }{
+	cases := []struct {
+		state RaftState
+		want  string
+	}{
 		{StateFollower, "Follower"},
 		{StateCandidate, "Candidate"},
 		{StateLeader, "Leader"},
@@ -1757,11 +1760,6 @@ func healNode(tr *chanTransport) {
 	atomic.StoreInt32(&tr.drop, 0)
 }
 
-// crashNode simulates a node crash by shutting it down.
-func crashNode(r *raft) {
-	r.Shutdown()
-}
-
 // =============================================================================
 // Chaos Tests
 // =============================================================================
@@ -2336,10 +2334,24 @@ func TestChaos_DiskFull_AppendFails(t *testing.T) {
 		t.Logf("first Apply failure at entry %d (expected, disk-full injected)", failedAt)
 	}
 
-	// The node must still be running (not deadlocked) and not corrupted.
-	state := r.State()
-	if state == StateShutdown {
-		t.Error("node shut down unexpectedly after disk error")
+	// H-R2: a persistent storage-write failure must be treated as fatal — the
+	// node halts and marks itself unhealthy rather than continuing as a silent
+	// zombie that still counts toward quorum. Wait for the halt to propagate.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !r.Healthy() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if r.Healthy() {
+		t.Error("expected node to become unhealthy after a persistent disk-write failure")
+	}
+	if r.FatalError() == nil {
+		t.Error("expected FatalError to be set after a persistent disk-write failure")
+	}
+	if r.State() != StateShutdown {
+		t.Errorf("expected node to be StateShutdown after fatal disk error, got %s", r.State())
 	}
 }
 
@@ -2522,9 +2534,12 @@ func TestChaos_PartitionThenReunite(t *testing.T) {
 	r3, t3, _ := makeRaftNode("n3", cfg)
 
 	connectAll := func() {
-		t1.connect(t2); t1.connect(t3)
-		t2.connect(t1); t2.connect(t3)
-		t3.connect(t1); t3.connect(t2)
+		t1.connect(t2)
+		t1.connect(t3)
+		t2.connect(t1)
+		t2.connect(t3)
+		t3.connect(t1)
+		t3.connect(t2)
 	}
 	connectAll()
 

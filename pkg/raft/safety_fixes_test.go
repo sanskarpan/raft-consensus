@@ -18,7 +18,7 @@ func (m *metaOnlySnapStore) Open(string) (Snapshot, *SnapshotMeta, error) {
 	return nil, nil, errors.New("not implemented")
 }
 func (m *metaOnlySnapStore) List() ([]*SnapshotMeta, error) { return m.metas, nil }
-func (m *metaOnlySnapStore) Delete(string) error           { return nil }
+func (m *metaOnlySnapStore) Delete(string) error            { return nil }
 
 // C5: On restart with a compacted (empty) log, snapshot metadata must
 // initialize lastIndex/lastTerm/applyIndex/commitIndex; otherwise the node

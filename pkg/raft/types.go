@@ -24,6 +24,10 @@ var (
 	// Raft permits at most one outstanding configuration change (C7).
 	ErrConfigChangeInProgress = errors.New("configuration change already in progress")
 	ErrLearnerNotReady        = errors.New("learner not ready")
+	// ErrNodeBusy is returned when the leader has too many outstanding
+	// un-applied proposals (the apply loop is stalling) and is shedding load
+	// (M-R5). Callers should back off and retry.
+	ErrNodeBusy = errors.New("node busy: too many outstanding proposals")
 )
 
 type ServerID string
@@ -290,7 +294,24 @@ type Config struct {
 	// StateFollower. A learner never initiates elections and only receives
 	// log replication from the leader.
 	StartAsLearner bool
+
+	// lastWarning holds a non-fatal advisory produced by the most recent
+	// Validate call (L7). Exposed via LastValidateWarning.
+	lastWarning string
 }
+
+// Sane defaults / bounds for the fields that Validate defaults (M-R8).
+const (
+	defaultSnapshotThreshold      uint64 = 8192
+	defaultTrailingLogs           uint64 = 10240
+	defaultConfigMaxSizePerMsg    uint64 = 1024 * 1024
+	defaultConfigMaxInflight             = 256
+	defaultConfigSnapshotInterval        = 120 * time.Second
+	// L7: the conventional Raft ratio is ~10x. We warn (not hard-fail) below 10x
+	// so existing 5:1 test configs stay valid, but hard-fail below the 3x floor.
+	recommendedElectionRatio = 10
+	minElectionRatio         = 3
+)
 
 func (c *Config) Validate() error {
 	// Defaults are applied in newRaft before Validate is called, so these
@@ -301,20 +322,56 @@ func (c *Config) Validate() error {
 	if c.HeartbeatTick <= 0 {
 		return fmt.Errorf("HeartbeatTick must be positive")
 	}
-	// L1: the randomised election timeout must leave enough headroom over the
+	// L1/L7: the randomised election timeout must leave enough headroom over the
 	// heartbeat interval that a healthy leader's heartbeats reliably reset the
-	// follower's election timer before it fires. When ElectionTick is only
-	// marginally larger than HeartbeatTick the jitter window collapses and
-	// followers time out spuriously, causing needless elections. Require the
-	// election timeout to be at least ~3x the heartbeat interval.
-	if c.ElectionTick < 3*c.HeartbeatTick {
-		return fmt.Errorf("ElectionTick (%d) must be at least 3x HeartbeatTick (%d)",
-			c.ElectionTick, c.HeartbeatTick)
+	// follower's election timer before it fires. Hard-fail below the 3x floor;
+	// the recommended ratio is ~10x (surfaced via LastValidateWarning so
+	// existing 5:1 test configs stay valid).
+	if c.ElectionTick < minElectionRatio*c.HeartbeatTick {
+		return fmt.Errorf("ElectionTick (%d) must be at least %dx HeartbeatTick (%d)",
+			c.ElectionTick, minElectionRatio, c.HeartbeatTick)
+	}
+	c.lastWarning = ""
+	if c.ElectionTick < recommendedElectionRatio*c.HeartbeatTick {
+		c.lastWarning = fmt.Sprintf("ElectionTick (%d) is below the recommended %dx HeartbeatTick (%d); "+
+			"GC/network blips may trigger spurious elections",
+			c.ElectionTick, recommendedElectionRatio, c.HeartbeatTick)
 	}
 	if c.LocalID == "" {
 		return fmt.Errorf("LocalID is required")
 	}
+
+	// M-R8: validate + default the remaining tunables so a mis-set field cannot
+	// silently disable snapshotting/batching or produce a degenerate node.
+	if c.SnapshotInterval < 0 {
+		return fmt.Errorf("SnapshotInterval must not be negative")
+	}
+	if c.SnapshotInterval == 0 {
+		c.SnapshotInterval = defaultConfigSnapshotInterval
+	}
+	if c.SnapshotThreshold == 0 {
+		c.SnapshotThreshold = defaultSnapshotThreshold
+	}
+	if c.TrailingLogs == 0 {
+		c.TrailingLogs = defaultTrailingLogs
+	}
+	if c.FSyncInterval < 0 {
+		return fmt.Errorf("FSyncInterval must not be negative")
+	}
+	if c.MaxSizePerMsg == 0 {
+		c.MaxSizePerMsg = defaultConfigMaxSizePerMsg
+	}
+	if c.MaxInflight <= 0 {
+		c.MaxInflight = defaultConfigMaxInflight
+	}
 	return nil
+}
+
+// LastValidateWarning returns a non-fatal advisory message produced by the most
+// recent Validate call (empty if none). Used to surface soft misconfigurations
+// (e.g. an election/heartbeat ratio below the recommended 10x — L7).
+func (c *Config) LastValidateWarning() string {
+	return c.lastWarning
 }
 
 type Transport interface {

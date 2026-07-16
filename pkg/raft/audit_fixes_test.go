@@ -354,7 +354,7 @@ func TestLeadershipTransferNoPrematureSuccess(t *testing.T) {
 	// While transferring, new proposals must be rejected. handleProposal locks
 	// r.mu itself, so call it without holding the lock.
 	fut := &ApplyFuture{ch: make(chan struct{})}
-	r.handleProposal(&proposalFuture{data: []byte("x"), future: fut})
+	r.handleProposal([]*proposalFuture{{data: []byte("x"), future: fut}})
 	if err := fut.Error(); err == nil {
 		t.Fatalf("expected proposal to be rejected during leadership transfer")
 	}
