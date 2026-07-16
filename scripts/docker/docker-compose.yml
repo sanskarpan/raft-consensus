@@ -1,0 +1,72 @@
+# 3-node Raft cluster for local development.
+# Builds the raftd image from the project root Dockerfile.
+#
+# Usage:
+#   docker-compose -f scripts/docker/docker-compose.yml up --build
+#
+# The admin UI can then be pointed at:
+#   localhost:8002  (node1 HTTP)
+#   localhost:8004  (node2 HTTP)
+#   localhost:8006  (node3 HTTP)
+
+version: "3.9"
+
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: raft-node1
+    command: ["-config", "/etc/raftd/config.yaml"]
+    # L10: the Raft inter-node port is reachable over the compose network only;
+    # do not publish it to the host. Only the HTTP API port is published.
+    expose:
+      - "8001"        # Raft TCP (inter-node, network-internal)
+    ports:
+      - "8002:8002"   # HTTP API
+    volumes:
+      - node1-data:/data
+      - ./node1.yaml:/etc/raftd/config.yaml:ro
+    networks:
+      - raft
+
+  node2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: raft-node2
+    command: ["-config", "/etc/raftd/config.yaml"]
+    expose:
+      - "8003"        # Raft TCP (inter-node, network-internal)
+    ports:
+      - "8004:8004"   # HTTP API
+    volumes:
+      - node2-data:/data
+      - ./node2.yaml:/etc/raftd/config.yaml:ro
+    networks:
+      - raft
+
+  node3:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: raft-node3
+    command: ["-config", "/etc/raftd/config.yaml"]
+    expose:
+      - "8005"        # Raft TCP (inter-node, network-internal)
+    ports:
+      - "8006:8006"   # HTTP API
+    volumes:
+      - node3-data:/data
+      - ./node3.yaml:/etc/raftd/config.yaml:ro
+    networks:
+      - raft
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  raft:
+    driver: bridge
