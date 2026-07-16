@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-raft
+  labels:
+    app: {{ .Release.Name }}-raft
+spec:
+  serviceName: {{ .Release.Name }}-raft-headless
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}-raft
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}-raft
+    spec:
+      containers:
+        - name: raftd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - -config
+            - /etc/raftd/config.yaml
+          ports:
+            - name: raft
+              containerPort: {{ .Values.service.raftPort }}
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/raftd
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-raft-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
