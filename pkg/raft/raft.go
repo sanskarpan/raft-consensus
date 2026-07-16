@@ -11,26 +11,19 @@ import (
 	"time"
 
 	"github.com/raft-consensus/pkg/metrics"
+	"github.com/raft-consensus/pkg/tracing"
 	"go.uber.org/zap"
 )
 
 var (
-	defaultElectionTick     = 10
-	defaultHeartbeatTick    = 1
-	defaultMaxSizePerMsg    = mathMaxInt64
-	defaultMaxInflight      = 256
-	defaultSnapshotInterval = 120 * time.Second
+	defaultElectionTick  = 10
+	defaultHeartbeatTick = 1
+	defaultMaxSizePerMsg = mathMaxInt64
+	defaultMaxInflight   = 256
 )
 
 func min(a, b uint64) uint64 {
 	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b uint64) uint64 {
-	if a > b {
 		return a
 	}
 	return b
@@ -65,8 +58,7 @@ type raft struct {
 	commitIndex uint64
 	applyIndex  uint64
 
-	configuration      Configuration
-	configurationIndex uint64
+	configuration Configuration
 
 	// jointConfig is non-nil when we are in the joint-consensus phase of a
 	// membership change. It holds both the old and new configurations.
@@ -140,13 +132,21 @@ type raft struct {
 
 	fsmSnapshotCh chan *reqSnapshotFuture
 
-	userSnapshotCh     chan *reqSnapshotFuture
-	snapshotInProgress int32
+	userSnapshotCh chan *reqSnapshotFuture
 
 	restoreCh chan *restoreFuture
 
-	ctx context.Context
-	mu  sync.RWMutex
+	// doneCh is closed at the very end of run() so Shutdown() can block until the
+	// final drain/flush has completed (H-R1). It is recreated in Start().
+	doneCh chan struct{}
+
+	// fatalErr, when non-nil, records a persistent storage-write failure
+	// (H-R2) or an unrecoverable FSM apply panic (H-R3) that has forced the node
+	// to stop. A node with a non-nil fatalErr is unhealthy and must not count
+	// toward quorum. Guarded by r.mu.
+	fatalErr error
+
+	mu sync.RWMutex
 
 	// applyCond broadcasts whenever applyIndex advances so that WaitApplied
 	// callers can block for a specific applied index without busy-polling (L9).
@@ -201,10 +201,8 @@ type restoreFuture struct {
 }
 
 type reqSnapshotFuture struct {
-	snapReq *SnapshotRequest
-	sink    SnapshotSink
-	done    chan struct{}
-	err     error
+	done chan struct{}
+	err  error
 }
 
 func newRaft(config *Config, localID ServerID, log LogStore, stable StableStore, snapshot SnapshotStore, fsm FSM, transport Transport) (*raft, error) {
@@ -247,11 +245,11 @@ func newRaft(config *Config, localID ServerID, log LogStore, stable StableStore,
 		inflightReplication: make(map[ServerID]bool),
 		heartbeatAcks:       make(map[ServerID]time.Time),
 
-		proposalCh:      make(chan *proposalFuture, 256),
-		commitNotifyCh:  make(chan struct{}, 1),
+		proposalCh:       make(chan *proposalFuture, 256),
+		commitNotifyCh:   make(chan struct{}, 1),
 		persistCommitCh:  make(chan struct{}, 1),
 		heartbeatTrigger: make(chan struct{}, 1),
-		fsmSnapshotCh:   make(chan *reqSnapshotFuture, 1),
+		fsmSnapshotCh:    make(chan *reqSnapshotFuture, 1),
 
 		userSnapshotCh: make(chan *reqSnapshotFuture, 1),
 		restoreCh:      make(chan *restoreFuture, 1),
@@ -315,6 +313,8 @@ func (r *raft) Start() error {
 	r.electionTicks = r.randomElectionTickCount()
 	r.ticker = time.NewTicker(r.heartbeatInterval())
 	r.stopCh = make(chan struct{})
+	r.doneCh = make(chan struct{})
+	r.fatalErr = nil
 
 	if r.config.SnapshotInterval > 0 {
 		r.snapshotTicker = time.NewTicker(r.config.SnapshotInterval)
@@ -330,9 +330,11 @@ func (r *raft) Start() error {
 
 func (r *raft) Shutdown() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.state == StateShutdown {
+		// If a fatal error already stopped run() (H-R2/H-R3), the loop closed
+		// doneCh itself; nothing more to wait on.
+		r.mu.Unlock()
 		return nil
 	}
 
@@ -341,14 +343,91 @@ func (r *raft) Shutdown() error {
 	if r.snapshotTicker != nil {
 		r.snapshotTicker.Stop()
 	}
-	close(r.stopCh)
+	// Guard against a double-close: a fatal-error stop may have already closed
+	// stopCh (see stopFatal).
+	select {
+	case <-r.stopCh:
+	default:
+		close(r.stopCh)
+	}
+	doneCh := r.doneCh
+
+	r.logger.Info("raft stopping", zap.String("id", r.localID.String()))
+	r.mu.Unlock()
+
+	// H-R1: block until run() finishes its final drain/flush so no committed
+	// write is lost by a premature process exit. Bounded so a stuck FSM/disk
+	// cannot hang Shutdown forever.
+	if doneCh != nil {
+		select {
+		case <-doneCh:
+		case <-time.After(r.shutdownTimeout()):
+			r.logger.Warn("raft shutdown drain timed out", zap.String("id", r.localID.String()))
+		}
+	}
 
 	r.logger.Info("raft stopped", zap.String("id", r.localID.String()))
-
 	return nil
 }
 
+// shutdownTimeout bounds how long Shutdown() waits for run() to finish its final
+// drain. Scaled off the election timeout with a sane floor.
+func (r *raft) shutdownTimeout() time.Duration {
+	d := 10 * r.electionTimeout()
+	if d < 5*time.Second {
+		d = 5 * time.Second
+	}
+	return d
+}
+
+// stopFatal marks the node as permanently stopped due to an unrecoverable
+// storage-write failure (H-R2) or FSM apply panic (H-R3). The node transitions
+// to StateShutdown, records fatalErr so health checks can observe it, and closes
+// stopCh so run() exits. Caller must hold r.mu (write).
+func (r *raft) stopFatal(err error) {
+	if r.fatalErr == nil {
+		r.fatalErr = err
+	}
+	if r.state == StateShutdown {
+		return
+	}
+	r.state = StateShutdown
+	r.leaderID = ""
+	if r.ticker != nil {
+		r.ticker.Stop()
+	}
+	if r.snapshotTicker != nil {
+		r.snapshotTicker.Stop()
+	}
+	metrics.RecordLeaderID(false)
+	r.logger.Error("raft node halted due to fatal error", zap.String("id", r.localID.String()), zap.Error(err))
+	select {
+	case <-r.stopCh:
+	default:
+		close(r.stopCh)
+	}
+}
+
+// FatalError returns the fatal error that stopped the node, or nil if healthy.
+// A non-nil result means the node has halted (H-R2/H-R3) and must not be counted
+// toward quorum.
+func (r *raft) FatalError() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fatalErr
+}
+
+// Healthy reports whether the node is running without a fatal storage/FSM error.
+func (r *raft) Healthy() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fatalErr == nil && r.state != StateShutdown
+}
+
 func (r *raft) run() {
+	// H-R1: signal Shutdown() that the final drain/flush has completed.
+	defer close(r.doneCh)
+
 	var snapshotCh <-chan time.Time
 	if r.snapshotTicker != nil {
 		snapshotCh = r.snapshotTicker.C
@@ -360,7 +439,7 @@ func (r *raft) run() {
 			r.tick()
 
 		case proposal := <-r.proposalCh:
-			r.handleProposal(proposal)
+			r.handleProposalBatch(proposal)
 
 		case req := <-r.userSnapshotCh:
 			r.processSnapshot(req)
@@ -395,6 +474,17 @@ func (r *raft) run() {
 
 		// Apply committed entries to the FSM after every event.
 		r.applyCommitted()
+
+		// H-R2/H-R3: a fatal storage-write failure or FSM apply panic sets
+		// fatalErr and closes stopCh. Exit the loop promptly (still draining
+		// futures) rather than spin as a zombie member.
+		r.mu.RLock()
+		fatal := r.fatalErr != nil
+		r.mu.RUnlock()
+		if fatal {
+			r.drainFuturesOnShutdown()
+			return
+		}
 	}
 }
 
@@ -502,7 +592,10 @@ func (r *raft) doLeadershipTransfer() {
 		lt.sent = true
 		lt.deadline = time.Now().Add(r.electionTimeout())
 		go func() {
-			_ = r.transport.TimeoutNow(context.Background(), target)
+			// M-C1: bounded, cancel-on-shutdown context.
+			ctx, cancel := r.rpcContext()
+			defer cancel()
+			_ = r.transport.TimeoutNow(ctx, target)
 		}()
 	}
 }
@@ -615,7 +708,17 @@ func (r *raft) startPreVote() {
 
 // sendPreVoteRequest sends a single pre-vote RPC and processes the result.
 func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
-	resp, err := r.transport.RequestVote(context.Background(), serverID, req)
+	// M-C1: bounded, cancel-on-shutdown context. H-O2: trace span. C-O1: latency.
+	ctx, cancel := r.rpcContext()
+	defer cancel()
+	spanCtx, span := tracing.SpanRequestVote(ctx, serverID.String(), req.Term)
+	start := time.Now()
+	resp, err := r.transport.RequestVote(spanCtx, serverID, req)
+	metrics.RecordRequestVoteLatency(time.Since(start).Seconds())
+	if err != nil {
+		tracing.RecordError(span, err)
+	}
+	span.End()
 	if err != nil {
 		r.logger.Warn("failed to send pre-vote request",
 			zap.String("target", serverID.String()),
@@ -661,7 +764,17 @@ func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 }
 
 func (r *raft) sendVoteRequest(serverID ServerID, req *RequestVoteRequest) {
-	resp, err := r.transport.RequestVote(context.Background(), serverID, req)
+	// M-C1: bounded, cancel-on-shutdown context. H-O2: trace span. C-O1: latency.
+	ctx, cancel := r.rpcContext()
+	defer cancel()
+	spanCtx, span := tracing.SpanRequestVote(ctx, serverID.String(), req.Term)
+	start := time.Now()
+	resp, err := r.transport.RequestVote(spanCtx, serverID, req)
+	metrics.RecordRequestVoteLatency(time.Since(start).Seconds())
+	if err != nil {
+		tracing.RecordError(span, err)
+	}
+	span.End()
 	if err != nil {
 		r.logger.Warn("failed to send vote request",
 			zap.String("target", serverID.String()),
@@ -842,12 +955,29 @@ func (r *raft) replicateTo(serverID ServerID) {
 		nextIdx = r.lastIndex + 1
 	}
 
+	// C-A1: if the entry the follower needs (nextIdx) has been compacted away
+	// (below the log's FirstIndex), we can no longer replicate it via
+	// AppendEntries. Stream the latest snapshot instead so the follower can
+	// recover, then resume normal replication from LastIncludedIndex+1.
+	firstIdx, _ := r.log.FirstIndex()
+	if firstIdx > 0 && nextIdx < firstIdx {
+		r.mu.RUnlock()
+		r.sendSnapshotTo(serverID)
+		return
+	}
+
 	prevLogIndex := uint64(0)
 	prevLogTerm := uint64(0)
 	if nextIdx > 1 {
 		prevLogIndex = nextIdx - 1
 		if entry, err := r.log.Get(prevLogIndex); err == nil {
 			prevLogTerm = entry.Term
+		} else if firstIdx > 0 && prevLogIndex < firstIdx {
+			// C-A1: the prevLog entry itself was compacted; we cannot prove log
+			// consistency via AppendEntries. Fall back to a snapshot.
+			r.mu.RUnlock()
+			r.sendSnapshotTo(serverID)
+			return
 		}
 	}
 
@@ -876,14 +1006,27 @@ func (r *raft) replicateTo(serverID ServerID) {
 	}
 	r.mu.RUnlock()
 
-	resp, err := r.transport.AppendEntries(context.Background(), serverID, req)
+	// M-C1: bounded, cancel-on-shutdown context. H-O2: wrap the send in a span.
+	ctx, cancel := r.rpcContext()
+	defer cancel()
+	spanCtx, span := tracing.SpanAppendEntries(ctx, serverID.String(), reqTerm, len(entries))
+
+	// C-O1: measure AppendEntries RPC latency and count sends by outcome.
+	start := time.Now()
+	resp, err := r.transport.AppendEntries(spanCtx, serverID, req)
+	metrics.RecordAppendEntriesLatency(serverID.String(), time.Since(start).Seconds())
 	if err != nil {
+		metrics.RecordAppendEntriesSent(serverID.String(), false)
+		tracing.RecordError(span, err)
+		span.End()
 		r.logger.Debug("AppendEntries failed",
 			zap.String("target", serverID.String()),
 			zap.Error(err),
 		)
 		return
 	}
+	metrics.RecordAppendEntriesSent(serverID.String(), resp.Success)
+	span.End()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -928,6 +1071,10 @@ func (r *raft) replicateTo(serverID ServerID) {
 			}
 			r.nextIndex[serverID] = r.matchIndex[serverID] + 1
 		}
+		// C-O1: report replication lag (leader lastIndex - follower matchIndex).
+		if r.lastIndex >= r.matchIndex[serverID] {
+			metrics.RecordReplicationLag(serverID.String(), r.lastIndex-r.matchIndex[serverID])
+		}
 		r.advanceCommitIndex()
 	} else {
 		// Follower rejected. Back off nextIndex, using the conflict term for a
@@ -953,6 +1100,137 @@ func (r *raft) replicateTo(serverID ServerID) {
 			r.nextIndex[serverID]--
 		}
 	}
+}
+
+// snapshotChunkSize bounds how much snapshot data is carried per InstallSnapshot
+// RPC when streaming to a lagging follower (C-A1).
+const snapshotChunkSize = 1 << 20 // 1 MiB
+
+// sendSnapshotTo streams the latest local snapshot to a follower whose required
+// log entry has been compacted away (C-A1). It reads the newest snapshot from
+// the SnapshotStore and sends it in chunks via Transport.InstallSnapshot,
+// honouring Offset/Done. On success it advances the follower's matchIndex /
+// nextIndex to LastIncludedIndex+1 so normal AppendEntries replication resumes.
+func (r *raft) sendSnapshotTo(serverID ServerID) {
+	r.mu.RLock()
+	if r.state != StateLeader {
+		r.mu.RUnlock()
+		return
+	}
+	reqTerm := r.term
+	r.mu.RUnlock()
+
+	// Locate the newest snapshot.
+	metas, err := r.snapshot.List()
+	if err != nil || len(metas) == 0 {
+		r.logger.Warn("cannot send InstallSnapshot: no snapshot available",
+			zap.String("target", serverID.String()), zap.Error(err))
+		return
+	}
+	latest := metas[0]
+	for _, m := range metas {
+		if m != nil && m.Index > latest.Index {
+			latest = m
+		}
+	}
+	if latest == nil {
+		return
+	}
+
+	snap, meta, err := r.snapshot.Open(latest.ID)
+	if err != nil {
+		r.logger.Warn("cannot open snapshot for InstallSnapshot",
+			zap.String("target", serverID.String()), zap.Error(err))
+		return
+	}
+	reader := snap.Reader()
+	defer reader.Close()
+
+	lastIncludedIndex := meta.Index
+	lastIncludedTerm := meta.Term
+
+	// M-C1 / H-O2: bounded, cancel-on-shutdown context wrapped in a span.
+	ctx, cancel := r.rpcContext()
+	defer cancel()
+	spanCtx, span := tracing.SpanSnapshot(ctx, serverID.String(), lastIncludedIndex)
+	defer span.End()
+
+	buf := make([]byte, snapshotChunkSize)
+	var offset uint64
+	for {
+		n, readErr := reader.Read(buf)
+		done := false
+		if readErr == io.EOF {
+			done = true
+		} else if readErr != nil {
+			tracing.RecordError(span, readErr)
+			r.logger.Warn("failed reading snapshot chunk", zap.Error(readErr))
+			return
+		}
+
+		req := &InstallSnapshotRequest{
+			Term:              reqTerm,
+			LeaderID:          r.localID,
+			LastIncludedIndex: lastIncludedIndex,
+			LastIncludedTerm:  lastIncludedTerm,
+			Offset:            offset,
+			Data:              buf[:n],
+			Done:              done,
+		}
+
+		resp, sErr := r.transport.InstallSnapshot(spanCtx, serverID, req)
+		if sErr != nil {
+			tracing.RecordError(span, sErr)
+			r.logger.Debug("InstallSnapshot failed",
+				zap.String("target", serverID.String()), zap.Error(sErr))
+			return
+		}
+
+		// Step down if the follower reports a higher term.
+		r.mu.Lock()
+		if resp.Term > r.term {
+			r.term = resp.Term
+			r.failPendingFutures()
+			r.state = StateFollower
+			r.votedFor = ""
+			r.leaderID = ""
+			r.heartbeatAcks = make(map[ServerID]time.Time)
+			metrics.RecordLeaderID(false)
+			r.persistTermAndVotedFor()
+			r.mu.Unlock()
+			return
+		}
+		stillLeader := r.state == StateLeader && r.term == reqTerm
+		r.mu.Unlock()
+		if !stillLeader {
+			return
+		}
+
+		offset += uint64(n)
+		if done {
+			break
+		}
+	}
+
+	// Success: the follower now holds state through lastIncludedIndex.
+	r.mu.Lock()
+	if r.state == StateLeader && r.term == reqTerm {
+		if lastIncludedIndex > r.matchIndex[serverID] {
+			r.matchIndex[serverID] = lastIncludedIndex
+		}
+		r.nextIndex[serverID] = r.matchIndex[serverID] + 1
+		r.heartbeatAcks[serverID] = time.Now()
+		if r.lastIndex >= r.matchIndex[serverID] {
+			metrics.RecordReplicationLag(serverID.String(), r.lastIndex-r.matchIndex[serverID])
+		}
+		r.advanceCommitIndex()
+	}
+	r.mu.Unlock()
+
+	r.logger.Info("sent snapshot to follower",
+		zap.String("target", serverID.String()),
+		zap.Uint64("last_included_index", lastIncludedIndex),
+	)
 }
 
 // lastIndexOfTerm returns the highest index in the local log whose entry has the
@@ -1026,9 +1304,11 @@ func (r *raft) advanceCommitIndex() {
 		quorum := r.configuration.QuorumSize()
 
 		// Count how many nodes (including self, only non-learner voters) have
-		// this entry.
+		// this entry. H-C1: the leader may have removed itself from the
+		// configuration; GetServer(localID) is then nil, so guard against a nil
+		// dereference and treat an absent self as a non-voter (don't count it).
 		count := 0
-		if !r.configuration.GetServer(r.localID).Learner {
+		if self := r.configuration.GetServer(r.localID); self != nil && !self.Learner {
 			count = 1
 		}
 		for id, matchIdx := range r.matchIndex {
@@ -1056,13 +1336,42 @@ func (r *raft) advanceCommitIndex() {
 	}
 }
 
-// handleProposal processes a client Apply() request from the proposalCh.
-func (r *raft) handleProposal(proposal *proposalFuture) {
+// maxProposalBatch bounds how many proposals are coalesced into a single
+// persistLog/WAL.Append (one fsync) per group-commit round (H-P1).
+const maxProposalBatch = 256
+
+// handleProposalBatch processes one proposal plus any additional ready
+// proposals drained non-blocking from proposalCh, appending the whole batch in a
+// SINGLE persistLog call (one WAL.Append / one fsync) before resolving any
+// future (H-P1). Ordering is preserved: entries are appended in arrival order
+// and the fsync inside persistLog completes before commit/replication is
+// triggered, so no future can resolve before its entry is durable.
+func (r *raft) handleProposalBatch(first *proposalFuture) {
+	batch := make([]*proposalFuture, 0, maxProposalBatch)
+	batch = append(batch, first)
+
+	// Non-blocking drain of additional ready proposals.
+	for len(batch) < maxProposalBatch {
+		select {
+		case p := <-r.proposalCh:
+			batch = append(batch, p)
+		default:
+			r.handleProposal(batch)
+			return
+		}
+	}
+	r.handleProposal(batch)
+}
+
+// handleProposal appends a batch of client proposals in one WAL append (H-P1).
+func (r *raft) handleProposal(batch []*proposalFuture) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.state != StateLeader {
-		proposal.future.respond(ErrNotLeader, 0, 0, nil)
+		for _, p := range batch {
+			p.future.respond(ErrNotLeader, 0, 0, nil)
+		}
 		return
 	}
 
@@ -1070,27 +1379,65 @@ func (r *raft) handleProposal(proposal *proposalFuture) {
 	// do not extend the log past the point the target is catching up to. The
 	// caller should retry against the new leader.
 	if r.transferring() {
-		proposal.future.respond(ErrLeadershipLost, 0, 0, nil)
+		for _, p := range batch {
+			p.future.respond(ErrLeadershipLost, 0, 0, nil)
+		}
 		return
 	}
 
-	entry := &LogEntry{
-		Term:  r.term,
-		Index: r.lastIndex + 1,
-		Type:  EntryNormal,
-		Data:  proposal.data,
+	// M-R5: bound outstanding pending futures. If the apply loop has stalled and
+	// too many futures are already in flight, reject the overflow with a busy
+	// error rather than let pendingFutures grow without limit.
+	limit := r.pendingFutureCap()
+	accepted := batch
+	if len(r.pendingFutures)+len(batch) > limit {
+		room := limit - len(r.pendingFutures)
+		if room < 0 {
+			room = 0
+		}
+		if room > len(batch) {
+			room = len(batch)
+		}
+		for _, p := range batch[room:] {
+			p.future.respond(ErrNodeBusy, 0, 0, nil)
+		}
+		accepted = batch[:room]
 	}
-
-	if err := r.persistLog([]*LogEntry{entry}); err != nil {
-		proposal.future.respond(err, 0, 0, nil)
+	if len(accepted) == 0 {
 		return
 	}
 
-	r.pendingFutures[entry.Index] = proposal.future
+	entries := make([]*LogEntry, 0, len(accepted))
+	nextIdx := r.lastIndex + 1
+	for i, p := range accepted {
+		entries = append(entries, &LogEntry{
+			Term:  r.term,
+			Index: nextIdx + uint64(i),
+			Type:  EntryNormal,
+			Data:  p.data,
+		})
+	}
+
+	// H-P1: one persistLog => one WAL.Append => one fsync for the whole batch.
+	if err := r.persistLog(entries); err != nil {
+		// H-R2: a persistent storage-write failure makes this node a silent
+		// zombie if it keeps running. Fail the batch and halt the node.
+		for _, p := range accepted {
+			p.future.respond(err, 0, 0, nil)
+		}
+		r.stopFatal(fmt.Errorf("persist proposal batch: %w", err))
+		return
+	}
+
+	for i, p := range accepted {
+		r.pendingFutures[entries[i].Index] = p.future
+	}
+
+	lastEntryIndex := entries[len(entries)-1].Index
 
 	// Single-node cluster: commit immediately.
 	if r.configuration.QuorumSize() == 1 {
-		r.commitIndex = entry.Index
+		r.commitIndex = lastEntryIndex
 		metrics.RecordCommitIndex(r.commitIndex)
 		r.persistCommitIndex()
 		return
@@ -1109,13 +1456,33 @@ func (r *raft) handleProposal(proposal *proposalFuture) {
 	}
 }
 
+// pendingFutureCap returns the maximum number of outstanding pending futures
+// (M-R5). Derived from MaxInflight with a sane floor.
+func (r *raft) pendingFutureCap() int {
+	c := r.config.MaxInflight * 16
+	if c < 1024 {
+		c = 1024
+	}
+	return c
+}
+
 // applyCommitted applies all log entries between applyIndex and commitIndex to
 // the FSM, resolving any waiting ApplyFutures.
 func (r *raft) applyCommitted() {
 	r.mu.RLock()
 	commitIndex := r.commitIndex
 	applyIndex := r.applyIndex
+	fatal := r.fatalErr != nil
 	r.mu.RUnlock()
+
+	// H-R3: once the node has halted on an FSM apply panic (or fatal storage
+	// error), it must NOT keep applying committed entries — doing so would
+	// silently advance applyIndex past the entry it could not apply and diverge
+	// this replica. The drain path also calls applyCommitted, so this guard is
+	// what keeps a halted node from re-applying during shutdown.
+	if fatal {
+		return
+	}
 
 	for applyIndex < commitIndex {
 		nextApply := applyIndex + 1
@@ -1131,6 +1498,7 @@ func (r *raft) applyCommitted() {
 
 		var result []byte
 		var applyErr error
+		var fsmPanicked bool
 
 		switch entry.Type {
 		case EntryNormal:
@@ -1138,24 +1506,44 @@ func (r *raft) applyCommitted() {
 				func() {
 					defer func() {
 						if rec := recover(); rec != nil {
-							r.logger.Error("FSM Apply panicked — entry skipped",
+							r.logger.Error("FSM Apply panicked",
 								zap.Uint64("index", entry.Index),
 								zap.Any("panic", rec),
 							)
 							applyErr = fmt.Errorf("FSM panic at index %d: %v", entry.Index, rec)
+							fsmPanicked = true
 						}
 					}()
+					// C-O1: record FSM apply latency around the Apply call.
+					start := time.Now()
 					result, applyErr = r.fsm.Apply(entry.Data)
+					metrics.RecordFSMApplyLatency(time.Since(start).Seconds())
 				}()
 			}
 		case EntryConfiguration:
 			r.applyConfigurationEntry(entry)
 		}
 
+		// H-R3: an FSM Apply panic means this replica cannot safely apply a
+		// committed entry. Advancing applyIndex past it would silently diverge
+		// this replica's state machine from the rest of the cluster. Do NOT
+		// advance applyIndex; halt the node so the divergence is loud, not silent.
+		if fsmPanicked {
+			r.mu.Lock()
+			if f, ok := r.pendingFutures[entry.Index]; ok {
+				f.respond(applyErr, entry.Index, entry.Term, nil)
+				delete(r.pendingFutures, entry.Index)
+			}
+			r.stopFatal(fmt.Errorf("FSM apply panic at index %d halted node: %w", entry.Index, applyErr))
+			r.mu.Unlock()
+			return
+		}
+
 		r.mu.Lock()
 		r.applyIndex = nextApply
 		applyIndex = nextApply
 		metrics.RecordAppliedIndex(r.applyIndex)
+		metrics.RecordApplyLag(r.commitIndex, r.applyIndex) // M-O1
 
 		if f, ok := r.pendingFutures[entry.Index]; ok {
 			f.respond(applyErr, entry.Index, entry.Term, result)
@@ -1266,6 +1654,9 @@ func (r *raft) applyConfigurationEntry(entry *LogEntry) {
 				}
 			}
 		}
+		// H-C1: if this leader is no longer a voter in the newly-committed config
+		// (e.g. it removed itself), it must step down and stop proposing.
+		r.stepDownIfNotVoter()
 		return
 	}
 
@@ -1311,6 +1702,35 @@ func (r *raft) applyConfigurationEntry(entry *LogEntry) {
 			}
 		}
 	}
+
+	// H-C1: a single-step change (e.g. RemoveNode of ourselves) may leave this
+	// leader as a non-voter. Step down if so.
+	r.stepDownIfNotVoter()
+}
+
+// stepDownIfNotVoter makes the node relinquish leadership when it is no longer a
+// voting member of the committed configuration (H-C1). A leader that has removed
+// itself must stop proposing and stepping on quorum decisions. Caller must hold
+// r.mu (write).
+func (r *raft) stepDownIfNotVoter() {
+	if r.state != StateLeader {
+		return
+	}
+	if r.configuration.IsVoter(r.localID) {
+		return
+	}
+	r.logger.Info("stepping down: local node is no longer a voter in the committed configuration",
+		zap.String("id", r.localID.String()),
+	)
+	// Fail any uncommitted proposals; a non-voter leader cannot commit them.
+	r.failPendingFutures()
+	r.finishTransfer(ErrLeadershipLost)
+	r.state = StateFollower
+	r.leaderID = ""
+	r.votedFor = ""
+	r.heartbeatAcks = make(map[ServerID]time.Time)
+	r.electionTicks = r.randomElectionTickCount()
+	metrics.RecordLeaderID(false)
 }
 
 // failPendingFutures cancels pending Apply futures for log entries that have
@@ -1398,6 +1818,11 @@ func (r *raft) ReadIndex(ctx context.Context) (uint64, error) {
 	// heartbeat interval rather than waiting for the next periodic tick.
 	r.triggerHeartbeat()
 
+	// L1: reuse a single Timer across retry iterations instead of allocating a
+	// fresh time.After channel (and leaking its underlying timer) each loop.
+	timer := time.NewTimer(r.heartbeatInterval() / 2)
+	defer timer.Stop()
+
 	for {
 		r.mu.RLock()
 		if r.state != StateLeader {
@@ -1427,8 +1852,9 @@ func (r *raft) ReadIndex(ctx context.Context) (uint64, error) {
 			return 0, ctx.Err()
 		case <-r.stopCh:
 			return 0, ErrNotStarted
-		case <-time.After(r.heartbeatInterval() / 2):
+		case <-timer.C:
 			r.triggerHeartbeat()
+			timer.Reset(r.heartbeatInterval() / 2)
 		}
 	}
 }
@@ -2233,6 +2659,29 @@ func (r *raft) truncateLog(index uint64) error {
 	return nil
 }
 
+// rpcContext derives a per-RPC context with a deadline (~one election timeout)
+// that is also cancelled when the node stops (M-C1). This bounds outbound
+// replicate/vote/prevote/timeoutnow/snapshot RPCs so a stuck peer cannot pin an
+// in-flight slot indefinitely, and lets a shutdown promptly abort them. The
+// caller MUST invoke the returned cancel func.
+func (r *raft) rpcContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), r.electionTimeout())
+	// Cancel the RPC when the node stops so shutdown does not wait on a hung
+	// peer. A single watcher goroutine per RPC, released via done.
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-r.stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+	return ctx, func() {
+		close(done)
+		cancel()
+	}
+}
+
 func (r *raft) heartbeatInterval() time.Duration {
 	return time.Duration(r.config.HeartbeatTick) * 50 * time.Millisecond
 }
@@ -2246,12 +2695,6 @@ func (r *raft) electionTimeout() time.Duration {
 func (r *raft) randomElectionTickCount() int {
 	jitter := rand.Intn(r.config.ElectionTick + 1)
 	return r.config.ElectionTick + jitter
-}
-
-func (r *raft) randomElectionTimeout() time.Duration {
-	timeout := r.electionTimeout()
-	jitter := time.Duration(rand.Int63n(int64(timeout / 2)))
-	return timeout + jitter
 }
 
 func uint64ToBytes(v uint64) []byte {
