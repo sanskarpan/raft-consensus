@@ -10,6 +10,7 @@ import (
 	proto "github.com/raft-consensus/proto"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -40,9 +41,9 @@ func TestConnPool_Get_NilPoolReturnsNil(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestConnPool_Close_Idempotent(t *testing.T) {
-	c, err := grpc.Dial("localhost:1", grpc.WithInsecure()) //nolint:staticcheck
+	c, err := grpc.NewClient("localhost:1", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("grpc.Dial: %v", err)
+		t.Fatalf("grpc.NewClient: %v", err)
 	}
 	p := newConnPool([]*grpc.ClientConn{c})
 	// Multiple Close calls must not panic.
