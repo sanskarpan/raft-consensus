@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-raft
+  labels:
+    app: {{ .Release.Name }}-raft
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: {{ .Release.Name }}-raft
+  ports:
+    - name: raft
+      port: {{ .Values.service.raftPort }}
+      targetPort: raft
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-raft-headless
+  labels:
+    app: {{ .Release.Name }}-raft
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Release.Name }}-raft
+  ports:
+    - name: raft
+      port: {{ .Values.service.raftPort }}
+    - name: http
+      port: {{ .Values.service.httpPort }}
