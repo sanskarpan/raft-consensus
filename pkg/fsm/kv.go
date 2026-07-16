@@ -1,0 +1,830 @@
+package fsm
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/raft-consensus/pkg/raft"
+)
+
+// ---------------------------------------------------------------------------
+// Core event types
+// ---------------------------------------------------------------------------
+
+// EventType distinguishes put (create or update) from delete events.
+type EventType int
+
+const (
+	EventPut EventType = iota
+	EventDelete
+)
+
+// KeyValue is the etcd-style versioned entry stored for each key.
+type KeyValue struct {
+	Key            string `json:"key"`
+	Value          string `json:"value"`
+	CreateRevision int64  `json:"create_revision"`
+	ModRevision    int64  `json:"mod_revision"`
+	Version        int64  `json:"version"` // number of modifications to this key
+}
+
+// Event represents a single change notification emitted after a committed Apply.
+type Event struct {
+	Type     EventType `json:"type"`
+	Key      string    `json:"key"`
+	KV       *KeyValue `json:"kv,omitempty"`      // nil for deletes
+	PrevKV   *KeyValue `json:"prev_kv,omitempty"` // nil for creates
+	Revision int64     `json:"revision"`
+}
+
+// ---------------------------------------------------------------------------
+// KVStore
+// ---------------------------------------------------------------------------
+
+// maxDedupEntries caps the number of unique client IDs tracked for
+// idempotency. When the cap is exceeded the entry with the lowest Order (oldest
+// deterministic insertion) is evicted. Each entry is ~200 bytes; 10 000 entries
+// ≈ 2 MB. It is a var (not const) only so tests can lower it to exercise
+// eviction. Its value must be identical on every replica.
+var maxDedupEntries = 10_000
+
+const (
+	defaultEventChanSize = 512
+	defaultHistorySize   = 1024
+	// maxRangeResults caps the number of keys returned by a single Range call
+	// to prevent memory exhaustion from a wildcard query.
+	maxRangeResults = 10_000
+
+	// maxRevision is the documented ceiling for the monotonic revision/version
+	// counters (L4). int64 gives ~9.2e18 headroom; at one mutation per
+	// nanosecond that is still ~292 years, so this is only a defense against
+	// pathological/adversarial input rather than an expected limit. We stop well
+	// short of math.MaxInt64 so the counters can never wrap to a negative value,
+	// which would break the monotonicity that watch/range/dedup rely on. When the
+	// ceiling is reached a mutation returns an error instead of corrupting state.
+	maxRevision = int64(1) << 62
+
+	// errRevisionExhausted is the KvResult.Error returned by a mutation once the
+	// revision counter has reached maxRevision (L4).
+	errRevisionExhausted = "revision counter exhausted"
+)
+
+// KVStore is the FSM for the distributed key-value store.
+// It implements raft.FSM and is safe for concurrent reads from any goroutine,
+// while Apply() is called exclusively from the raft run() goroutine.
+type KVStore struct {
+	mu       sync.RWMutex
+	data     map[string]*KeyValue // all keys (both legacy and v2 ops share this)
+	revision int64                // global cluster revision; incremented on mutations only
+	index    uint64               // incremented on every Apply call; used by Snapshot.Index()
+
+	// eventCh is written non-blocking by Apply() and drained by WatchManager.
+	eventCh chan []Event
+
+	// droppedEvents counts non-blocking sends to eventCh that were dropped
+	// because the channel was full. Observable via DroppedEvents().
+	droppedEvents uint64 // accessed atomically
+
+	// history is a ring buffer of past events for late-subscriber replay.
+	history    []Event
+	historyPos int // next write position (wraps around)
+	historyLen int // number of valid entries (capped at defaultHistorySize)
+
+	// dedupTable stores the last applied seqNum and result per client.
+	// This prevents double-application when a client retries after a network
+	// failure where the command committed but the response was lost.
+	dedupTable map[string]dedupEntry
+}
+
+// DroppedEvents returns the total number of event notifications that were
+// silently dropped because the WatchManager was not consuming fast enough.
+// A non-zero value means some watch subscribers may have missed live events
+// and had to reconnect using history replay.
+func (k *KVStore) DroppedEvents() uint64 {
+	return atomic.LoadUint64(&k.droppedEvents)
+}
+
+// NewKVStore creates a ready-to-use KVStore.
+func NewKVStore() *KVStore {
+	return &KVStore{
+		data:       make(map[string]*KeyValue),
+		eventCh:    make(chan []Event, defaultEventChanSize),
+		history:    make([]Event, defaultHistorySize),
+		dedupTable: make(map[string]dedupEntry),
+	}
+}
+
+// ---------------------------------------------------------------------------
+// kvCommand — internal JSON wire format shared by all ops
+// ---------------------------------------------------------------------------
+
+type kvCommand struct {
+	Op    string      `json:"op"`
+	Key   string      `json:"key"`
+	Value string      `json:"value"`
+	Txn   *TxnRequest `json:"txn,omitempty"` // only present for op=="txn"
+
+	// Idempotency fields.  When ClientID is set, Apply() deduplicates repeated
+	// commands from the same client (e.g. after a network retry that committed
+	// on the server but whose response was lost in transit).
+	// Read-only ops (get, get_v2, list, range) do not set these fields.
+	ClientID string `json:"client_id,omitempty"`
+	SeqNum   uint64 `json:"seq_num,omitempty"`
+}
+
+// dedupEntry caches the last applied result per client for idempotency.
+type dedupEntry struct {
+	SeqNum uint64 `json:"seq_num"`
+	Result []byte `json:"result"`
+	// Order is the apply index at which this entry was last stored. It gives a
+	// deterministic, replica-consistent basis for eviction (C8).
+	Order uint64 `json:"order"`
+}
+
+// KvResult is the response type for legacy and simple v2 operations.
+type KvResult struct {
+	Value string `json:"value"`
+	Error string `json:"error,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Apply — called serially from raft run() goroutine
+// ---------------------------------------------------------------------------
+
+func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	var cmd kvCommand
+	if err := json.Unmarshal(entry, &cmd); err != nil {
+		return nil, err
+	}
+
+	k.index++
+
+	// Idempotency deduplication: if we have seen this (clientID, seqNum) pair
+	// before, return the cached result without re-applying.
+	if cmd.ClientID != "" {
+		// C8: dedup on monotonic seq. Any command whose seq is <= the highest
+		// already applied for this client is a duplicate/stale retry and must not
+		// be re-applied (return the cached result rather than mutating again).
+		if entry, ok := k.dedupTable[cmd.ClientID]; ok && entry.SeqNum >= cmd.SeqNum {
+			return entry.Result, nil
+		}
+	}
+
+	var res []byte
+	var applyErr error
+	isMutation := false
+
+	switch cmd.Op {
+	// ------------------------------------------------------------------
+	// Legacy ops — preserved for 100 % backward compatibility
+	// ------------------------------------------------------------------
+
+	case "set":
+		if k.revisionExhausted() {
+			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
+			break
+		}
+		prev := k.data[cmd.Key]
+		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev)
+		k.emitEvents([]Event{{
+			Type:     EventPut,
+			Key:      cmd.Key,
+			KV:       kvClone(kv),
+			PrevKV:   kvClone(prev),
+			Revision: k.revision,
+		}})
+		res, applyErr = json.Marshal(KvResult{Value: cmd.Value})
+		isMutation = true
+
+	case "get":
+		kv := k.data[cmd.Key]
+		if kv == nil {
+			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
+		} else {
+			res, applyErr = json.Marshal(KvResult{Value: kv.Value})
+		}
+
+	case "delete":
+		kv := k.data[cmd.Key]
+		if kv == nil {
+			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
+		} else if k.revisionExhausted() {
+			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
+		} else {
+			k.revision++
+			delete(k.data, cmd.Key)
+			k.emitEvents([]Event{{
+				Type:     EventDelete,
+				Key:      cmd.Key,
+				PrevKV:   kvClone(kv),
+				Revision: k.revision,
+			}})
+			res, applyErr = json.Marshal(KvResult{Value: "ok"})
+			isMutation = true
+		}
+
+	case "list":
+		// Iterate keys in sorted order so the Apply output is deterministic
+		// across replicas (a Go map iterates in random order). Mirrors "range".
+		keys := make([]string, 0, len(k.data))
+		for key := range k.data {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		values := make([]string, 0, len(keys))
+		for _, key := range keys {
+			values = append(values, k.data[key].Value)
+		}
+		res, applyErr = json.Marshal(KvResult{Value: fmt.Sprintf("%v", values)})
+
+	// ------------------------------------------------------------------
+	// v2 ops
+	// ------------------------------------------------------------------
+
+	case "put":
+		if k.revisionExhausted() {
+			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
+			break
+		}
+		prev := k.data[cmd.Key]
+		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev)
+		k.emitEvents([]Event{{
+			Type:     EventPut,
+			Key:      cmd.Key,
+			KV:       kvClone(kv),
+			PrevKV:   kvClone(prev),
+			Revision: k.revision,
+		}})
+		kvJSON, err := json.Marshal(kv)
+		if err != nil {
+			return nil, err
+		}
+		res, applyErr = json.Marshal(KvResult{Value: string(kvJSON)})
+		isMutation = true
+
+	case "get_v2":
+		// Linearizable: this op travels through the Raft log so the read
+		// is guaranteed to reflect all preceding committed writes.
+		kv := k.data[cmd.Key]
+		if kv == nil {
+			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
+		} else {
+			kvJSON, err := json.Marshal(kv)
+			if err != nil {
+				return nil, err
+			}
+			res, applyErr = json.Marshal(KvResult{Value: string(kvJSON)})
+		}
+
+	case "range":
+		// Prefix scan — no mutation, no revision bump.
+		var kvs []*KeyValue
+		for key, kv := range k.data {
+			if strings.HasPrefix(key, cmd.Key) {
+				kvs = append(kvs, kvClone(kv))
+			}
+		}
+		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
+		rangeJSON, err := json.Marshal(kvs)
+		if err != nil {
+			return nil, err
+		}
+		res, applyErr = json.Marshal(KvResult{Value: string(rangeJSON)})
+
+	case "txn":
+		if cmd.Txn == nil {
+			res, applyErr = json.Marshal(KvResult{Error: "missing txn payload"})
+		} else {
+			resp := k.applyTxnLocked(cmd.Txn)
+			res, applyErr = json.Marshal(resp)
+			isMutation = true
+		}
+
+	default:
+		res, applyErr = json.Marshal(KvResult{Error: "unknown operation"})
+	}
+
+	// Record the result in the dedup table for mutation ops so that client
+	// retries receive the cached response rather than double-applying.
+	if isMutation && cmd.ClientID != "" && applyErr == nil {
+		prev, ok := k.dedupTable[cmd.ClientID]
+		if !ok || cmd.SeqNum >= prev.SeqNum {
+			k.dedupTable[cmd.ClientID] = dedupEntry{SeqNum: cmd.SeqNum, Result: res, Order: k.index}
+			k.evictDedupIfNeeded()
+		}
+	}
+
+	return res, applyErr
+}
+
+// revisionExhausted reports whether the revision counter has reached its
+// documented ceiling (L4). Callers must refuse further mutations when true so
+// the int64 counters never wrap to a negative value.
+func (k *KVStore) revisionExhausted() bool {
+	return k.revision >= maxRevision
+}
+
+// applyPutLocked creates or updates a key. Caller must hold mu.Lock().
+// Returns the updated KeyValue (stored in k.data).
+func (k *KVStore) applyPutLocked(key, value string, prev *KeyValue) *KeyValue {
+	k.revision++
+	var cr, ver int64
+	if prev != nil {
+		cr = prev.CreateRevision
+		ver = prev.Version + 1
+	} else {
+		cr = k.revision
+		ver = 1
+	}
+	kv := &KeyValue{
+		Key:            key,
+		Value:          value,
+		CreateRevision: cr,
+		ModRevision:    k.revision,
+		Version:        ver,
+	}
+	k.data[key] = kv
+	return kv
+}
+
+// applyTxnLocked evaluates and executes a transaction. Caller must hold mu.Lock().
+func (k *KVStore) applyTxnLocked(req *TxnRequest) TxnResponse {
+	// Evaluate all conditions.
+	succeeded := true
+	for _, cmp := range req.Compare {
+		if !k.evalCompare(cmp) {
+			succeeded = false
+			break
+		}
+	}
+
+	ops := req.Success
+	if !succeeded {
+		ops = req.Failure
+	}
+
+	if len(ops) == 0 {
+		return TxnResponse{Succeeded: succeeded, Revision: k.revision}
+	}
+
+	// L4: refuse to mutate once the revision ceiling is reached rather than
+	// wrapping the int64 counter negative. The txn is reported as not succeeded
+	// and no state is changed.
+	if k.revisionExhausted() {
+		return TxnResponse{Succeeded: false, Revision: k.revision}
+	}
+
+	// M11: transactions are atomic. Pre-validate every op before mutating any
+	// state so a failing op (e.g. delete of a missing key) aborts the whole txn
+	// without partial application. On abort nothing is written, no revision is
+	// consumed, no events are emitted, and Succeeded is reported false so the
+	// caller is never told the branch succeeded when an op did not.
+	for _, op := range ops {
+		if op.Type == 1 && k.data[op.Key] == nil { // delete of a missing key
+			results := make([]TxnResult, len(ops))
+			for i := range ops {
+				if ops[i].Type == 1 && k.data[ops[i].Key] == nil {
+					results[i] = TxnResult{Error: "key not found"}
+				}
+			}
+			return TxnResponse{Succeeded: false, Results: results, Revision: k.revision}
+		}
+	}
+
+	// Execute ops. All mutations share a single revision increment for the txn.
+	k.revision++
+	txnRev := k.revision
+
+	var results []TxnResult
+	var events []Event
+
+	for _, op := range ops {
+		switch op.Type {
+		case 0: // put
+			prev := k.data[op.Key]
+			var cr, ver int64
+			if prev != nil {
+				cr = prev.CreateRevision
+				ver = prev.Version + 1
+			} else {
+				cr = txnRev
+				ver = 1
+			}
+			kv := &KeyValue{
+				Key:            op.Key,
+				Value:          op.Value,
+				CreateRevision: cr,
+				ModRevision:    txnRev,
+				Version:        ver,
+			}
+			k.data[op.Key] = kv
+			events = append(events, Event{
+				Type:     EventPut,
+				Key:      op.Key,
+				KV:       kvClone(kv),
+				PrevKV:   kvClone(prev),
+				Revision: txnRev,
+			})
+			results = append(results, TxnResult{KV: kvClone(kv)})
+
+		case 1: // delete
+			// Pre-validated above: prev is guaranteed non-nil here.
+			prev := k.data[op.Key]
+			delete(k.data, op.Key)
+			events = append(events, Event{
+				Type:     EventDelete,
+				Key:      op.Key,
+				PrevKV:   kvClone(prev),
+				Revision: txnRev,
+			})
+			results = append(results, TxnResult{KV: kvClone(prev)})
+		}
+	}
+
+	if len(events) > 0 {
+		k.emitEvents(events)
+	}
+
+	return TxnResponse{Succeeded: succeeded, Results: results, Revision: txnRev}
+}
+
+// evalCompare evaluates a single Compare condition. Caller must hold mu.Lock() or mu.RLock().
+func (k *KVStore) evalCompare(c Compare) bool {
+	kv := k.data[c.Key]
+	switch c.Target {
+	case "value":
+		if kv == nil {
+			return c.Result == "not_equal"
+		}
+		switch c.Result {
+		case "equal":
+			return kv.Value == c.Value
+		case "not_equal":
+			return kv.Value != c.Value
+		}
+		return false
+	case "version":
+		var ver int64
+		if kv != nil {
+			ver = kv.Version
+		}
+		return compareInt64(ver, c.Rev, c.Result)
+	case "create_revision":
+		var cr int64
+		if kv != nil {
+			cr = kv.CreateRevision
+		}
+		return compareInt64(cr, c.Rev, c.Result)
+	case "mod_revision":
+		var mr int64
+		if kv != nil {
+			mr = kv.ModRevision
+		}
+		return compareInt64(mr, c.Rev, c.Result)
+	}
+	return false
+}
+
+// emitEvents writes events to the history ring buffer and pushes them to eventCh
+// non-blocking. Caller must hold mu.Lock().
+func (k *KVStore) emitEvents(events []Event) {
+	for _, ev := range events {
+		k.history[k.historyPos] = ev
+		k.historyPos = (k.historyPos + 1) % len(k.history)
+		if k.historyLen < len(k.history) {
+			k.historyLen++
+		}
+	}
+	select {
+	case k.eventCh <- events:
+	default:
+		// WatchManager is not keeping up; drop the live notification.
+		// Late subscribers reconnect using GetHistory(sinceRevision).
+		// Increment the dropped-events counter so operators can alert on this.
+		atomic.AddUint64(&k.droppedEvents, 1)
+	}
+}
+
+// drainEventCh non-blockingly empties any pending event batches from eventCh.
+// Caller must hold mu.Lock(). Used by Restore so pre-snapshot events buffered
+// in the channel are not delivered live after a snapshot install (H11).
+func (k *KVStore) drainEventCh() {
+	for {
+		select {
+		case <-k.eventCh:
+		default:
+			return
+		}
+	}
+}
+
+// kvClone returns a deep copy of kv, or nil if kv is nil.
+func kvClone(kv *KeyValue) *KeyValue {
+	if kv == nil {
+		return nil
+	}
+	cp := *kv
+	return &cp
+}
+
+// ---------------------------------------------------------------------------
+// Public read methods (safe for concurrent HTTP goroutines)
+// ---------------------------------------------------------------------------
+
+// Get returns the KeyValue for key, or nil if the key does not exist.
+func (k *KVStore) Get(key string) (*KeyValue, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	kv := k.data[key]
+	if kv == nil {
+		return nil, nil
+	}
+	return kvClone(kv), nil
+}
+
+// Range returns all KeyValues whose key has the given prefix, sorted by key.
+// At most maxRangeResults entries are returned; if the result set would exceed
+// this limit an error is returned to avoid memory exhaustion from wildcard queries.
+func (k *KVStore) Range(prefix string) ([]*KeyValue, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	var result []*KeyValue
+	for key, kv := range k.data {
+		if len(result) >= maxRangeResults {
+			return nil, fmt.Errorf("range result exceeds limit of %d keys; use a more specific prefix", maxRangeResults)
+		}
+		if strings.HasPrefix(key, prefix) {
+			result = append(result, kvClone(kv))
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Key < result[j].Key })
+	return result, nil
+}
+
+// GetRevision returns the current global cluster revision.
+func (k *KVStore) GetRevision() int64 {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	return k.revision
+}
+
+// NotificationChan returns the read-only channel on which Apply emits events.
+// It should be consumed exclusively by a single WatchManager goroutine.
+func (k *KVStore) NotificationChan() <-chan []Event {
+	return k.eventCh
+}
+
+// GetHistory returns all buffered events with Revision > sinceRevision,
+// in ascending revision order.
+func (k *KVStore) GetHistory(sinceRevision int64) []Event {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	if k.historyLen == 0 {
+		return nil
+	}
+
+	// Walk the ring buffer in insertion order (oldest → newest).
+	start := (k.historyPos - k.historyLen + len(k.history)) % len(k.history)
+	var result []Event
+	for i := 0; i < k.historyLen; i++ {
+		ev := k.history[(start+i)%len(k.history)]
+		if ev.Revision > sinceRevision {
+			result = append(result, ev)
+		}
+	}
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot / Restore
+// ---------------------------------------------------------------------------
+
+// kvSnapshotData is the JSON envelope written into snapshot files.
+type kvSnapshotData struct {
+	Revision int64 `json:"revision"`
+	// Index is the apply index (k.index) at the moment the snapshot was taken.
+	// It must be serialized and restored so Snapshot().Index() is correct after a
+	// Restore (H10): otherwise a restored FSM reports index 0 and the raft layer
+	// can mis-compute the snapshot/log boundary.
+	Index      uint64                `json:"index"`
+	Data       map[string]*KeyValue  `json:"data"`
+	DedupTable map[string]dedupEntry `json:"dedup_table,omitempty"`
+}
+
+// evictDedupIfNeeded removes entries when dedupTable exceeds maxDedupEntries.
+// Eviction is DETERMINISTIC (C8): it removes the entry with the lowest Order
+// (oldest deterministic insertion), breaking ties by client ID. Because the
+// dedup table is serialized into snapshots, a non-deterministic (e.g.
+// map-iteration-order) eviction would make replicas' snapshots diverge.
+// Called under mu.Lock (held by Apply).
+func (k *KVStore) evictDedupIfNeeded() {
+	for len(k.dedupTable) > maxDedupEntries {
+		var victimID string
+		var victimOrder uint64
+		first := true
+		for id, e := range k.dedupTable {
+			if first || e.Order < victimOrder || (e.Order == victimOrder && id < victimID) {
+				victimID = id
+				victimOrder = e.Order
+				first = false
+			}
+		}
+		delete(k.dedupTable, victimID)
+	}
+}
+
+func (k *KVStore) Snapshot() (raft.Snapshot, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	snap := kvSnapshotData{
+		Revision:   k.revision,
+		Index:      k.index,
+		Data:       make(map[string]*KeyValue, len(k.data)),
+		DedupTable: make(map[string]dedupEntry, len(k.dedupTable)),
+	}
+	for key, kv := range k.data {
+		snap.Data[key] = kvClone(kv)
+	}
+	for clientID, entry := range k.dedupTable {
+		snap.DedupTable[clientID] = entry
+	}
+
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return nil, err
+	}
+	return &kvSnapshot{data: data, index: k.index}, nil
+}
+
+func (k *KVStore) Restore(reader io.Reader) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+
+	// Reset watch history: stale pre-snapshot events must not be delivered
+	// to reconnecting watchers after the snapshot is installed.
+	k.history = make([]Event, defaultHistorySize)
+	k.historyPos = 0
+	k.historyLen = 0
+
+	// Drain any events buffered in eventCh (H11): pre-snapshot events must not be
+	// delivered live to watchers after a restore, or they'd be duplicated /
+	// out-of-order relative to the restored state.
+	k.drainEventCh()
+
+	// Try new versioned format first.
+	var snap kvSnapshotData
+	if err := json.Unmarshal(data, &snap); err == nil && snap.Data != nil {
+		k.data = snap.Data
+		k.revision = snap.Revision
+		k.index = snap.Index
+		if snap.DedupTable != nil {
+			k.dedupTable = snap.DedupTable
+		} else {
+			k.dedupTable = make(map[string]dedupEntry)
+		}
+		return nil
+	}
+
+	// Fall back to old map[string]string format (rolling upgrade path).
+	var legacy map[string]string
+	if err := json.Unmarshal(data, &legacy); err != nil {
+		return err
+	}
+	k.data = make(map[string]*KeyValue, len(legacy))
+	for key, val := range legacy {
+		k.data[key] = &KeyValue{Key: key, Value: val}
+	}
+	k.revision = 0
+	k.dedupTable = make(map[string]dedupEntry)
+	return nil
+}
+
+type kvSnapshot struct {
+	data  []byte
+	index uint64
+}
+
+func (s *kvSnapshot) Index() uint64 { return s.index }
+func (s *kvSnapshot) Term() uint64  { return 0 }
+func (s *kvSnapshot) Reader() io.ReadCloser {
+	return &kvReader{data: s.data}
+}
+
+type kvReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *kvReader) Read(p []byte) (n int, err error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	n = copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
+}
+
+func (r *kvReader) Close() error { return nil }
+
+// ---------------------------------------------------------------------------
+// Command encoding helpers (public API, backward compatible)
+// ---------------------------------------------------------------------------
+
+type CommandType uint8
+
+const (
+	CommandSet CommandType = iota
+	CommandGet
+	CommandDelete
+	CommandList
+)
+
+func EncodeCommand(op string, key, value string) ([]byte, error) {
+	cmd := kvCommand{Op: op, Key: key, Value: value}
+	return json.Marshal(cmd)
+}
+
+// EncodeCommandWithID encodes a kvCommand that includes idempotency fields so
+// the FSM can deduplicate retried writes from the same client.
+func EncodeCommandWithID(op, key, value, clientID string, seqNum uint64) ([]byte, error) {
+	cmd := kvCommand{
+		Op:       op,
+		Key:      key,
+		Value:    value,
+		ClientID: clientID,
+		SeqNum:   seqNum,
+	}
+	return json.Marshal(cmd)
+}
+
+func EncodeSet(key, value string) ([]byte, error) { return EncodeCommand("set", key, value) }
+func EncodeGet(key string) ([]byte, error)        { return EncodeCommand("get", key, "") }
+func EncodeDelete(key string) ([]byte, error)     { return EncodeCommand("delete", key, "") }
+
+func DecodeResult(data []byte) (*KvResult, error) {
+	var res KvResult
+	if err := json.Unmarshal(data, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// DecodeKeyValueResult decodes a *KeyValue from the JSON string embedded in
+// KvResult.Value — used by HTTP handlers and the client library for v2 ops.
+func DecodeKeyValueResult(data []byte) (*KeyValue, error) {
+	res, err := DecodeResult(data)
+	if err != nil {
+		return nil, err
+	}
+	if res.Error != "" {
+		return nil, fmt.Errorf("%s", res.Error)
+	}
+	var kv KeyValue
+	if err := json.Unmarshal([]byte(res.Value), &kv); err != nil {
+		return nil, err
+	}
+	return &kv, nil
+}
+
+// DecodeKeyValuesResult decodes a []*KeyValue from the JSON string embedded in
+// KvResult.Value — used by HTTP handlers for range ops.
+func DecodeKeyValuesResult(data []byte) ([]*KeyValue, error) {
+	res, err := DecodeResult(data)
+	if err != nil {
+		return nil, err
+	}
+	if res.Error != "" {
+		return nil, fmt.Errorf("%s", res.Error)
+	}
+	var kvs []*KeyValue
+	if err := json.Unmarshal([]byte(res.Value), &kvs); err != nil {
+		return nil, err
+	}
+	return kvs, nil
+}
+
+func EncodeUint64(v uint64) []byte {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, v)
+	return buf
+}
+
+func DecodeUint64(buf []byte) uint64 {
+	return binary.BigEndian.Uint64(buf)
+}
