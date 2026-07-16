@@ -1,0 +1,31 @@
+replicaCount: 3
+
+image:
+  repository: raftd
+  pullPolicy: IfNotPresent
+  # L10: pin an explicit, reproducible version tag instead of the mutable
+  # "latest" (supply-chain risk). Override per deployment; prefer a digest.
+  tag: "0.1.0"
+
+service:
+  type: ClusterIP
+  raftPort: 8080
+  httpPort: 8081
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 10Gi
+
+config:
+  electionTick: 10
+  heartbeatTick: 1
+  adminToken: ""
