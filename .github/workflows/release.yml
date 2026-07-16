@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  GO_VERSION: "1.24"
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X github.com/raft-consensus/pkg/version.Version=${VERSION} -X github.com/raft-consensus/pkg/version.GitCommit=${COMMIT} -X github.com/raft-consensus/pkg/version.BuildDate=${DATE}"
+
+          mkdir -p dist
+          for GOOS in linux darwin; do
+            for GOARCH in amd64 arm64; do
+              GOOS=${GOOS} GOARCH=${GOARCH} CGO_ENABLED=0 go build \
+                -trimpath -ldflags="${LDFLAGS}" \
+                -o dist/raftd-${GOOS}-${GOARCH} ./cmd/raftd
+            done
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Raft Consensus ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            Download the appropriate binary for your platform from the assets below.
+
+            ### Checksums
+            See `checksums.txt` in assets.
+
+  nightly:
+    name: Nightly Chaos Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run chaos tests (no -short flag)
+        run: go test -race -timeout 300s -run "TestAT|TestChaos|TestPartition" ./pkg/raft/
