@@ -1,0 +1,43 @@
+# Compiled binaries
+/raftd
+*.exe
+*.test
+
+# Build output
+/bin/
+/dist/
+
+# Test artifacts
+coverage.out
+coverage.html
+*.prof
+*.trace
+
+# Snapshot and data directories (created at runtime)
+data/
+snapshots/
+
+# Log files
+*.log
+
+# TLS certificates (generated; commit CA cert only if needed)
+scripts/certs/generated/
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backup files
+*.bak
+*.tmp
+
+# Compiled command binaries
+/kvctl
+/cmd/raftd/raftd
+/cmd/kvctl/kvctl
+# Runtime state files
+*.db
+*.wal
