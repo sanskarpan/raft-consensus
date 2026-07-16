@@ -20,6 +20,21 @@ import (
 	"github.com/raft-consensus/tools/testharness"
 )
 
+// eventually polls cond every 50ms until it returns true or timeout elapses,
+// failing the test if the condition is never met. It replaces fixed
+// time.Sleep-then-assert synchronization, which is flaky under CI load.
+func eventually(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %v: %s", timeout, msg)
+}
+
 func projectRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -145,10 +160,21 @@ func TestLeaderFailover(t *testing.T) {
 		t.Fatalf("health after restart: %v", err)
 	}
 
-	// Give the restarted node time to replicate.
-	time.Sleep(2 * time.Second)
+	// Wait for the restarted node to replicate: all post-kill keys must become
+	// readable with the expected values.
+	allPostKillReadable := func() bool {
+		for i := 0; i < postKillKeys; i++ {
+			key := fmt.Sprintf("chaos/post/%d", i)
+			kv, err := c.GetKV(key)
+			if err != nil || kv.Value != fmt.Sprintf("val-%d", i) {
+				return false
+			}
+		}
+		return true
+	}
+	eventually(t, 10*time.Second, allPostKillReadable, "all post-kill keys should be readable with expected values")
 
-	// All post-kill keys must be readable on all nodes.
+	// Final assertion with per-key diagnostics.
 	for i := 0; i < postKillKeys; i++ {
 		key := fmt.Sprintf("chaos/post/%d", i)
 		kv, err := c.GetKV(key)
@@ -239,10 +265,21 @@ func TestFollowerRestart(t *testing.T) {
 		t.Fatalf("health after restart: %v", err)
 	}
 
-	// Give the follower time to catch up via log replication.
-	time.Sleep(3 * time.Second)
+	// Wait for the follower to catch up via log replication: all 20 keys must
+	// become readable (linearizable = leader read) with expected values.
+	allReadable := func() bool {
+		for i := 0; i < 20; i++ {
+			key := fmt.Sprintf("restart/%d", i)
+			kv, err := c.GetKV(key)
+			if err != nil || kv.Value != fmt.Sprintf("v%d", i) {
+				return false
+			}
+		}
+		return true
+	}
+	eventually(t, 10*time.Second, allReadable, "all restart keys should be readable with expected values")
 
-	// All 20 keys must be readable (linearizable = leader read).
+	// Final assertion with per-key diagnostics.
 	for i := 0; i < 20; i++ {
 		key := fmt.Sprintf("restart/%d", i)
 		kv, err := c.GetKV(key)

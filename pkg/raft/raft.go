@@ -153,8 +153,11 @@ type raft struct {
 	// It is guarded by applyMu (an independent lock, NOT r.mu, so the apply path
 	// never has to acquire two locks in a fixed order and waiters never contend
 	// on r.mu). appliedForWait mirrors r.applyIndex under applyMu.
-	applyMu        sync.Mutex
-	applyCond      *sync.Cond
+	applyMu sync.Mutex
+	// applyWaitCh is closed+replaced by notifyApplied on each apply-index
+	// advance; WaitApplied selects on it instead of spawning a per-call watcher
+	// goroutine (L2). appliedForWait mirrors r.applyIndex under applyMu.
+	applyWaitCh    chan struct{}
 	appliedForWait uint64
 }
 
@@ -257,7 +260,7 @@ func newRaft(config *Config, localID ServerID, log LogStore, stable StableStore,
 		stopCh: make(chan struct{}),
 	}
 
-	r.applyCond = sync.NewCond(&r.applyMu)
+	r.applyWaitCh = make(chan struct{})
 
 	if transport != nil {
 		transport.SetLocalID(localID)
@@ -935,6 +938,14 @@ func (r *raft) spawnReplication(serverID ServerID) {
 
 // replicateTo sends the appropriate AppendEntries RPC to a follower.
 // It may carry new log entries or act as a heartbeat with no entries.
+// replicateTo drains outstanding entries to a follower. M-P1/M-P2: instead of
+// sending a single AppendEntries and re-spawning a goroutine on the next tick,
+// one goroutine keeps sending (replicateOnce) as long as the follower is still
+// behind or a rejection must be retried — continuous replication that amortizes
+// RTT over a backlog and avoids per-tick goroutine churn during replication.
+// The single-in-flight-per-follower invariant (H1) is preserved by the caller's
+// inflightReplication guard; a heartbeat to a caught-up follower is a single
+// pass. Safety of matchIndex/nextIndex updates is unchanged (see replicateOnce).
 func (r *raft) replicateTo(serverID ServerID) {
 	// H1: release the in-flight slot when this goroutine exits so the next tick
 	// (or proposal) can start a fresh replication attempt for this follower.
@@ -944,10 +955,23 @@ func (r *raft) replicateTo(serverID ServerID) {
 		r.mu.Unlock()
 	}()
 
+	for r.replicateOnce(serverID) {
+		// Follower still behind (or a reject needs an immediate retry from the
+		// backed-off nextIndex): keep draining without waiting for the next tick.
+	}
+}
+
+// replicateOnce sends one AppendEntries (or InstallSnapshot) to a follower and
+// applies the response. It returns true if the caller should immediately send
+// again — i.e. the follower is still behind after a successful batch, a
+// rejection was recorded (retry from the backed-off nextIndex), or a snapshot
+// was streamed — and false when the follower is caught up, we are no longer the
+// leader for this request's term, or the RPC failed.
+func (r *raft) replicateOnce(serverID ServerID) bool {
 	r.mu.RLock()
 	if r.state != StateLeader {
 		r.mu.RUnlock()
-		return
+		return false
 	}
 
 	nextIdx, ok := r.nextIndex[serverID]
@@ -963,7 +987,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 	if firstIdx > 0 && nextIdx < firstIdx {
 		r.mu.RUnlock()
 		r.sendSnapshotTo(serverID)
-		return
+		return true // continue replicating post-snapshot entries
 	}
 
 	prevLogIndex := uint64(0)
@@ -977,7 +1001,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 			// consistency via AppendEntries. Fall back to a snapshot.
 			r.mu.RUnlock()
 			r.sendSnapshotTo(serverID)
-			return
+			return true
 		}
 	}
 
@@ -1023,7 +1047,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 			zap.String("target", serverID.String()),
 			zap.Error(err),
 		)
-		return
+		return false // transport error: stop draining, retry on the next tick
 	}
 	metrics.RecordAppendEntriesSent(serverID.String(), resp.Success)
 	span.End()
@@ -1032,7 +1056,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 	defer r.mu.Unlock()
 
 	if r.state != StateLeader {
-		return
+		return false
 	}
 
 	if resp.Term > r.term {
@@ -1044,11 +1068,11 @@ func (r *raft) replicateTo(serverID ServerID) {
 		r.heartbeatAcks = make(map[ServerID]time.Time) // stale acks from old term
 		metrics.RecordLeaderID(false)
 		r.persistTermAndVotedFor()
-		return
+		return false
 	}
 
 	if resp.Term != r.term {
-		return
+		return false
 	}
 
 	// H2: the request was sent under reqTerm; if our term has advanced since
@@ -1057,7 +1081,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 	// applied. resp.Term == r.term guarantees no gap only if reqTerm also
 	// matches — a leader only mutates term via step-down, so verify explicitly.
 	if reqTerm != r.term {
-		return
+		return false
 	}
 
 	if resp.Success {
@@ -1076,6 +1100,8 @@ func (r *raft) replicateTo(serverID ServerID) {
 			metrics.RecordReplicationLag(serverID.String(), r.lastIndex-r.matchIndex[serverID])
 		}
 		r.advanceCommitIndex()
+		// M-P1: if the follower is still behind, keep draining immediately.
+		return r.nextIndex[serverID] <= r.lastIndex
 	} else {
 		// Follower rejected. Back off nextIndex, using the conflict term for a
 		// fast term-skip when available (M7), otherwise the conflict index hint.
@@ -1099,6 +1125,8 @@ func (r *raft) replicateTo(serverID ServerID) {
 		} else if r.nextIndex[serverID] > 1 {
 			r.nextIndex[serverID]--
 		}
+		// Retry immediately from the backed-off nextIndex (fast convergence).
+		return true
 	}
 }
 
@@ -1565,8 +1593,11 @@ func (r *raft) notifyApplied(idx uint64) {
 	if idx > r.appliedForWait {
 		r.appliedForWait = idx
 	}
+	// L2: broadcast by closing the current wait channel and installing a fresh
+	// one, so WaitApplied callers wake without a per-call watcher goroutine.
+	close(r.applyWaitCh)
+	r.applyWaitCh = make(chan struct{})
 	r.applyMu.Unlock()
-	r.applyCond.Broadcast()
 }
 
 // applyConfigurationEntry processes a committed configuration change entry.
@@ -1957,32 +1988,26 @@ func (r *raft) WaitApplied(ctx context.Context, idx uint64) error {
 		return nil
 	}
 
-	// A watcher goroutine wakes the Cond when ctx is cancelled so a blocked
-	// waiter can observe the cancellation and return. It exits once we signal
-	// done, so it never leaks past this call.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
+	// L2: block on a broadcast channel + ctx.Done() directly — no per-call
+	// watcher goroutine. We capture the current wait channel under applyMu AFTER
+	// re-checking the predicate; notifyApplied closes exactly that channel under
+	// the same lock, so a wake that races the select cannot be missed.
+	for {
+		r.applyMu.Lock()
+		if r.appliedForWait >= idx {
+			r.applyMu.Unlock()
+			return nil
+		}
+		ch := r.applyWaitCh
+		r.applyMu.Unlock()
+
 		select {
 		case <-ctx.Done():
-			// Broadcast so the waiter re-checks its predicate and sees ctx.Err().
-			r.applyCond.Broadcast()
-		case <-done:
+			return ctx.Err()
+		case <-ch:
+			// applyIndex advanced (or a broadcast fired); re-check the predicate.
 		}
-	}()
-
-	r.applyMu.Lock()
-	defer r.applyMu.Unlock()
-	for r.appliedForWait < idx {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		// Wait atomically releases applyMu and reacquires it on wake. We are
-		// woken either by notifyApplied (applyIndex advanced) or by the ctx
-		// watcher above; in both cases the loop re-checks the predicate.
-		r.applyCond.Wait()
 	}
-	return nil
 }
 
 func (r *raft) Configuration() Configuration {

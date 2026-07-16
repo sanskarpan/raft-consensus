@@ -358,6 +358,21 @@ func waitApplied(t *testing.T, r *raft, want uint64, timeout time.Duration) {
 	t.Fatalf("timed out waiting for appliedIndex >= %d; current = %d", want, r.AppliedIndex())
 }
 
+// eventually polls cond every 5ms until it returns true or timeout elapses,
+// failing the test if the condition is never met. It replaces fixed
+// time.Sleep-then-assert synchronization, which is flaky under load / -race.
+func eventually(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %v: %s", timeout, msg)
+}
+
 // ---- tests ---------------------------------------------------------------
 
 // --- Basic type / configuration tests (always pass) ----------------------
@@ -649,10 +664,16 @@ func TestThreeNodeApply(t *testing.T) {
 		t.Errorf("result = %q, want %q", result, "hello-cluster")
 	}
 
-	// Allow replication to complete.
-	time.Sleep(200 * time.Millisecond)
-
-	_ = fsms // FSMs are applied; at minimum the leader has applied.
+	// Wait for replication to complete: every node's FSM must have applied at
+	// least the committed command (in addition to the leader no-op entry).
+	eventually(t, 5*time.Second, func() bool {
+		for _, fsm := range fsms {
+			if fsm.count() < 1 {
+				return false
+			}
+		}
+		return true
+	}, "all FSMs should apply the committed command")
 }
 
 func TestTermProgressionOnRestart(t *testing.T) {
@@ -1330,15 +1351,16 @@ func TestThreeNodeAllFollowersApply(t *testing.T) {
 		}
 	}
 
-	// Allow replication to reach all followers.
-	time.Sleep(300 * time.Millisecond)
-
-	// All nodes should have applied at least N entries (leader no-op + N commands).
-	for i, fsm := range fsms {
-		if fsm.count() < N {
-			t.Errorf("node %d: FSM has %d entries, want >= %d", i, fsm.count(), N)
+	// Wait for replication to reach all followers: every node's FSM should have
+	// applied at least N entries (leader no-op + N commands).
+	eventually(t, 5*time.Second, func() bool {
+		for _, fsm := range fsms {
+			if fsm.count() < N {
+				return false
+			}
 		}
-	}
+		return true
+	}, fmt.Sprintf("all FSMs should apply >= %d entries", N))
 }
 
 // Test 7: Partition tolerance - leader isolation
@@ -1638,16 +1660,21 @@ func TestCommittedEntriesPresentOnMajorityAfterRecovery(t *testing.T) {
 	for i := range transports {
 		atomic.StoreInt32(&transports[i].drop, 0)
 	}
-	time.Sleep(300 * time.Millisecond)
 
-	// At least 2 out of 3 nodes must have applied all committed entries.
-	applied := 0
-	for _, f := range fsms {
-		if f.count() >= N {
-			applied++
+	// At least 2 out of 3 nodes must eventually apply all committed entries.
+	countApplied := func() int {
+		applied := 0
+		for _, f := range fsms {
+			if f.count() >= N {
+				applied++
+			}
 		}
+		return applied
 	}
-	if applied < 2 {
+	eventually(t, 5*time.Second, func() bool {
+		return countApplied() >= 2
+	}, fmt.Sprintf("at least 2/3 nodes should apply >= %d entries", N))
+	if applied := countApplied(); applied < 2 {
 		counts := make([]int, len(fsms))
 		for i, f := range fsms {
 			counts[i] = f.count()
@@ -1693,9 +1720,9 @@ func TestMembershipChangeUnderPartition(t *testing.T) {
 
 	// Heal partition.
 	atomic.StoreInt32(&transports[partIdx].drop, 0)
-	time.Sleep(200 * time.Millisecond)
 
-	// Cluster should still be consistent.
+	// Cluster should still be consistent; waitApplied polls until the leader has
+	// applied its last index (no fixed sleep needed).
 	lastIdx := leader.LastIndex()
 	waitApplied(t, leader, lastIdx, 5*time.Second)
 }
@@ -1951,16 +1978,21 @@ func TestAT1TenKCommandsCrashFollowerVerifyMajority(t *testing.T) {
 
 	// Heal.
 	healNode(transports[crashedIdx])
-	time.Sleep(500 * time.Millisecond)
 
-	// Verify at least 2/3 nodes have all committed entries.
-	alive := 0
-	for _, f := range fsms {
-		if f.count() >= N {
-			alive++
+	// Verify at least 2/3 nodes eventually have all committed entries.
+	countAlive := func() int {
+		alive := 0
+		for _, f := range fsms {
+			if f.count() >= N {
+				alive++
+			}
 		}
+		return alive
 	}
-	if alive < 2 {
+	eventually(t, 5*time.Second, func() bool {
+		return countAlive() >= 2
+	}, fmt.Sprintf("AT-1: at least 2/3 nodes should apply >= %d entries", N))
+	if alive := countAlive(); alive < 2 {
 		t.Errorf("AT-1: only %d/3 nodes have >= %d entries applied", alive, N)
 	}
 }
