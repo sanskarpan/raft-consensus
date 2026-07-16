@@ -161,8 +161,8 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 
-	var cmd kvCommand
-	if err := json.Unmarshal(entry, &cmd); err != nil {
+	cmd, err := decodeKVCommand(entry)
+	if err != nil {
 		return nil, err
 	}
 
@@ -756,21 +756,99 @@ const (
 )
 
 func EncodeCommand(op string, key, value string) ([]byte, error) {
-	cmd := kvCommand{Op: op, Key: key, Value: value}
-	return json.Marshal(cmd)
+	return encodeKVCommand(kvCommand{Op: op, Key: key, Value: value}), nil
 }
 
 // EncodeCommandWithID encodes a kvCommand that includes idempotency fields so
 // the FSM can deduplicate retried writes from the same client.
 func EncodeCommandWithID(op, key, value, clientID string, seqNum uint64) ([]byte, error) {
-	cmd := kvCommand{
+	return encodeKVCommand(kvCommand{
 		Op:       op,
 		Key:      key,
 		Value:    value,
 		ClientID: clientID,
 		SeqNum:   seqNum,
+	}), nil
+}
+
+// cmdBinaryMagic tags a binary-encoded kvCommand. It is deliberately not '{'
+// (0x7b) so decodeKVCommand can distinguish binary from the legacy/txn JSON
+// encoding by peeking the first byte (M-P4).
+const cmdBinaryMagic = 0x01
+
+// encodeKVCommand serializes a non-txn kvCommand into a compact, deterministic
+// binary form (M-P4): a magic byte, then length-prefixed op/key/value/clientID
+// and a uvarint seqNum. It is used for the hot put/get/delete path; txn commands
+// keep the JSON envelope (see EncodeTxn). The encoding is a pure function of the
+// command, so replicas produce byte-identical entries.
+func encodeKVCommand(cmd kvCommand) []byte {
+	// Txn commands are never routed here (EncodeTxn handles them); fall back to
+	// JSON defensively if a Txn is somehow present so nothing is silently lost.
+	if cmd.Txn != nil {
+		b, _ := json.Marshal(cmd)
+		return b
 	}
-	return json.Marshal(cmd)
+	size := 1 + 5*4 + len(cmd.Op) + len(cmd.Key) + len(cmd.Value) + len(cmd.ClientID) + binary.MaxVarintLen64
+	buf := make([]byte, 0, size)
+	buf = append(buf, cmdBinaryMagic)
+	writeLenPrefixed := func(b []byte, s string) []byte {
+		b = binary.AppendUvarint(b, uint64(len(s)))
+		return append(b, s...)
+	}
+	buf = writeLenPrefixed(buf, cmd.Op)
+	buf = writeLenPrefixed(buf, cmd.Key)
+	buf = writeLenPrefixed(buf, cmd.Value)
+	buf = writeLenPrefixed(buf, cmd.ClientID)
+	buf = binary.AppendUvarint(buf, cmd.SeqNum)
+	return buf
+}
+
+// decodeKVCommand decodes a kvCommand from either the binary form (magic byte)
+// or the legacy/txn JSON form (starts with '{'), so it is backward-compatible
+// with entries written before M-P4 and with txn commands (M-P4).
+func decodeKVCommand(data []byte) (kvCommand, error) {
+	var cmd kvCommand
+	if len(data) == 0 {
+		return cmd, fmt.Errorf("empty command")
+	}
+	if data[0] != cmdBinaryMagic {
+		// Legacy JSON command or a txn envelope.
+		err := json.Unmarshal(data, &cmd)
+		return cmd, err
+	}
+	b := data[1:]
+	readStr := func() (string, error) {
+		n, m := binary.Uvarint(b)
+		if m <= 0 {
+			return "", fmt.Errorf("corrupt command: bad length prefix")
+		}
+		b = b[m:]
+		if uint64(len(b)) < n {
+			return "", fmt.Errorf("corrupt command: truncated field")
+		}
+		s := string(b[:n])
+		b = b[n:]
+		return s, nil
+	}
+	var err error
+	if cmd.Op, err = readStr(); err != nil {
+		return cmd, err
+	}
+	if cmd.Key, err = readStr(); err != nil {
+		return cmd, err
+	}
+	if cmd.Value, err = readStr(); err != nil {
+		return cmd, err
+	}
+	if cmd.ClientID, err = readStr(); err != nil {
+		return cmd, err
+	}
+	seq, m := binary.Uvarint(b)
+	if m <= 0 {
+		return cmd, fmt.Errorf("corrupt command: bad seqnum")
+	}
+	cmd.SeqNum = seq
+	return cmd, nil
 }
 
 func EncodeSet(key, value string) ([]byte, error) { return EncodeCommand("set", key, value) }
