@@ -632,12 +632,3 @@ func TestIdempotencyDeleteDedup(t *testing.T) {
 		t.Errorf("expected nil for deleted key, got %v", entry)
 	}
 }
-
-// EncodeCommand with three args — helper so tests don't need to repeat (op,key,"")
-func encodeApply(kv *KVStore, op, key, value string) ([]byte, error) {
-	cmd, err := EncodeCommand(op, key, value)
-	if err != nil {
-		return nil, err
-	}
-	return kv.Apply(cmd)
-}
