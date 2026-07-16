@@ -6,15 +6,15 @@ import "encoding/json"
 // Target selects which field to compare; Result selects the comparison operator.
 type Compare struct {
 	Key    string `json:"key"`
-	Target string `json:"target"` // "value" | "version" | "create_revision" | "mod_revision"
-	Result string `json:"result"` // "equal" | "not_equal" | "greater" | "less"
+	Target string `json:"target"`          // "value" | "version" | "create_revision" | "mod_revision"
+	Result string `json:"result"`          // "equal" | "not_equal" | "greater" | "less"
 	Value  string `json:"value,omitempty"` // used when Target == "value"
 	Rev    int64  `json:"rev,omitempty"`   // used for numeric targets
 }
 
 // TxnOp is a single operation within a transaction's success or failure branch.
 type TxnOp struct {
-	Type  int    `json:"type"`            // 0 = put, 1 = delete
+	Type  int    `json:"type"` // 0 = put, 1 = delete
 	Key   string `json:"key"`
 	Value string `json:"value,omitempty"` // used for put
 }
