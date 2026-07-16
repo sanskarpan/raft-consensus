@@ -60,9 +60,10 @@ func bareServer(adminToken string) *Server {
 		PerIPRateLimitRPS: 100,
 	}
 	return &Server{
-		config:  cfg,
-		logger:  zap.NewNop(),
-		limiter: newWriteLimiter(cfg.RateLimitRPS),
+		config:       cfg,
+		logger:       zap.NewNop(),
+		limiter:      newWriteLimiter(cfg.RateLimitRPS),
+		watchCancels: make(map[int64]context.CancelFunc),
 	}
 }
 

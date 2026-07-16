@@ -28,8 +28,8 @@ func WithBinary(path string) HarnessOption {
 
 // Harness manages a set of raftd processes for integration testing.
 type Harness struct {
-	mu         sync.Mutex
-	nodes      map[string]*Node
+	mu    sync.Mutex
+	nodes map[string]*Node
 	// assignedPorts remembers the raft port allocated to each node ID so
 	// that restarted nodes always bind the same port they were first given.
 	assignedPorts map[string]int
