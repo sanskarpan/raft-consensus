@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-raft-config
+data:
+  config.yaml: |
+    node_id: "${HOSTNAME}"
+    listen_addr: ":{{ .Values.service.raftPort }}"
+    http_addr: ":{{ .Values.service.httpPort }}"
+    data_dir: /data
+    election_tick: {{ .Values.config.electionTick }}
+    heartbeat_tick: {{ .Values.config.heartbeatTick }}
+    admin_token: "{{ .Values.config.adminToken }}"
+    cluster:
+    {{- range $i := until (.Values.replicaCount | int) }}
+      - id: {{ $.Release.Name }}-raft-{{ $i }}
+        address: {{ $.Release.Name }}-raft-{{ $i }}.{{ $.Release.Name }}-raft-headless:{{ $.Values.service.raftPort }}
+    {{- end }}
