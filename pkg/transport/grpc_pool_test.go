@@ -18,6 +18,7 @@ import (
 	"github.com/raft-consensus/pkg/raft"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // selfSignedCert generates a minimal self-signed TLS certificate for tests
@@ -59,18 +60,18 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 // ---------------------------------------------------------------------------
 
 // buildFakePool creates a connPool whose entries are *grpc.ClientConn values
-// dialled to a blackhole address with grpc.WithInsecure so they are non-nil
+// pointed at a blackhole address with insecure credentials so they are non-nil
 // but never actually connected. We only need the pointer identity for the
 // round-robin tests; no actual RPC is performed.
 func buildFakePool(t *testing.T, n int) *connPool {
 	t.Helper()
 	conns := make([]*grpc.ClientConn, n)
 	for i := 0; i < n; i++ {
-		// grpc.Dial is non-blocking by default; the connection attempt happens
-		// in the background, so this always succeeds immediately.
-		c, err := grpc.Dial("localhost:1", grpc.WithInsecure()) //nolint:staticcheck
+		// M-L1: grpc.NewClient (lazy) replaces the deprecated grpc.Dial; the
+		// connection attempt happens lazily so this always succeeds immediately.
+		c, err := grpc.NewClient("localhost:1", grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			t.Fatalf("grpc.Dial: %v", err)
+			t.Fatalf("grpc.NewClient: %v", err)
 		}
 		conns[i] = c
 	}

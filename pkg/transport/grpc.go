@@ -17,8 +17,12 @@ import (
 	proto "github.com/raft-consensus/proto"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	grpcpeer "google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -36,6 +40,23 @@ const (
 	// DNS localhost, DNS *.raft.local, IP 127.0.0.1) when no explicit name is
 	// otherwise configured (C11).
 	defaultServerName = "localhost"
+
+	// M-R1: explicit gRPC message size limits, sized for snapshot chunks. The
+	// stock gRPC default is 4 MiB on receive and effectively unbounded on send;
+	// large AppendEntries/InstallSnapshot batches exceed 4 MiB and are rejected.
+	// These defaults are configurable via SetMaxMessageSize.
+	defaultGrpcMaxMsgSize = 64 << 20 // 64 MiB
+
+	// M-S4: aggregate cap on a reassembled InstallSnapshot stream. Chunks are
+	// accumulated on the server; without a total bound a peer could stream an
+	// unbounded snapshot and exhaust memory. Configurable via SetMaxSnapshotBytes.
+	defaultMaxSnapshotBytes int64 = 512 << 20 // 512 MiB
+
+	// M-R7: default RPC timeouts, now configurable. The AppendEntries timeout is
+	// intentionally short (near the heartbeat interval) so a stuck peer does not
+	// pin an in-flight slot; the snapshot timeout is longer for bulk transfer.
+	defaultAppendEntriesTimeout = 10 * time.Second
+	defaultSnapshotTimeout      = 30 * time.Second
 )
 
 // connPool holds a fixed-size slice of gRPC client connections and uses an
@@ -136,17 +157,186 @@ type GrpcTransport struct {
 	// peer without a TLS config returns an error instead of silently connecting
 	// in cleartext (C11).
 	requireTLS bool
+	// allowedMembers, when non-nil, is the set of peer certificate identities
+	// (CN or DNS SAN) permitted to call the Raft/Admin services. When mTLS is
+	// active and this set is non-empty, the server interceptors reject any RPC
+	// whose verified peer identity is not a member (H-S1). Nil/empty means the
+	// authorization check is disabled (plaintext/dev still works).
+	allowedMembers map[string]struct{}
+	// maxMsgSize bounds a single gRPC message on both send and receive (M-R1).
+	// 0 means defaultGrpcMaxMsgSize.
+	maxMsgSize int
+	// maxSnapshotBytes bounds a reassembled InstallSnapshot stream (M-S4).
+	// 0 means defaultMaxSnapshotBytes.
+	maxSnapshotBytes int64
+	// appendEntriesTimeout / snapshotTimeout override the per-RPC deadlines
+	// (M-R7). 0 means the corresponding default.
+	appendEntriesTimeout time.Duration
+	snapshotTimeout      time.Duration
 }
 
 // ErrTLSRequired is returned when RequireTLS is set but no TLS config is
 // available to dial a peer (C11).
 var ErrTLSRequired = errors.New("transport: TLS required but no TLS config configured")
 
+// checkKeyPerm rejects a TLS private-key file that is group- or
+// world-readable/writable (mode & 0077 != 0) (M-S3). An overly-permissive key
+// file is a common misconfiguration that leaks the cluster's identity material.
+// Symlinks are resolved via os.Stat so the permission of the real key is checked.
+func checkKeyPerm(path string) error {
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat key file: %w", err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf(
+			"key file %s has insecure permissions %#o (group/other-accessible); use 0600",
+			path, perm)
+	}
+	return nil
+}
+
 // SetRequireTLS enables fail-closed behavior: peers can only be dialed over TLS.
 func (t *GrpcTransport) SetRequireTLS(v bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.requireTLS = v
+}
+
+// SetAllowedMembers configures the set of peer certificate identities (CN or
+// DNS SAN) permitted to call the Raft and RaftAdmin services (H-S1). When mTLS
+// is active and this set is non-empty, the server interceptors reject any RPC
+// whose verified peer identity is not present in the set. Passing an empty or
+// nil slice disables the check so plaintext/dev deployments keep working.
+func (t *GrpcTransport) SetAllowedMembers(ids []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(ids) == 0 {
+		t.allowedMembers = nil
+		return
+	}
+	m := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			m[id] = struct{}{}
+		}
+	}
+	t.allowedMembers = m
+}
+
+// SetMaxMessageSize overrides the per-message size limit applied to both the
+// gRPC server and outbound dials (M-R1). n <= 0 restores the default.
+func (t *GrpcTransport) SetMaxMessageSize(n int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxMsgSize = n
+}
+
+// SetMaxSnapshotBytes overrides the aggregate cap on a reassembled
+// InstallSnapshot stream (M-S4). n <= 0 restores the default.
+func (t *GrpcTransport) SetMaxSnapshotBytes(n int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.maxSnapshotBytes = n
+}
+
+func (t *GrpcTransport) snapshotBytesCap() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.maxSnapshotBytes > 0 {
+		return t.maxSnapshotBytes
+	}
+	return defaultMaxSnapshotBytes
+}
+
+// SetRPCTimeouts overrides the per-RPC deadlines (M-R7). A non-positive value
+// for either argument leaves that timeout at its default.
+func (t *GrpcTransport) SetRPCTimeouts(appendEntries, snapshot time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if appendEntries > 0 {
+		t.appendEntriesTimeout = appendEntries
+	}
+	if snapshot > 0 {
+		t.snapshotTimeout = snapshot
+	}
+}
+
+func (t *GrpcTransport) aeTimeout() time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.appendEntriesTimeout > 0 {
+		return t.appendEntriesTimeout
+	}
+	return defaultAppendEntriesTimeout
+}
+
+func (t *GrpcTransport) snapTimeout() time.Duration {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.snapshotTimeout > 0 {
+		return t.snapshotTimeout
+	}
+	return defaultSnapshotTimeout
+}
+
+// peerAuthorized reports whether an RPC arriving on ctx is permitted. When no
+// allowed-member set is configured, or when the connection is not mTLS (no
+// verified client cert), the check passes (opt-in). Otherwise the verified peer
+// certificate's CN and DNS SANs are matched against the allowed set (H-S1).
+func (t *GrpcTransport) peerAuthorized(ctx context.Context) error {
+	t.mu.RLock()
+	allowed := t.allowedMembers
+	t.mu.RUnlock()
+	if len(allowed) == 0 {
+		return nil // authorization disabled
+	}
+
+	p, ok := grpcpeer.FromContext(ctx)
+	if !ok || p.AuthInfo == nil {
+		// No transport auth info: not an mTLS connection. Leave enforcement to
+		// the TLS layer (RequireAndVerifyClientCert) and skip identity check.
+		return nil
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return nil
+	}
+	chains := tlsInfo.State.VerifiedChains
+	if len(chains) == 0 || len(chains[0]) == 0 {
+		return status.Error(codes.Unauthenticated, "transport: no verified peer certificate")
+	}
+	leaf := chains[0][0]
+	if _, ok := allowed[leaf.Subject.CommonName]; ok {
+		return nil
+	}
+	for _, dns := range leaf.DNSNames {
+		if _, ok := allowed[dns]; ok {
+			return nil
+		}
+	}
+	return status.Errorf(codes.PermissionDenied,
+		"transport: peer identity %q is not an allowed cluster member", leaf.Subject.CommonName)
+}
+
+// unaryAuthInterceptor enforces per-RPC peer authorization on unary calls (H-S1).
+func (t *GrpcTransport) unaryAuthInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	if err := t.peerAuthorized(ctx); err != nil {
+		return nil, err
+	}
+	return handler(ctx, req)
+}
+
+// streamAuthInterceptor enforces per-RPC peer authorization on streaming calls
+// such as InstallSnapshot (H-S1).
+func (t *GrpcTransport) streamAuthInterceptor(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	if err := t.peerAuthorized(ss.Context()); err != nil {
+		return err
+	}
+	return handler(srv, ss)
 }
 
 type RaftHandler interface {
@@ -225,6 +415,10 @@ func NewGrpcTransportInsecure(listenAddr string, logger *zap.Logger) (*GrpcTrans
 	}
 
 	t.server = grpc.NewServer(
+		grpc.MaxRecvMsgSize(defaultGrpcMaxMsgSize),
+		grpc.MaxSendMsgSize(defaultGrpcMaxMsgSize),
+		grpc.UnaryInterceptor(t.unaryAuthInterceptor),
+		grpc.StreamInterceptor(t.streamAuthInterceptor),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             serverMinTime,
 			PermitWithoutStream: true,
@@ -303,12 +497,24 @@ func NewGrpcTransport(listenAddr string, logger *zap.Logger, cert tls.Certificat
 
 	t.server = grpc.NewServer(
 		grpc.Creds(creds),
+		grpc.MaxRecvMsgSize(defaultGrpcMaxMsgSize),
+		grpc.MaxSendMsgSize(defaultGrpcMaxMsgSize),
+		grpc.UnaryInterceptor(t.unaryAuthInterceptor),
+		grpc.StreamInterceptor(t.streamAuthInterceptor),
 		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 			MinTime:             serverMinTime,
 			PermitWithoutStream: true,
 		}))
 
 	t.listener = ln
+
+	// Register the Raft/Admin services before Serve. The insecure constructor
+	// already did this inline; the TLS path previously relied on a separate
+	// RegisterService() call that cmd/raftd never made, so a TLS server answered
+	// every RPC with "unknown service". Registering here keeps both constructors
+	// consistent and lets the auth interceptors (H-S1) take effect.
+	proto.RegisterRaftServiceServer(t.server, &grpcServerHandler{transport: t})
+	proto.RegisterRaftAdminServer(t.server, &grpcAdminHandler{transport: t})
 
 	t.wg.Add(1)
 	go func() {
@@ -396,6 +602,17 @@ func (t *GrpcTransport) SetAdminHandler(handler AdminHandler) {
 func (t *GrpcTransport) SetTLS(cfg *GRPCTLSConfig) error {
 	if cfg == nil {
 		return nil
+	}
+
+	// M-S3: reject a private key file that is group/other-readable before
+	// loading it, so a world-readable key is not silently accepted.
+	if err := checkKeyPerm(cfg.ServerKey); err != nil {
+		return fmt.Errorf("grpc: server key: %w", err)
+	}
+	if cfg.ClientKey != "" {
+		if err := checkKeyPerm(cfg.ClientKey); err != nil {
+			return fmt.Errorf("grpc: client key: %w", err)
+		}
 	}
 
 	// Load server certificate and key.
@@ -487,17 +704,36 @@ func (t *GrpcTransport) AddPeer(id raft.ServerID, addr raft.ServerAddress) error
 			t.mu.Unlock()
 			return ErrTLSRequired
 		}
-		dialOpts = append(dialOpts, grpc.WithInsecure()) //nolint:staticcheck
+		// M-L1: use insecure.NewCredentials() instead of the deprecated
+		// grpc.WithInsecure() (SA1019). Behavior is identical: no transport
+		// security. Combined with grpc.NewClient below this preserves the lazy
+		// dial and per-peer ServerName semantics.
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 	dialOpts = append(dialOpts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
 		Time:                clientKeepaliveTime,
 		Timeout:             20 * time.Second,
 		PermitWithoutStream: true,
 	}))
+	// M-R1: bound the message size on both directions of the client stub so
+	// large AppendEntries/InstallSnapshot payloads are not rejected by gRPC's
+	// 4 MiB default and sends stay bounded. t.mu is already held (write) here,
+	// so read the field directly rather than via msgSize() to avoid re-locking.
+	msgSize := t.maxMsgSize
+	if msgSize <= 0 {
+		msgSize = defaultGrpcMaxMsgSize
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+		grpc.MaxCallRecvMsgSize(msgSize),
+		grpc.MaxCallSendMsgSize(msgSize),
+	))
 
 	conns := make([]*grpc.ClientConn, defaultConnPoolSize)
 	for i := 0; i < defaultConnPoolSize; i++ {
-		conn, err := grpc.Dial(string(addr), dialOpts...) //nolint:staticcheck
+		// M-L1: grpc.NewClient replaces the deprecated grpc.Dial. NewClient is
+		// lazy by default (no eager connection), matching the previous behavior
+		// where grpc.Dial without WithBlock returned immediately.
+		conn, err := grpc.NewClient(string(addr), dialOpts...)
 		if err != nil {
 			// Close any connections already opened before failing.
 			for j := 0; j < i; j++ {
@@ -568,7 +804,7 @@ func (t *GrpcTransport) AppendEntries(ctx context.Context, target raft.ServerID,
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, t.aeTimeout())
 	defer cancel()
 
 	client, err := t.clientFor(pc)
@@ -606,7 +842,7 @@ func (t *GrpcTransport) RequestVote(ctx context.Context, target raft.ServerID, r
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, t.aeTimeout())
 	defer cancel()
 
 	client, err := t.clientFor(pc)
@@ -642,7 +878,7 @@ func (t *GrpcTransport) InstallSnapshot(ctx context.Context, target raft.ServerI
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, t.snapTimeout())
 	defer cancel()
 
 	client, err := t.clientFor(pc)
@@ -689,7 +925,7 @@ func (t *GrpcTransport) TimeoutNow(ctx context.Context, target raft.ServerID) er
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, t.aeTimeout())
 	defer cancel()
 
 	client, err := t.clientFor(pc)
@@ -807,6 +1043,9 @@ func (h *grpcServerHandler) InstallSnapshot(stream proto.RaftService_InstallSnap
 		data  []byte
 		done  bool
 	)
+	// M-S4: enforce an aggregate bound on the reassembled snapshot so a peer
+	// cannot stream an unbounded payload and exhaust server memory.
+	maxSnap := h.transport.snapshotBytesCap()
 	for {
 		chunk, err := stream.Recv()
 		if err == io.EOF {
@@ -818,6 +1057,10 @@ func (h *grpcServerHandler) InstallSnapshot(stream proto.RaftService_InstallSnap
 		}
 		if first == nil {
 			first = chunk
+		}
+		if int64(len(data))+int64(len(chunk.Data)) > maxSnap {
+			return status.Errorf(codes.ResourceExhausted,
+				"transport: snapshot exceeds max size %d bytes", maxSnap)
 		}
 		data = append(data, chunk.Data...)
 		if chunk.Done {

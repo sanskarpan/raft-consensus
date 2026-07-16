@@ -60,8 +60,8 @@ func TestLoadTLSConfigFromFiles(t *testing.T) {
 	keyFile := filepath.Join(dir, "server.key")
 	caFile := filepath.Join(dir, "ca.crt")
 
-	os.WriteFile(certFile, certPEM, 0600) //nolint:errcheck
-	os.WriteFile(keyFile, keyPEM, 0600)   //nolint:errcheck
+	os.WriteFile(certFile, certPEM, 0600)  //nolint:errcheck
+	os.WriteFile(keyFile, keyPEM, 0600)    //nolint:errcheck
 	os.WriteFile(caFile, ca.certPEM, 0600) //nolint:errcheck
 
 	cfg, err := transport.LoadTLSConfig(&transport.TCPTLSConfig{

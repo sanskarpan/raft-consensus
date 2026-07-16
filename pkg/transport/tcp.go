@@ -97,6 +97,64 @@ type tcpTransport struct {
 	// reqCounter is a monotonic source of per-request correlation IDs (C12).
 	// Accessed via sync/atomic; starts at 0 so the first ID handed out is 1.
 	reqCounter uint64
+	// allowedMembers, when non-nil and non-empty, restricts which verified peer
+	// certificate identities (CN or DNS SAN) may drive the transport over TLS
+	// (H-S1). Empty/nil disables the check so plaintext/dev keeps working.
+	allowedMembers map[string]struct{}
+}
+
+// SetAllowedMembers configures the set of verified peer certificate identities
+// (CN or DNS SAN) permitted to talk to this TCP transport when TLS is enabled
+// (H-S1). An empty/nil slice disables the check (plaintext/dev still works).
+func (t *tcpTransport) SetAllowedMembers(ids []string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(ids) == 0 {
+		t.allowedMembers = nil
+		return
+	}
+	m := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id != "" {
+			m[id] = struct{}{}
+		}
+	}
+	t.allowedMembers = m
+}
+
+// authorizeTLSConn checks the verified peer certificate on a TLS connection
+// against the allowed-member set (H-S1). It returns nil (allowed) when the
+// check is disabled or the connection is not TLS; enforcement of the presence
+// of a client cert itself is left to RequireAndVerifyClientCert.
+func (t *tcpTransport) authorizeTLSConn(conn net.Conn) error {
+	t.mu.RLock()
+	allowed := t.allowedMembers
+	t.mu.RUnlock()
+	if len(allowed) == 0 {
+		return nil
+	}
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return nil // not a TLS connection; nothing to authorize here
+	}
+	// Ensure the handshake has completed so VerifiedChains is populated.
+	if err := tlsConn.Handshake(); err != nil {
+		return err
+	}
+	state := tlsConn.ConnectionState()
+	if len(state.VerifiedChains) == 0 || len(state.VerifiedChains[0]) == 0 {
+		return fmt.Errorf("transport: no verified peer certificate")
+	}
+	leaf := state.VerifiedChains[0][0]
+	if _, ok := allowed[leaf.Subject.CommonName]; ok {
+		return nil
+	}
+	for _, dns := range leaf.DNSNames {
+		if _, ok := allowed[dns]; ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("transport: peer identity %q is not an allowed cluster member", leaf.Subject.CommonName)
 }
 
 // nextRequestID returns a fresh, monotonically increasing correlation ID (C12).
@@ -104,16 +162,102 @@ func (t *tcpTransport) nextRequestID() uint64 {
 	return atomic.AddUint64(&t.reqCounter, 1)
 }
 
-// defaultMaxMessageBytes caps a single inbound message. Large enough for
-// snapshot chunks, small enough to prevent an allocation-DoS.
-const defaultMaxMessageBytes int64 = 128 << 20 // 128 MiB
+// defaultMaxMessageBytes caps a single inbound message. Large enough for a
+// snapshot chunk, small enough to limit a pre-auth allocation-DoS (M-S2).
+// Snapshots are chunked, so a single frame never needs to be huge; the previous
+// 128 MiB default let an unauthenticated peer force a large allocation. Callers
+// that legitimately send larger single frames can raise it via
+// SetMaxMessageBytes.
+const defaultMaxMessageBytes int64 = 16 << 20 // 16 MiB
 
+// maxPeerConns bounds the number of concurrent connections a single peer may
+// hold. H-R5: the old design serialized every RPC to a peer behind one mutex
+// held across the whole network round-trip, so a slow AppendEntries starved
+// heartbeats/votes. We now keep a small pool of idle connections; concurrent
+// exchanges each check out their own connection, so they no longer serialize.
+// A cap prevents an unbounded connection blow-up under load.
+const maxPeerConns = 8
 
+// peer tracks the connection state for one remote server. H-R5: instead of a
+// single serialized conn, it maintains a free-list (idle) of ready connections
+// plus a count of connections currently checked out, all guarded by mu. The
+// request/response exchange itself runs WITHOUT holding mu, so exchanges to the
+// same peer proceed concurrently. Per-connection request-ID correlation (C12)
+// is preserved because each connection is used by exactly one exchange at a
+// time.
 type peer struct {
 	addr    raft.ServerAddress
-	conn    net.Conn
 	timeout time.Duration
-	mu      sync.Mutex
+
+	mu     sync.Mutex
+	idle   []net.Conn // ready connections available for checkout
+	closed bool       // set by RemovePeer/Close; no further checkouts
+}
+
+// checkoutConn returns a ready connection for an exchange, dialing a fresh one
+// if the idle pool is empty. The returned conn is owned exclusively by the
+// caller until releaseConn/discardConn. mu is held only briefly (M-C2: peer.conn
+// state is always mutated under peer.mu).
+func (t *tcpTransport) checkoutConn(ctx context.Context, p *peer) (net.Conn, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("peer removed")
+	}
+	if n := len(p.idle); n > 0 {
+		conn := p.idle[n-1]
+		p.idle = p.idle[:n-1]
+		p.mu.Unlock()
+		return conn, nil
+	}
+	p.mu.Unlock()
+
+	// Dial outside the lock so concurrent checkouts do not serialize on dialing.
+	return t.dialPeer(ctx, p)
+}
+
+// releaseConn returns a healthy connection to the idle pool for reuse. If the
+// peer has been removed or the pool is full, the connection is closed instead.
+func (t *tcpTransport) releaseConn(p *peer, conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	p.mu.Lock()
+	if p.closed || len(p.idle) >= maxPeerConns {
+		p.mu.Unlock()
+		conn.Close()
+		return
+	}
+	p.idle = append(p.idle, conn)
+	p.mu.Unlock()
+}
+
+// discardConn closes a connection that must not be reused (I/O error or a
+// correlation mismatch left it out of sync).
+func (t *tcpTransport) discardConn(conn net.Conn) {
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+// dialPeer opens a new connection to the peer, honoring the caller ctx deadline.
+func (t *tcpTransport) dialPeer(ctx context.Context, p *peer) (net.Conn, error) {
+	dialCtx, cancel := t.dialContext(ctx, p.timeout)
+	defer cancel()
+	if t.tlsClient != nil {
+		// C11: verify the server cert against this peer's own address rather
+		// than a hardcoded name. An explicit ServerName wins; otherwise it is
+		// derived from the peer address host.
+		peerTLS := t.tlsClient.Clone()
+		peerTLS.ServerName = serverNameFor(t.tlsClient.ServerName, string(p.addr))
+		dialer := &tls.Dialer{
+			NetDialer: &net.Dialer{Timeout: p.timeout},
+			Config:    peerTLS,
+		}
+		return dialer.DialContext(dialCtx, "tcp", string(p.addr))
+	}
+	d := &net.Dialer{Timeout: p.timeout}
+	return d.DialContext(dialCtx, "tcp", string(p.addr))
 }
 
 // TCPTLSConfig holds the paths to TLS material for the TCP transport.
@@ -137,6 +281,11 @@ func LoadTLSConfig(cfg *TCPTLSConfig) (*tls.Config, error) {
 	}
 	if cfg.CertFile == "" || cfg.KeyFile == "" {
 		return nil, fmt.Errorf("tls: CertFile and KeyFile must both be set")
+	}
+
+	// M-S3: refuse a key file that is group/other-readable before loading it.
+	if err := checkKeyPerm(cfg.KeyFile); err != nil {
+		return nil, fmt.Errorf("tls: %w", err)
 	}
 
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -265,6 +414,12 @@ func (t *tcpTransport) ListenerAddr() string {
 func (t *tcpTransport) serve() {
 	defer t.wg.Done()
 
+	// M-R2: bound concurrent connection handlers so a reconnect storm cannot
+	// exhaust goroutines/FDs, and back off on persistent accept errors.
+	const maxConcurrentConns = 1024
+	sem := make(chan struct{}, maxConcurrentConns)
+	var backoff time.Duration
+
 	for {
 		conn, err := t.listener.Accept()
 		if err != nil {
@@ -273,12 +428,36 @@ func (t *tcpTransport) serve() {
 				return
 			default:
 			}
-			t.logger.Error("failed to accept connection", zap.Error(err))
+			if backoff == 0 {
+				backoff = 5 * time.Millisecond
+			} else {
+				backoff *= 2
+			}
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+			t.logger.Error("failed to accept connection; backing off",
+				zap.Error(err), zap.Duration("delay", backoff))
+			select {
+			case <-time.After(backoff):
+			case <-t.shutdownCh:
+				return
+			}
 			continue
 		}
+		backoff = 0
 
+		select {
+		case sem <- struct{}{}:
+		case <-t.shutdownCh:
+			conn.Close()
+			return
+		}
 		t.wg.Add(1)
-		go t.handleConn(conn)
+		go func(c net.Conn) {
+			defer func() { <-sem }()
+			t.handleConn(c)
+		}(conn)
 	}
 }
 
@@ -294,6 +473,16 @@ const idleWriteTimeout = 30 * time.Second
 func (t *tcpTransport) handleConn(conn net.Conn) {
 	defer t.wg.Done()
 	defer conn.Close()
+
+	// H-S1: when an allowed-member set is configured and this is a TLS
+	// connection, reject peers whose verified certificate identity (CN/SAN) is
+	// not an expected cluster member before processing any request.
+	if err := t.authorizeTLSConn(conn); err != nil {
+		if t.logger != nil {
+			t.logger.Warn("rejected unauthorized peer", zap.Error(err))
+		}
+		return
+	}
 
 	// C12: bound the bytes read for any single message so an unauthenticated
 	// peer cannot exhaust memory with an arbitrarily large JSON object. The
@@ -535,49 +724,26 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 		return nil, err
 	}
 
-	peer.mu.Lock()
-	defer peer.mu.Unlock()
-
-	if peer.conn == nil {
-		var conn net.Conn
-		var err error
-		// M5: derive the dial deadline from the caller ctx (capped by the
-		// transport timeout) and thread ctx through the dial so cancellation is
-		// honored instead of always using context.Background().
-		dialCtx, cancel := t.dialContext(ctx, peer.timeout)
-		if t.tlsClient != nil {
-			// C11: verify the server cert against this peer's own address rather
-			// than a hardcoded name. An explicit ServerName wins; otherwise it is
-			// derived from the peer address host.
-			peerTLS := t.tlsClient.Clone()
-			peerTLS.ServerName = serverNameFor(t.tlsClient.ServerName, string(peer.addr))
-			dialer := &tls.Dialer{
-				NetDialer: &net.Dialer{Timeout: peer.timeout},
-				Config:    peerTLS,
-			}
-			conn, err = dialer.DialContext(dialCtx, "tcp", string(peer.addr))
-		} else {
-			d := &net.Dialer{Timeout: peer.timeout}
-			conn, err = d.DialContext(dialCtx, "tcp", string(peer.addr))
-		}
-		cancel()
-		if err != nil {
-			return nil, err
-		}
-		peer.conn = conn
+	// H-R5: check out a connection dedicated to this exchange instead of holding
+	// peer.mu across the whole round-trip. Concurrent RPCs to the same peer each
+	// use their own connection and therefore proceed in parallel. Per-connection
+	// request-ID correlation (C12) is preserved because a checked-out connection
+	// is never shared by two exchanges at once.
+	conn, err := t.checkoutConn(ctx, peer)
+	if err != nil {
+		return nil, err
 	}
 
 	// Set a per-exchange deadline so the goroutine cannot block indefinitely
 	// when the remote side is killed or unreachable (e.g. RST delayed on macOS).
 	// M5: prefer the caller ctx's deadline when it is sooner than the default.
-	if err := peer.conn.SetDeadline(t.exchangeDeadline(ctx, peer.timeout)); err != nil {
-		peer.conn.Close()
-		peer.conn = nil
+	if err := conn.SetDeadline(t.exchangeDeadline(ctx, peer.timeout)); err != nil {
+		t.discardConn(conn)
 		return nil, err
 	}
 
-	encoder := json.NewEncoder(peer.conn)
-	decoder := json.NewDecoder(peer.conn)
+	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
 
 	// C12: assign a unique correlation ID for this request. The server echoes
 	// it (and a matching response type) so we can detect a stale/mis-ordered
@@ -594,15 +760,13 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 	}
 
 	if err := encoder.Encode(msg); err != nil {
-		peer.conn.Close()
-		peer.conn = nil
+		t.discardConn(conn)
 		return nil, err
 	}
 
 	var resp message
 	if err := decoder.Decode(&resp); err != nil {
-		peer.conn.Close()
-		peer.conn = nil
+		t.discardConn(conn)
 		return nil, err
 	}
 
@@ -612,17 +776,17 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 	// rather than returning a payload that may belong to a different request.
 	wantType := msgType + "Response"
 	if resp.ID != reqID || resp.Type != wantType {
-		peer.conn.Close()
-		peer.conn = nil
+		t.discardConn(conn)
 		return nil, fmt.Errorf(
 			"transport: response correlation mismatch: got id=%d type=%q, want id=%d type=%q",
 			resp.ID, resp.Type, reqID, wantType,
 		)
 	}
 
-	// Clear the deadline so future exchanges on this connection are not
-	// affected by a stale deadline from this exchange.
-	peer.conn.SetDeadline(time.Time{}) //nolint:errcheck
+	// Clear the deadline so a future exchange on this connection is not affected
+	// by a stale deadline, then return it to the idle pool for reuse.
+	conn.SetDeadline(time.Time{}) //nolint:errcheck
+	t.releaseConn(peer, conn)
 
 	return resp.Payload, nil
 }
@@ -638,13 +802,20 @@ func (t *tcpTransport) Close() error {
 
 	t.wg.Wait()
 
+	// M-C2: take t.mu first, then each peer.mu (consistent t.mu -> peer.mu
+	// ordering) so peer connection state is always mutated under peer.mu even
+	// during shutdown.
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	for _, peer := range t.peers {
-		if peer.conn != nil {
-			peer.conn.Close()
+	for _, p := range t.peers {
+		p.mu.Lock()
+		p.closed = true
+		for _, c := range p.idle {
+			c.Close()
 		}
+		p.idle = nil
+		p.mu.Unlock()
 	}
 
 	return nil
@@ -667,13 +838,24 @@ func (t *tcpTransport) AddPeer(id raft.ServerID, addr raft.ServerAddress) error 
 }
 
 func (t *tcpTransport) RemovePeer(id raft.ServerID) {
+	// M-C2: order is t.mu -> peer.mu. peer connection state (idle pool, closed
+	// flag) is mutated ONLY under peer.mu, matching checkoutConn/releaseConn, so
+	// there is no data race with a concurrent sendRequest on the same peer.
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	if peer, ok := t.peers[id]; ok {
-		if peer.conn != nil {
-			peer.conn.Close()
-		}
+	p, ok := t.peers[id]
+	if ok {
 		delete(t.peers, id)
 	}
+	t.mu.Unlock()
+
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	p.closed = true
+	for _, c := range p.idle {
+		c.Close()
+	}
+	p.idle = nil
+	p.mu.Unlock()
 }
