@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/sanskarpan/raft-consensus/security/advisories/new
+    about: Please report security issues privately. Do not open a public issue. See SECURITY.md.
+  - name: Questions and discussion
+    url: https://github.com/sanskarpan/raft-consensus/discussions
+    about: Ask questions and discuss usage in GitHub Discussions.

@@ -9,19 +9,31 @@ on:
     - cron: '0 2 * * *'  # 2 AM UTC daily
 
 env:
-  GO_VERSION: "1.24"
+  # Primary toolchain; the module pins toolchain go1.26.5 via go.mod.
+  GO_VERSION: "1.26.5"
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Test
+    name: Test (Go ${{ matrix.go-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Build/test matrix: primary toolchain plus the next minor for
+        # forward-compat signal. Keep the primary first for coverage upload.
+        go-version: ["1.26.5", "1.25.x"]
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: ${{ matrix.go-version }}
           cache: true
 
       - name: Download dependencies
@@ -40,18 +52,62 @@ jobs:
         run: go test -race -timeout 120s ./...
 
       - name: Test with coverage
+        if: matrix.go-version == '1.26.5'
         run: go test -coverprofile=coverage.out -timeout 120s ./...
 
       - name: Upload coverage
+        if: matrix.go-version == '1.26.5'
         uses: actions/upload-artifact@v4
         with:
           name: coverage
           path: coverage.out
 
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8
+          args: --timeout=5m
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: staticcheck
+        run: staticcheck ./...
+
+  vuln:
+    name: Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: govulncheck
+        run: govulncheck ./...
+
   build-docker:
     name: Build Docker Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, lint, vuln]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4

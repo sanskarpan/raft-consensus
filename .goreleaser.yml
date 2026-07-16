@@ -1,0 +1,91 @@
+# GoReleaser configuration for raft-consensus.
+# Schema version 2 (GoReleaser v2.x). Validate with: goreleaser check
+version: 2
+
+project_name: raft-consensus
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+
+builds:
+  - id: raftd
+    main: ./cmd/raftd
+    binary: raftd
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/raft-consensus/pkg/version.Version={{ .Version }}
+      - -X github.com/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/raft-consensus/pkg/version.BuildDate={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: kvctl
+    main: ./cmd/kvctl
+    binary: kvctl
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/raft-consensus/pkg/version.Version={{ .Version }}
+      - -X github.com/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/raft-consensus/pkg/version.BuildDate={{ .Date }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: default
+    ids:
+      - raftd
+      - kvctl
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - CHANGELOG.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Software Bill of Materials generated via syft (must be on PATH).
+sboms:
+  - id: archive-sbom
+    artifacts: archive
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "Merge pull request"
+      - "Merge branch"
+
+release:
+  github:
+    owner: sanskarpan
+    name: raft-consensus
+  draft: false
+  prerelease: auto
