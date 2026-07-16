@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	mathrand "math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -40,6 +41,34 @@ func retryBackoff(n int) time.Duration {
 	}
 	jitter := time.Duration(mathrand.Int63n(tenPct*2+1)) - time.Duration(tenPct)
 	return d + jitter
+}
+
+// Watch stream deadlines (L3). watchResponseHeaderTimeout bounds the initial
+// connect + header wait so a black-holed first address fails over quickly;
+// watchIdleReadTimeout bounds the gap between reads on an established stream so
+// a silent half-open connection is detected rather than hanging on the OS TCP
+// timeout. It must comfortably exceed the server's SSE keepalive interval.
+const (
+	watchResponseHeaderTimeout = 10 * time.Second
+	watchIdleReadTimeout       = 90 * time.Second
+)
+
+// watchBackoff returns the full-jitter wait before reconnect attempt n
+// (0-indexed). The base grows exponentially 100ms → 200ms → … capped at 30s;
+// the returned value is uniformly random in [0, base) ("full jitter") to spread
+// a thundering herd of clients reconnecting after a shared outage. Because the
+// result is random, callers should not assume monotonic growth between calls.
+func watchBackoff(n int) time.Duration {
+	base := 100 * time.Millisecond
+	for i := 0; i < n; i++ {
+		base *= 2
+		if base >= 30*time.Second {
+			base = 30 * time.Second
+			break
+		}
+	}
+	// Full jitter: uniform in [0, base).
+	return time.Duration(mathrand.Int63n(int64(base)))
 }
 
 // v2RetryMax is the number of full retry rounds for v2 API calls.
@@ -239,18 +268,30 @@ func (c *Client) SubmitCommand(key, value string) (string, error) {
 	// without one (H5).
 	seq := c.nextSeqNum()
 
-	url := fmt.Sprintf("http://%s/command", c.getCurrentAddr())
-	resp, err := c.sendCommandIdem(url, data, seq)
-	if err != nil {
-		for _, addr := range c.addrs {
-			url = fmt.Sprintf("http://%s/command", addr)
-			resp, err = c.sendCommandIdem(url, data, seq)
-			if err == nil {
-				break
+	// Route the multi-node sweep through doWithRetry so a shared outage backs
+	// off (jittered exponential) between rounds instead of hammering every node
+	// in a tight loop (L3). Try the last-known-good address first, then the full
+	// address list; the seq is generated once so all retries share one
+	// idempotency key (H5).
+	var resp []byte
+	err = c.doWithRetry(func() error {
+		if cur := c.getCurrentAddr(); cur != "" {
+			url := fmt.Sprintf("http://%s/command", cur)
+			if r, e := c.sendCommandIdem(url, data, seq); e == nil {
+				resp = r
+				return nil
 			}
 		}
-	}
-
+		for _, addr := range c.addrs {
+			url := fmt.Sprintf("http://%s/command", addr)
+			r, e := c.sendCommandIdem(url, data, seq)
+			if e == nil {
+				resp = r
+				return nil
+			}
+		}
+		return fmt.Errorf("SubmitCommand: all nodes failed")
+	})
 	if err != nil {
 		return "", err
 	}
@@ -530,9 +571,9 @@ type ClientTxnRequest struct {
 
 // ClientTxnResponse is the response from /v1/txn.
 type ClientTxnResponse struct {
-	Succeeded bool      `json:"succeeded"`
-	Results   []KVPair  `json:"results,omitempty"`
-	Revision  int64     `json:"revision"`
+	Succeeded bool     `json:"succeeded"`
+	Results   []KVPair `json:"results,omitempty"`
+	Revision  int64    `json:"revision"`
 }
 
 // ClientKVEvent is a single key change event delivered to Watch subscribers.
@@ -713,18 +754,28 @@ func (c *Client) WatchPrefix(ctx context.Context, prefix string, opts ...WatchOp
 
 // watchLoop connects to an SSE endpoint and pushes events to ch.
 // On disconnect it reconnects with the last seen revision as Last-Event-ID.
-// Uses exponential backoff (100ms → 200ms → … → 30s) between reconnects.
+// Backoff between reconnects is full-jittered exponential (base 100ms → … → 30s)
+// to avoid a thundering herd on a shared outage, and successive attempts rotate
+// through every configured address so a dead first node fails over (L3).
 func (c *Client) watchLoop(ctx context.Context, path string, sinceRevision int64, ch chan<- ClientWatchEvent) {
 	defer close(ch)
 	lastRevision := sinceRevision
 	reconnects := 0
+	attempt := 0 // rotates the starting address across reconnects
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		addr := c.addrs[0] // prefer first address; no leader forwarding needed
+		// Rotate through all configured addresses so a dead first node fails
+		// over to a second on the next attempt instead of retrying addrs[0].
+		addrs := c.addrs
+		var addr string
+		if len(addrs) > 0 {
+			addr = addrs[attempt%len(addrs)]
+		}
+		attempt++
 		rawURL := fmt.Sprintf("http://%s%s", addr, path)
 
 		err := c.streamSSE(ctx, rawURL, lastRevision, ch, &lastRevision)
@@ -732,15 +783,8 @@ func (c *Client) watchLoop(ctx context.Context, path string, sinceRevision int64
 			return
 		}
 		if err != nil {
-			// Exponential backoff: 100ms, 200ms, 400ms, … capped at 30s.
-			d := 100 * time.Millisecond
-			for i := 0; i < reconnects; i++ {
-				d *= 2
-				if d >= 30*time.Second {
-					d = 30 * time.Second
-					break
-				}
-			}
+			// Full-jitter exponential backoff to spread reconnects.
+			d := watchBackoff(reconnects)
 			select {
 			case <-ctx.Done():
 				return
@@ -770,8 +814,30 @@ func (c *Client) streamSSE(
 		req.Header.Set("Last-Event-ID", fmt.Sprintf("%d", sinceRevision))
 	}
 
-	// Use a client with no timeout — the connection stays open.
-	streamClient := &http.Client{}
+	// A silent half-open connection (peer vanished, no FIN/RST) would otherwise
+	// hang until the OS TCP timeout — potentially minutes. We bound how long we
+	// wait for response headers, and grab the underlying net.Conn via a custom
+	// DialContext so we can set a per-read idle deadline that is reset on each
+	// received event: a healthy long-lived stream stays open while a stalled one
+	// is torn down (L3). The client has no overall Timeout so an active stream is
+	// never cut off mid-flight.
+	var connMu sync.Mutex
+	var streamConn net.Conn
+	baseDial := (&net.Dialer{Timeout: watchResponseHeaderTimeout}).DialContext
+	streamClient := &http.Client{
+		Transport: &http.Transport{
+			ResponseHeaderTimeout: watchResponseHeaderTimeout,
+			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
+				conn, derr := baseDial(dctx, network, addr)
+				if derr == nil {
+					connMu.Lock()
+					streamConn = conn
+					connMu.Unlock()
+				}
+				return conn, derr
+			},
+		},
+	}
 	resp, err := streamClient.Do(req)
 	if err != nil {
 		return err
@@ -782,10 +848,27 @@ func (c *Client) streamSSE(
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
+	// setReadDeadline pushes a fresh idle deadline on the captured conn; when it
+	// elapses with no data the Read fails and the loop exits, triggering a
+	// reconnect rather than hanging on a dead conn.
+	setReadDeadline := func() {
+		connMu.Lock()
+		conn := streamConn
+		connMu.Unlock()
+		if conn != nil {
+			_ = conn.SetReadDeadline(time.Now().Add(watchIdleReadTimeout))
+		}
+	}
+
 	scanner := bufio.NewScanner(resp.Body)
 	var dataLines []string
 
-	for scanner.Scan() {
+	for {
+		// Reset the idle deadline before each line read.
+		setReadDeadline()
+		if !scanner.Scan() {
+			break
+		}
 		line := scanner.Text()
 
 		if line == "" {
