@@ -606,8 +606,8 @@ cluster:
 	}
 	defer func() {
 		if cmd.Process != nil {
-			cmd.Process.Kill()   //nolint:errcheck
-			cmd.Wait()           //nolint:errcheck
+			cmd.Process.Kill() //nolint:errcheck
+			cmd.Wait()         //nolint:errcheck
 		}
 	}()
 

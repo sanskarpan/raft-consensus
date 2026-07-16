@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -20,8 +23,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/raft-consensus/pkg/fsm"
+	"github.com/raft-consensus/pkg/metrics"
 	"github.com/raft-consensus/pkg/raft"
 	"github.com/raft-consensus/pkg/storage"
 	"github.com/raft-consensus/pkg/tracing"
@@ -96,6 +101,12 @@ type Config struct {
 	// PerIPRateLimitRPS caps write requests per second per client IP.
 	// Zero uses the default of 50 RPS.
 	PerIPRateLimitRPS int `yaml:"per_ip_rate_limit_rps"`
+
+	// MetricsAuth, when true, gates the /metrics endpoint behind the read role
+	// (M-O3). When false (the default) /metrics is still automatically gated
+	// behind auth whenever any admin token is configured; it stays open only in
+	// token-less dev mode.
+	MetricsAuth bool `yaml:"metrics_auth"`
 
 	// TrustedProxyCIDRs is a list of CIDR blocks (e.g. "10.0.0.0/8") whose
 	// X-Forwarded-For / X-Real-IP headers are trusted for per-IP rate
@@ -293,6 +304,19 @@ func (s *Server) sweepPerIPLimiters(ctx context.Context) {
 			}
 			return true
 		})
+
+		// L5: also evict per-IP watch counters that have dropped to zero (no open
+		// streams). These are never otherwise removed, so a churn of distinct
+		// client IPs would grow the map unbounded. A concurrent acquire that
+		// loaded the same counter will simply re-create the entry, so deleting a
+		// zeroed counter is safe.
+		s.watchPerIP.Range(func(key, val any) bool {
+			ctr := val.(*int64)
+			if atomic.LoadInt64(ctr) == 0 {
+				s.watchPerIP.Delete(key)
+			}
+			return true
+		})
 	}
 }
 
@@ -304,15 +328,26 @@ type Server struct {
 	watchMgr        *fsm.WatchManager // SSE event fan-out
 	watchCtxCancel  context.CancelFunc
 	sweepCancel     context.CancelFunc // cancels sweepPerIPLimiters goroutine on shutdown
-	limiter         *writeLimiter     // global token-bucket rate limiter
-	perIPLimiters   sync.Map          // map[string]*writeLimiter — per client-IP limiters
-	watchCount      int64             // current number of open /v1/watch SSE streams (atomic)
-	watchPerIP      sync.Map          // map[string]*int64 — open watch streams per client IP
-	trustedNets     []*net.IPNet      // parsed from config TrustedProxyCIDRs
-	tracingProvider *tracing.Provider // shutdown on exit
+	limiter         *writeLimiter      // global token-bucket rate limiter
+	perIPLimiters   sync.Map           // map[string]*writeLimiter — per client-IP limiters
+	watchCount      int64              // current number of open /v1/watch SSE streams (atomic)
+	watchPerIP      sync.Map           // map[string]*int64 — open watch streams per client IP
+	trustedNets     []*net.IPNet       // parsed from config TrustedProxyCIDRs
+	tracingProvider *tracing.Provider  // shutdown on exit
 	logger          *zap.Logger
 	http            *http.Server
 	debugServer     *http.Server
+
+	// draining is flipped to 1 at the start of Shutdown so write endpoints
+	// return 503 before the drain begins (M-R4).
+	draining atomic.Bool
+
+	// watchMu guards watchCancels, the set of per-request cancel funcs for open
+	// SSE watch streams. Shutdown cancels them all so http.Shutdown does not
+	// block on long-lived streams (M-R3).
+	watchMu      sync.Mutex
+	watchCancels map[int64]context.CancelFunc
+	watchSeq     int64
 }
 
 func main() {
@@ -462,9 +497,10 @@ func debugAddrIsLoopback(addr string) bool {
 
 func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	s := &Server{
-		config:  config,
-		logger:  logger,
-		limiter: newWriteLimiter(config.RateLimitRPS),
+		config:       config,
+		logger:       logger,
+		limiter:      newWriteLimiter(config.RateLimitRPS),
+		watchCancels: make(map[int64]context.CancelFunc),
 	}
 
 	// Parse trusted proxy CIDRs so clientIP() can extract real IPs.
@@ -504,6 +540,32 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	go s.sweepPerIPLimiters(sweepCtx)
 
 	return s, nil
+}
+
+// tlsConfigured reports whether any TLS material is configured for the Raft
+// transport, in which case per-peer authorization should be enforced (H-S1).
+func (s *Server) tlsConfigured() bool {
+	return s.config.TLSCert != "" || s.config.TLSKey != "" || s.config.TLSCA != ""
+}
+
+// allowedMemberSetter is implemented by transports that support restricting
+// which peer identities may drive consensus (H-S1). Both the gRPC and TCP
+// transports satisfy it.
+type allowedMemberSetter interface {
+	SetAllowedMembers([]string)
+}
+
+// applyAllowedMembers passes the configured cluster member IDs to the transport
+// so it can reject RPCs from certificates that are not an expected member (H-S1).
+func (s *Server) applyAllowedMembers(trans raft.Transport) {
+	ids := make([]string, 0, len(s.config.Cluster))
+	for _, m := range s.config.Cluster {
+		ids = append(ids, m.ID)
+	}
+	if setter, ok := trans.(allowedMemberSetter); ok {
+		setter.SetAllowedMembers(ids)
+		s.logger.Info("peer authorization enabled", zap.Int("allowed_members", len(ids)))
+	}
 }
 
 func (s *Server) initRaft() error {
@@ -646,6 +708,14 @@ func (s *Server) initRaft() error {
 		return err
 	}
 
+	// H-S1: when TLS is configured, restrict which peer certificate identities
+	// may drive consensus / RaftAdmin to the configured cluster member IDs, so a
+	// cert that merely chains to the CA cannot inject config changes. Left open
+	// (no-op) for plaintext/dev deployments.
+	if s.tlsConfigured() {
+		s.applyAllowedMembers(trans)
+	}
+
 	// Wire the raft node into the handler wrapper now that it exists.
 	wrapper.raftNode = raftNode
 
@@ -758,11 +828,63 @@ func (s *Server) waitApplied(ctx context.Context, idx uint64) error {
 func (s *Server) initHTTP() {
 	s.http = &http.Server{
 		Addr:         s.config.HttpAddr,
-		Handler:      s.corsMiddleware(s.buildMux()),
+		Handler:      s.requestIDMiddleware(s.corsMiddleware(s.buildMux())),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
+}
+
+// requestIDHeader is the HTTP header carrying the per-request correlation ID
+// (M-O2). It is generated if absent and propagated on the leader-forward hop.
+const requestIDHeader = "X-Request-ID"
+
+// requestIDKey is the context key under which the request ID is stored.
+type requestIDKey struct{}
+
+// newRequestID returns a random 128-bit hex request ID (M-O2).
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Fall back to a time-based value; correlation is best-effort.
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// requestIDFromContext returns the request ID stored on ctx, or "".
+func requestIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(requestIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// requestIDMiddleware ensures every request carries an X-Request-ID, generating
+// one if the client did not supply it, echoing it in the response, and stashing
+// it in the request context so error-path logs and the leader-forward hop can
+// correlate a single client request across nodes (M-O2).
+func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(requestIDHeader)
+		if id == "" {
+			id = newRequestID()
+			r.Header.Set(requestIDHeader, id)
+		}
+		w.Header().Set(requestIDHeader, id)
+		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// instrument wraps a route handler so its latency is recorded in
+// raft_http_request_duration_seconds labelled by handler/method/code (M-O1).
+func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
+	wrapped := promhttp.InstrumentHandlerDuration(
+		metrics.HTTPRequestDuration.MustCurryWith(prometheus.Labels{"handler": name}),
+		h,
+	)
+	return wrapped.ServeHTTP
 }
 
 // buildMux registers all HTTP routes and returns the mux. Extracted from
@@ -771,13 +893,16 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Health/readiness are intentionally unauthenticated.
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/health", instrument("health", s.handleHealth))
+	mux.HandleFunc("/ready", instrument("ready", s.handleReady))
 	// C10: /command applies arbitrary FSM writes and MUST require the write role.
-	mux.HandleFunc("/command", s.requireRole("write", s.rateLimitMiddleware(s.handleCommand)))
-	mux.HandleFunc("/admin/cluster", s.authMiddleware(s.handleCluster))
-	mux.HandleFunc("/admin/snapshot", s.requireRole("write", s.handleSnapshot))
-	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/command", instrument("command", s.requireRole("write", s.rateLimitMiddleware(s.handleCommand))))
+	mux.HandleFunc("/admin/cluster", instrument("admin_cluster", s.authMiddleware(s.handleCluster)))
+	mux.HandleFunc("/admin/snapshot", instrument("admin_snapshot", s.requireRole("write", s.handleSnapshot)))
+	// M-O3: /metrics leaks topology/term/leader. Gate it behind the read role
+	// whenever any admin token is configured (or metrics_auth is set), so prod
+	// deployments require auth while token-less dev stays open.
+	mux.HandleFunc("/metrics", instrument("metrics", s.metricsHandler()))
 
 	// Cluster membership management API (write role required).
 	// POST   /admin/members            — add a voting server
@@ -785,19 +910,38 @@ func (s *Server) buildMux() *http.ServeMux {
 	// POST   /admin/members/{id}/promote — promote learner → voter
 	// POST   /admin/members/{id}/demote  — demote voter → learner
 	// POST   /admin/learners           — add a non-voting learner
-	mux.HandleFunc("/admin/members", s.requireRole("write", s.handleAdminMembers))
-	mux.HandleFunc("/admin/members/", s.requireRole("write", s.handleAdminMemberByID))
+	mux.HandleFunc("/admin/members", instrument("admin_members", s.requireRole("write", s.handleAdminMembers)))
+	mux.HandleFunc("/admin/members/", instrument("admin_member_by_id", s.requireRole("write", s.handleAdminMemberByID)))
 
 	// v1 KV API routes.
 	// /v1/kv/{key} — GET (linearizable/stale), PUT, DELETE
 	// /v1/kv      — GET ?prefix= for range queries
-	mux.HandleFunc("/v1/kv/", s.authMiddleware(s.rateLimitMiddleware(s.handleV1KV)))
-	mux.HandleFunc("/v1/kv", s.authMiddleware(s.rateLimitMiddleware(s.handleV1KVList)))
-	mux.HandleFunc("/v1/txn", s.authMiddleware(s.rateLimitMiddleware(s.handleV1Txn)))
-	mux.HandleFunc("/v1/watch", s.authMiddleware(s.handleV1Watch))
-	mux.HandleFunc("/v1/status", s.authMiddleware(s.handleV1Status))
+	mux.HandleFunc("/v1/kv/", instrument("v1_kv", s.authMiddleware(s.rateLimitMiddleware(s.handleV1KV))))
+	mux.HandleFunc("/v1/kv", instrument("v1_kv_list", s.authMiddleware(s.rateLimitMiddleware(s.handleV1KVList))))
+	mux.HandleFunc("/v1/txn", instrument("v1_txn", s.authMiddleware(s.rateLimitMiddleware(s.handleV1Txn))))
+	mux.HandleFunc("/v1/watch", instrument("v1_watch", s.authMiddleware(s.handleV1Watch)))
+	mux.HandleFunc("/v1/status", instrument("v1_status", s.authMiddleware(s.handleV1Status)))
 
 	return mux
+}
+
+// metricsAuthEnabled reports whether /metrics must be gated behind the read
+// role: either metrics_auth was set explicitly, or any admin token is
+// configured (prod), leaving token-less dev deployments open (M-O3).
+func (s *Server) metricsAuthEnabled() bool {
+	if s.config.MetricsAuth {
+		return true
+	}
+	return s.config.AdminToken != "" || len(s.config.AdminTokens) > 0
+}
+
+// metricsHandler returns the /metrics handler, gated behind the read role when
+// metricsAuthEnabled() (M-O3).
+func (s *Server) metricsHandler() http.HandlerFunc {
+	if s.metricsAuthEnabled() {
+		return s.requireRole("read", s.handleMetrics)
+	}
+	return s.handleMetrics
 }
 
 func (s *Server) Start() error {
@@ -868,6 +1012,15 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Shutdown() {
+	// M-R4: stop accepting new writes before draining so in-flight requests can
+	// finish and no new proposals race the leader handoff.
+	s.draining.Store(true)
+
+	// M-R3: cancel every open watch stream now so http.Shutdown does not block
+	// for the full grace period waiting on long-lived SSE connections. Each
+	// stream emits a clean event: shutdown as it unwinds.
+	s.cancelAllWatches()
+
 	// Stop WatchManager goroutine.
 	if s.watchCtxCancel != nil {
 		s.watchCtxCancel()
@@ -961,6 +1114,15 @@ func (s *Server) transferLeadership() {
 	}
 }
 
+// constantTimeEqual reports whether a and b are equal using a constant-time
+// comparison (M-S1). subtle.ConstantTimeCompare requires equal-length inputs to
+// avoid leaking length via an early return, so we hash-independent-length guard
+// with a length check that is itself not the discriminating branch: unequal
+// lengths always fail, and equal lengths are compared in constant time.
+func constantTimeEqual(a, b string) bool {
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
 func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// C9: fail closed when no tokens are configured. Only allow unauthenticated
@@ -986,14 +1148,19 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			token = token[7:]
 		}
 
-		// Determine the role for this token.
+		// Determine the role for this token. M-S1: use constant-time comparison
+		// so an attacker cannot recover a valid token byte-by-byte via timing.
 		role := ""
-		if token == s.config.AdminToken && s.config.AdminToken != "" {
+		if s.config.AdminToken != "" && constantTimeEqual(token, s.config.AdminToken) {
 			// Legacy single token always gets "write" role.
 			role = "write"
 		} else if s.config.AdminTokens != nil {
-			if r, ok := s.config.AdminTokens[token]; ok {
-				role = r
+			// Constant-time scan: compare against every configured token so the
+			// runtime does not depend on which (if any) token matched.
+			for candidate, r := range s.config.AdminTokens {
+				if constantTimeEqual(token, candidate) {
+					role = r
+				}
 			}
 		}
 
@@ -1029,15 +1196,38 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// healthChecker is the optional interface a raft node implements to report a
+// fatal storage/FSM error (H-R2). The concrete *raft node satisfies it via
+// Healthy(); stubs may or may not. A node that does not implement it is
+// treated as healthy.
+type healthChecker interface {
+	Healthy() bool
+}
+
+// nodeHealthy reports whether the raft node has not hit a fatal storage/FSM
+// error. Nodes that do not implement healthChecker are assumed healthy.
+func (s *Server) nodeHealthy() bool {
+	if hc, ok := s.raftNode.(healthChecker); ok {
+		return hc.Healthy()
+	}
+	return true
+}
+
+// handleReady is the readiness probe (H-O1). A node is ready only when it is a
+// Follower or Leader, it knows a current leader (Leader() != ""), and it has
+// not hit a fatal storage/FSM error (Healthy()). A partitioned follower with no
+// known leader — or a node with a fatal disk error — reports 503 so a load
+// balancer takes it out of rotation. /health remains a pure liveness probe.
 func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	state := s.raftNode.State()
-	if state == raft.StateLeader || state == raft.StateFollower {
+	stateOK := state == raft.StateLeader || state == raft.StateFollower
+	if stateOK && s.raftNode.Leader() != "" && s.nodeHealthy() && !s.draining.Load() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ready"))
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("not ready"))
+		return
 	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	w.Write([]byte("not ready"))
 }
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
@@ -1066,8 +1256,16 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// M-R4: refuse new writes once draining has begun so in-flight requests can
+	// finish and the log can be handed off cleanly.
+	if s.draining.Load() {
+		s.writeDrainingResponse(w)
+		return
+	}
+
 	leader := s.raftNode.Leader()
 	if leader == "" {
+		metrics.RecordRejection("not_leader")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]string{"error": "no leader elected"})
 		return
@@ -1093,14 +1291,20 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.raftNode.Apply(ctx, data)
 	if err != nil {
+		metrics.RecordProposal("error")
+		if errors.Is(err, raft.ErrNotLeader) {
+			metrics.RecordRejection("not_leader")
+		}
 		s.logger.Warn("Apply failed",
 			zap.Error(err),
 			zap.String("state", s.raftNode.State().String()),
 			zap.String("leader", string(s.raftNode.Leader())),
+			zap.String("request_id", requestIDFromContext(r.Context())),
 		)
 		s.writeGenericError(w, http.StatusInternalServerError, "internal error", err)
 		return
 	}
+	metrics.RecordProposal("ok")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"result": string(result)})
@@ -1274,6 +1478,7 @@ func (s *Server) handleAdminMemberByID(w http.ResponseWriter, r *http.Request) {
 func (s *Server) ensureLeader(w http.ResponseWriter, r *http.Request, path string) error {
 	leader := s.raftNode.Leader()
 	if leader == "" {
+		metrics.RecordRejection("not_leader")
 		w.WriteHeader(http.StatusServiceUnavailable)
 		json.NewEncoder(w).Encode(map[string]string{"error": "no leader elected"})
 		return fmt.Errorf("no leader")
@@ -1354,6 +1559,10 @@ func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request, leaderI
 	if req.Header.Get("Content-Type") == "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// M-O2: propagate the request ID so the leader's logs correlate with ours.
+	if reqID := requestIDFromContext(r.Context()); reqID != "" {
+		req.Header.Set(requestIDHeader, reqID)
+	}
 
 	client := &http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Do(req)
@@ -1362,7 +1571,9 @@ func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request, leaderI
 			zap.Error(err),
 			zap.String("to", forwardAddr),
 			zap.String("leader", leaderID),
+			zap.String("request_id", requestIDFromContext(r.Context())),
 		)
+		metrics.RecordRejection("not_leader")
 		s.writeGenericError(w, http.StatusServiceUnavailable, "failed to reach leader", err)
 		return err
 	}
@@ -1375,6 +1586,22 @@ func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request, leaderI
 	return nil
 }
 
+// recordApplyRejection records a rejection metric when an Apply failed because
+// this node is not the leader (M-O1).
+func (s *Server) recordApplyRejection(err error) {
+	if errors.Is(err, raft.ErrNotLeader) {
+		metrics.RecordRejection("not_leader")
+	}
+}
+
+// writeDrainingResponse rejects a write with 503 during shutdown drain (M-R4).
+func (s *Server) writeDrainingResponse(w http.ResponseWriter) {
+	metrics.RecordRejection("draining")
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	writeJSON(w, map[string]string{"error": "server is shutting down"})
+}
+
 // writeJSON is a small helper to set Content-Type and encode a value.
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
@@ -1383,7 +1610,7 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 
 // Key/value size limits enforced on PUT (L8).
 const (
-	maxKeySize   = 4 << 10  // 4 KiB
+	maxKeySize   = 4 << 10   // 4 KiB
 	maxValueSize = 512 << 10 // 512 KiB
 )
 
@@ -1543,6 +1770,10 @@ func (s *Server) handleV1Get(w http.ResponseWriter, r *http.Request, key string)
 // handleV1Put serves PUT /v1/kv/{key}.
 // Body can be a raw string or JSON {"value":"..."}.
 func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string) {
+	if s.draining.Load() {
+		s.writeDrainingResponse(w)
+		return
+	}
 	if err := s.ensureLeader(w, r, "/v1/kv/"+key); err != nil {
 		return
 	}
@@ -1598,9 +1829,12 @@ func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string)
 
 	result, err := s.raftNode.Apply(ctx, data)
 	if err != nil {
+		metrics.RecordProposal("error")
+		s.recordApplyRejection(err)
 		s.writeError(w, err)
 		return
 	}
+	metrics.RecordProposal("ok")
 
 	kv, err := fsm.DecodeKeyValueResult(result)
 	if err != nil {
@@ -1613,6 +1847,10 @@ func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string)
 
 // handleV1Delete serves DELETE /v1/kv/{key}.
 func (s *Server) handleV1Delete(w http.ResponseWriter, r *http.Request, key string) {
+	if s.draining.Load() {
+		s.writeDrainingResponse(w)
+		return
+	}
 	if err := s.ensureLeader(w, r, "/v1/kv/"+key); err != nil {
 		return
 	}
@@ -1639,9 +1877,12 @@ func (s *Server) handleV1Delete(w http.ResponseWriter, r *http.Request, key stri
 
 	result, err := s.raftNode.Apply(ctx, data)
 	if err != nil {
+		metrics.RecordProposal("error")
+		s.recordApplyRejection(err)
 		s.writeError(w, err)
 		return
 	}
+	metrics.RecordProposal("ok")
 
 	res, _ := fsm.DecodeResult(result)
 	if res != nil && res.Error != "" {
@@ -1718,6 +1959,11 @@ func (s *Server) handleV1Txn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.draining.Load() {
+		s.writeDrainingResponse(w)
+		return
+	}
+
 	if err := s.ensureLeader(w, r, "/v1/txn"); err != nil {
 		return
 	}
@@ -1740,9 +1986,12 @@ func (s *Server) handleV1Txn(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.raftNode.Apply(ctx, data)
 	if err != nil {
+		metrics.RecordProposal("error")
+		s.recordApplyRejection(err)
 		s.writeError(w, err)
 		return
 	}
+	metrics.RecordProposal("ok")
 
 	resp, err := fsm.DecodeTxnResult(result)
 	if err != nil {
@@ -1750,6 +1999,43 @@ func (s *Server) handleV1Txn(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, resp)
+}
+
+// registerWatch stores cancel under a fresh ID so Shutdown can cancel every
+// open SSE stream at drain start (M-R3). It returns the ID and a deregister
+// func the handler must defer.
+func (s *Server) registerWatch(cancel context.CancelFunc) (int64, func()) {
+	s.watchMu.Lock()
+	s.watchSeq++
+	id := s.watchSeq
+	if s.watchCancels == nil {
+		s.watchCancels = make(map[int64]context.CancelFunc)
+	}
+	s.watchCancels[id] = cancel
+	n := len(s.watchCancels)
+	s.watchMu.Unlock()
+	metrics.SetWatchConnections(n)
+	return id, func() {
+		s.watchMu.Lock()
+		delete(s.watchCancels, id)
+		n := len(s.watchCancels)
+		s.watchMu.Unlock()
+		metrics.SetWatchConnections(n)
+	}
+}
+
+// cancelAllWatches cancels every open watch stream's request context so
+// http.Shutdown does not block waiting for long-lived SSE connections (M-R3).
+func (s *Server) cancelAllWatches() {
+	s.watchMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(s.watchCancels))
+	for _, c := range s.watchCancels {
+		cancels = append(cancels, c)
+	}
+	s.watchMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
 }
 
 // handleV1Watch serves GET /v1/watch — SSE stream of key change events.
@@ -1800,6 +2086,16 @@ func (s *Server) handleV1Watch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// H-R4: an SSE stream is long-lived, but the server's 60s WriteTimeout would
+	// otherwise kill it (and make WatchIdleTimeout > 60s a no-op). Clear the
+	// per-request write deadline so the stream can run for the full idle window.
+	if rc := http.NewResponseController(w); rc != nil {
+		if err := rc.SetWriteDeadline(time.Time{}); err != nil {
+			// Not fatal — some ResponseWriters (e.g. httptest) don't support it.
+			s.logger.Debug("watch: could not clear write deadline", zap.Error(err))
+		}
+	}
+
 	// Set SSE headers before writing any body.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1812,7 +2108,14 @@ func (s *Server) handleV1Watch(w http.ResponseWriter, r *http.Request) {
 		idleTimeout = 5 * time.Minute
 	}
 
-	ctx := r.Context()
+	// M-R3: derive a cancellable context and register it so Shutdown can cancel
+	// this stream immediately (rather than blocking http.Shutdown for the full
+	// grace period). The stream also emits a clean event: shutdown on cancel.
+	ctx, cancelWatch := context.WithCancel(r.Context())
+	defer cancelWatch()
+	_, deregister := s.registerWatch(cancelWatch)
+	defer deregister()
+
 	var (
 		ch      <-chan fsm.WatchEvent
 		watchID fsm.WatchID
@@ -1857,6 +2160,13 @@ func (s *Server) handleV1Watch(w http.ResponseWriter, r *http.Request) {
 			return
 
 		case <-ctx.Done():
+			// M-R3: if the server is draining, send a clean shutdown event so the
+			// client reconnects to another node instead of seeing a truncated
+			// stream. Resume is via Last-Event-ID.
+			if s.draining.Load() {
+				fmt.Fprintf(w, "event: shutdown\ndata: {\"reason\":\"server shutting down\"}\n\n")
+				flusher.Flush()
+			}
 			return
 		}
 	}

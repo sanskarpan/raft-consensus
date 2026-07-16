@@ -24,6 +24,9 @@ type leaderStub struct {
 	readErr     error
 	applied     uint64
 	appliedCall int64
+	unhealthy   bool // when true, Healthy() reports false (H-R2/H-O1)
+	applyErr    error
+	applyResult []byte
 }
 
 func (r *leaderStub) State() raft.RaftState {
@@ -53,12 +56,17 @@ func (r *leaderStub) WaitApplied(ctx context.Context, idx uint64) error {
 func (r *leaderStub) ReadIndex(_ context.Context) (uint64, error) {
 	return r.readIndex, r.readErr
 }
-func (r *leaderStub) Apply(_ context.Context, _ []byte) ([]byte, error)     { return nil, nil }
-func (r *leaderStub) Snapshot() error                                       { return nil }
-func (r *leaderStub) Restore(_ context.Context, _ io.Reader) error          { return nil }
-func (r *leaderStub) Start() error                                          { return nil }
-func (r *leaderStub) Shutdown() error                                       { return nil }
-func (r *leaderStub) RequestLeadership(_ context.Context) error             { return nil }
+func (r *leaderStub) Apply(_ context.Context, _ []byte) ([]byte, error) {
+	return r.applyResult, r.applyErr
+}
+
+// Healthy satisfies the healthChecker interface used by /ready (H-R2/H-O1).
+func (r *leaderStub) Healthy() bool                                { return !r.unhealthy }
+func (r *leaderStub) Snapshot() error                              { return nil }
+func (r *leaderStub) Restore(_ context.Context, _ io.Reader) error { return nil }
+func (r *leaderStub) Start() error                                 { return nil }
+func (r *leaderStub) Shutdown() error                              { return nil }
+func (r *leaderStub) RequestLeadership(_ context.Context) error    { return nil }
 func (r *leaderStub) ReplaceServer(_ context.Context, _, _ raft.ServerID, _ raft.ServerAddress) error {
 	return nil
 }
