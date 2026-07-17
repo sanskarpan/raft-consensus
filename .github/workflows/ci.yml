@@ -75,9 +75,12 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # v9 of the action supports golangci-lint v2. v2.12.x is built with
+        # go1.26, satisfying the go.mod `toolchain go1.26.5` (the v1 line was
+        # built with go1.24 and refused to lint a 1.26-targeted module).
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v1.64.8
+          version: v2.12.2
           args: --timeout=5m
 
       - name: Install staticcheck
