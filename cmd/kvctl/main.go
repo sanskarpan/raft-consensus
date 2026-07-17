@@ -47,6 +47,7 @@ func main() {
 	stale := flag.Bool("stale", false, "use stale consistency for get/range")
 	prefix := flag.Bool("prefix", false, "watch by prefix instead of exact key")
 	revision := flag.Int64("revision", 0, "start watch/history from this revision")
+	limit := flag.Int("limit", 0, "page size for range (auto-pages through all results when > 0)")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -100,7 +101,7 @@ func main() {
 		if len(cmdArgs) >= 1 {
 			pfx = cmdArgs[0]
 		}
-		runRange(c, pfx)
+		runRange(c, pfx, *limit)
 
 	case "txn":
 		src := "-"
@@ -208,10 +209,28 @@ func runDelete(c *client.Client, key string) {
 	fmt.Printf("deleted %q\n", key)
 }
 
-func runRange(c *client.Client, prefix string) {
-	kvs, err := c.Range(prefix)
-	if err != nil {
-		fatalf("range failed: %v\n", err)
+func runRange(c *client.Client, prefix string, limit int) {
+	var kvs []*client.KVPair
+	if limit > 0 {
+		// Auto-page through all results (bounded per request); avoids the
+		// single-shot 10k-key cap.
+		cursor := ""
+		for {
+			page, next, more, err := c.RangePage(prefix, cursor, limit)
+			if err != nil {
+				fatalf("range failed: %v\n", err)
+			}
+			kvs = append(kvs, page...)
+			if !more {
+				break
+			}
+			cursor = next
+		}
+	} else {
+		var err error
+		if kvs, err = c.Range(prefix); err != nil {
+			fatalf("range failed: %v\n", err)
+		}
 	}
 	if len(kvs) == 0 {
 		fmt.Println("(empty)")
