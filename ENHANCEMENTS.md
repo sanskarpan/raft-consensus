@@ -280,17 +280,17 @@ runbooks, cert-gen script, docker-compose, version stamping.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| PodDisruptionBudget | H | S | No PDB; a node drain can evict 2+ of 3 voters and destroy quorum. | new `pdb.yaml` |
-| Pod anti-affinity + topology spread | H | S | No affinity; k8s may co-locate 2 of 3 voters on one node/AZ. | statefulset |
-| PreStop hook + terminationGracePeriod | H | S | Grace period isn't aligned with the internal drain/transfer budget; no preStop for endpoint deregistration. | statefulset |
+| ✅ PodDisruptionBudget | H | S | **Shipped (#214)** — opt-in `pdb.yaml`, `maxUnavailable: 1`. | `pdb.yaml` |
+| ✅ Pod anti-affinity + topology spread | H | S | **Shipped (#214)** — default soft anti-affinity + configurable topologySpreadConstraints. | statefulset |
+| ✅ terminationGracePeriod | H | S | **Shipped (#214)** — configurable (default 40s > internal drain/transfer). (No preStop: distroless has no shell; SIGTERM drain covers it.) | statefulset |
 | Kubernetes Operator / CRD | H | L | Scaling is manual (`/admin/members`); an operator automates join/leave, reconciliation, rolling upgrades. | new `operator/` |
 | Membership reconciliation on reschedule | H | M | Nothing reconciles Raft config with running pods after PVC loss / recreation. | sidecar/init container |
 | Scheduled backup to S3/GCS | H | M | Backup is manual `cp -r`; add a CronJob/built-in scheduler with retention. | new `cronjob-backup.yaml` |
 | Restore automation / DR bootstrap | H | M | Cluster restore is a manual multi-step procedure; add `kvctl restore` + init-container pull. | `kvctl`, chart |
 | Container image publishing + signing | M | S | CI builds with `push: false`; goreleaser ships only archives. Add multi-arch push + cosign + provenance. | `.goreleaser.yml`, release.yml |
-| ServiceMonitor / PodMonitor | M | S | Chart ships no ServiceMonitor; Prometheus-Operator won't auto-scrape. | new chart template |
+| ✅ ServiceMonitor / PodMonitor | M | S | **Shipped (#215)** — opt-in `servicemonitor.yaml` with bearer-token support. | `servicemonitor.yaml` |
 | NetworkPolicy | M | S | No default-deny; peer port should only accept sibling-pod traffic. | new `networkpolicy.yaml` |
-| Secret-based tokens/TLS | M | S | `admin_token` renders in plaintext into a ConfigMap; move to Secret / external-secrets. | `configmap.yaml`, new `secret.yaml` |
+| ✅ Secret-based tokens | M | S | **Shipped (#215)** — `admin_token` now sourced from a Secret via `$ADMIN_TOKEN` (chart-managed or `existingSecret`); no plaintext in the ConfigMap. (TLS-in-chart still open.) | `configmap.yaml`, `secret.yaml` |
 | Shipped systemd unit (bare-metal) | M | S | Only a doc snippet; ship a hardened `.service` + sysusers/tmpfiles via goreleaser nfpms. | new `packaging/systemd/` |
 | PV resize support + storageClass wiring | M | S | Fixed volumeClaim size; `persistence.enabled` is ignored. | statefulset, values |
 | Guaranteed-QoS production preset | M | S | Burstable QoS risks CPU throttling → spurious elections; provide requests==limits preset. | values, `docs/tuning.md` |
