@@ -859,11 +859,12 @@ func (t *GrpcTransport) RequestVote(ctx context.Context, target raft.ServerID, r
 	}
 
 	pbReq := &proto.RequestVoteRequest{
-		Term:         req.Term,
-		CandidateId:  string(req.CandidateID),
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-		PreVote:      req.PreVote,
+		Term:           req.Term,
+		CandidateId:    string(req.CandidateID),
+		LastLogIndex:   req.LastLogIndex,
+		LastLogTerm:    req.LastLogTerm,
+		PreVote:        req.PreVote,
+		LeaderTransfer: req.LeaderTransfer,
 	}
 
 	resp, err := client.RequestVote(ctx, pbReq)

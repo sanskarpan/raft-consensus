@@ -44,11 +44,12 @@ type AppendEntriesResp struct {
 }
 
 type RequestVoteReq struct {
-	Term         uint64 `json:"term"`
-	CandidateID  string `json:"candidate_id"`
-	LastLogIndex uint64 `json:"last_log_index"`
-	LastLogTerm  uint64 `json:"last_log_term"`
-	PreVote      bool   `json:"pre_vote"`
+	Term           uint64 `json:"term"`
+	CandidateID    string `json:"candidate_id"`
+	LastLogIndex   uint64 `json:"last_log_index"`
+	LastLogTerm    uint64 `json:"last_log_term"`
+	PreVote        bool   `json:"pre_vote"`
+	LeaderTransfer bool   `json:"leader_transfer"`
 }
 
 type RequestVoteResp struct {
@@ -611,11 +612,12 @@ func (t *tcpTransport) RequestVote(ctx context.Context, target raft.ServerID, re
 	}
 
 	pbReq := RequestVoteReq{
-		Term:         req.Term,
-		CandidateID:  string(req.CandidateID),
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-		PreVote:      req.PreVote,
+		Term:           req.Term,
+		CandidateID:    string(req.CandidateID),
+		LastLogIndex:   req.LastLogIndex,
+		LastLogTerm:    req.LastLogTerm,
+		PreVote:        req.PreVote,
+		LeaderTransfer: req.LeaderTransfer,
 	}
 
 	resp, err := t.sendRequest(ctx, peer, "RequestVote", pbReq)
