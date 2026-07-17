@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Atomic counter: `incr` FSM op, `POST /v1/kv/{key}?op=incr`, `client.Increment`, and `kvctl incr`
+- Client v2 writes now prefer the leader (`X-Raft-Leader-Address` hint + last-known-leader routing)
 - CheckQuorum: leaders step down on lost quorum contact (opt-in `check_quorum`)
 - Disruptive-server vote rejection on the real-vote path (Ongaro §4.2.3), gated on CheckQuorum
 - Metrics: `raft_leader_changes_total`, `raft_proposal_commit_latency_seconds`, `raft_snapshot_size_bytes`
