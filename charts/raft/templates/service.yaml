@@ -24,6 +24,9 @@ metadata:
     app: {{ .Release.Name }}-raft
 spec:
   clusterIP: None
+  # Publish pod DNS even before pods are Ready so peers can discover each
+  # other to bootstrap (readiness is gated on a leader, which needs quorum).
+  publishNotReadyAddresses: true
   selector:
     app: {{ .Release.Name }}-raft
   ports:

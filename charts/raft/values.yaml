@@ -29,3 +29,5 @@ config:
   electionTick: 10
   heartbeatTick: 1
   adminToken: ""
+  # Set true ONLY for local/dev demos with no token; fails closed otherwise.
+  allowNoAuth: false

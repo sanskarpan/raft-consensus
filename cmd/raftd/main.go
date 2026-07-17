@@ -397,6 +397,13 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
+	// Expand ${VAR} / $VAR references from the environment so configs can be
+	// templated per-instance without a preprocessing step. This is what lets a
+	// Kubernetes StatefulSet set `node_id: "${HOSTNAME}"` (the kubelet sets
+	// HOSTNAME to the stable pod name, e.g. "raft-raft-0"). Unset variables
+	// expand to "" (which then fails config validation loudly, as intended).
+	data = []byte(os.ExpandEnv(string(data)))
+
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
