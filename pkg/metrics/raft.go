@@ -121,6 +121,23 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// LeaderChangesCounter counts observed leader changes (etcd's
+	// leader_changes_seen_total): incremented whenever this node sees the leader
+	// transition to a different node, including when it becomes leader itself.
+	// The canonical leader-instability SLI.
+	LeaderChangesCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "raft_leader_changes_total",
+		Help: "Number of leader changes this node has observed",
+	})
+
+	// ProposalCommitLatencyHistogram measures leader-side latency from a client
+	// proposal (Apply) to when its entry is committed and applied to the FSM.
+	ProposalCommitLatencyHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "raft_proposal_commit_latency_seconds",
+		Help:    "Latency from proposal to commit+apply (leader side)",
+		Buckets: prometheus.DefBuckets,
+	})
+
 	// SnapshotSizeBytesGauge exports the byte size of the most recent snapshot
 	// transferred through InstallSnapshot (sent by a leader or received by a
 	// follower). Consumed by the dashboard's snapshot-size card.
@@ -225,6 +242,16 @@ func RecordInstallSnapshotLatency(seconds float64) {
 // RecordSnapshotSize sets the gauge for the most recent snapshot transferred.
 func RecordSnapshotSize(bytes int) {
 	SnapshotSizeBytesGauge.Set(float64(bytes))
+}
+
+// RecordLeaderChange increments the observed-leader-change counter.
+func RecordLeaderChange() {
+	LeaderChangesCounter.Inc()
+}
+
+// RecordProposalCommitLatency observes propose→commit+apply latency (seconds).
+func RecordProposalCommitLatency(seconds float64) {
+	ProposalCommitLatencyHistogram.Observe(seconds)
 }
 
 func SetWatchConnections(n int) {

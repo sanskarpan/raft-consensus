@@ -911,6 +911,7 @@ func (r *raft) hasVoteQuorum(votes map[ServerID]bool) bool {
 
 func (r *raft) becomeLeader() {
 	r.state = StateLeader
+	metrics.RecordLeaderChange() // this node observes itself as the new leader
 	r.leaderID = r.localID
 	r.leadershipTransfer = nil
 	// A freshly elected leader must re-confirm quorum before serving
@@ -1656,6 +1657,9 @@ func (r *raft) applyCommitted() {
 		metrics.RecordApplyLag(r.commitIndex, r.applyIndex) // M-O1
 
 		if f, ok := r.pendingFutures[entry.Index]; ok {
+			if !f.created.IsZero() {
+				metrics.RecordProposalCommitLatency(time.Since(f.created).Seconds())
+			}
 			f.respond(applyErr, entry.Index, entry.Term, result)
 			delete(r.pendingFutures, entry.Index)
 		}
@@ -1991,8 +1995,9 @@ func (r *raft) Apply(ctx context.Context, data []byte) ([]byte, error) {
 	}
 
 	future := &ApplyFuture{
-		ch:   make(chan struct{}),
-		data: data,
+		ch:      make(chan struct{}),
+		data:    data,
+		created: time.Now(),
 	}
 
 	proposal := &proposalFuture{
@@ -2882,6 +2887,9 @@ func (r *raft) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		r.state = StateFollower
 	}
 
+	if req.LeaderID != r.leaderID {
+		metrics.RecordLeaderChange() // observed a new/changed leader via AppendEntries
+	}
 	r.leaderID = req.LeaderID
 	// Reset election timer on valid leader contact.
 	r.electionTicks = r.randomElectionTickCount()
@@ -3121,6 +3129,9 @@ func (r *raft) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		r.persistTermAndVotedForLogged()
 	}
 
+	if req.LeaderID != r.leaderID {
+		metrics.RecordLeaderChange() // observed a new/changed leader via InstallSnapshot
+	}
 	r.leaderID = req.LeaderID
 	r.electionTicks = r.randomElectionTickCount()
 
