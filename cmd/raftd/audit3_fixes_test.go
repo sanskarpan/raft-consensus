@@ -377,7 +377,7 @@ func TestForwardToLeaderPropagatesRequestID(t *testing.T) {
 	addr := strings.TrimPrefix(leaderSrv.URL, "http://")
 
 	s := bareServer("secret")
-	s.config.Cluster = []ClusterMember{{ID: "leader", HttpAddress: addr}}
+	s.config.Cluster = []ClusterMember{{ID: "leader", HTTPAddress: addr}}
 	s.raftNode = &leaderStub{leader: "leader"}
 
 	r := httptest.NewRequest(http.MethodPost, "/command", strings.NewReader("{}"))

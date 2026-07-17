@@ -508,7 +508,7 @@ func (r *raft) tick() {
 	}
 }
 
-// tickFollower counts ticks and starts an election after the randomised
+// tickFollower counts ticks and starts an election after the randomized
 // election timeout has elapsed without hearing from a leader.
 func (r *raft) tickFollower() {
 	r.electionTicks--
@@ -630,7 +630,7 @@ func (r *raft) startElectionWith(alreadyPreVoted bool) {
 	r.votes = make(map[ServerID]bool)
 	r.voteCount = 1
 
-	r.persistTermAndVotedFor()
+	r.persistTermAndVotedForLogged()
 
 	metrics.RecordElection()
 	metrics.RecordTerm(r.term)
@@ -744,7 +744,7 @@ func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 		r.state = StateFollower
 		r.votedFor = ""
 		r.inPreVote = false
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 		return
 	}
 
@@ -797,7 +797,7 @@ func (r *raft) sendVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 		r.term = resp.Term
 		r.state = StateFollower
 		r.votedFor = ""
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 		return
 	}
 
@@ -867,7 +867,7 @@ func (r *raft) becomeLeader() {
 		zap.Uint64("term", r.term),
 	)
 
-	// Initialise per-follower replication trackers for ALL non-local servers
+	// Initialize per-follower replication trackers for ALL non-local servers
 	// (including learners so they receive log entries and can catch up).
 	r.nextIndex = make(map[ServerID]uint64)
 	r.matchIndex = make(map[ServerID]uint64)
@@ -1067,7 +1067,7 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 		r.leaderID = ""
 		r.heartbeatAcks = make(map[ServerID]time.Time) // stale acks from old term
 		metrics.RecordLeaderID(false)
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 		return false
 	}
 
@@ -1137,7 +1137,7 @@ const snapshotChunkSize = 1 << 20 // 1 MiB
 // sendSnapshotTo streams the latest local snapshot to a follower whose required
 // log entry has been compacted away (C-A1). It reads the newest snapshot from
 // the SnapshotStore and sends it in chunks via Transport.InstallSnapshot,
-// honouring Offset/Done. On success it advances the follower's matchIndex /
+// honoring Offset/Done. On success it advances the follower's matchIndex /
 // nextIndex to LastIncludedIndex+1 so normal AppendEntries replication resumes.
 func (r *raft) sendSnapshotTo(serverID ServerID) {
 	r.mu.RLock()
@@ -1224,7 +1224,7 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 			r.leaderID = ""
 			r.heartbeatAcks = make(map[ServerID]time.Time)
 			metrics.RecordLeaderID(false)
-			r.persistTermAndVotedFor()
+			r.persistTermAndVotedForLogged()
 			r.mu.Unlock()
 			return
 		}
@@ -1642,7 +1642,7 @@ func (r *raft) applyConfigurationEntry(entry *LogEntry) {
 		}
 		r.mu.Unlock()
 
-		// If we are leader, append the ChangeCommitJoint entry to finalise the
+		// If we are leader, append the ChangeCommitJoint entry to finalize the
 		// transition once the joint entry is committed.
 		if isLeader {
 			r.mu.Lock()
@@ -1820,7 +1820,7 @@ func (r *raft) drainFuturesOnShutdown() {
 // (`start`) and the recorded ack times are BOTH taken from the leader's own
 // monotonic clock in the AppendEntries response handler, so the confirmation
 // makes no assumption about inter-node clock synchronization — it purely proves
-// "a majority still recognised me as leader after I started this read", which is
+// "a majority still recognized me as leader after I started this read", which is
 // exactly what linearizability requires.
 //
 // Callers should wait until AppliedIndex() >= the returned value before reading
@@ -1926,7 +1926,7 @@ func (r *raft) Apply(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, ErrNotStarted
 	}
 
-	// Wait for the future to be resolved while still honouring the caller's
+	// Wait for the future to be resolved while still honoring the caller's
 	// context and a node shutdown.  This ensures Apply() never hangs
 	// indefinitely if the leader steps down after the proposal was sent.
 	select {
@@ -2386,7 +2386,11 @@ func (r *raft) triggerSnapshot() {
 	// M3: do NOT set snapshotIndex here to lastIndex. processSnapshot captures
 	// applyIndex and the FSM snapshot atomically and updates snapshotIndex to the
 	// real index the snapshot covers.
-	go r.Snapshot()
+	go func() {
+		if err := r.Snapshot(); err != nil {
+			r.logger.Warn("background snapshot failed", zap.Error(err))
+		}
+	}()
 }
 
 // processSnapshot handles a user-initiated snapshot request from the run() goroutine.
@@ -2419,7 +2423,7 @@ func (r *raft) processSnapshot(req *reqSnapshotFuture) {
 	defer reader.Close()
 
 	if _, err := io.Copy(sink, reader); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel() // best-effort cleanup; original copy error is what we report
 		req.err = err
 		close(req.done)
 		return
@@ -2590,6 +2594,18 @@ func (r *raft) persistTermAndVotedFor() error {
 	return r.stable.Sync()
 }
 
+// persistTermAndVotedForLogged persists term/votedFor on a best-effort basis and
+// logs (rather than propagates) any error. It is used on step-down and term-bump
+// paths where votedFor is being cleared: the caller cannot meaningfully act on a
+// persistence failure, and Raft's term-comparison recovers correctness on restart
+// even if the write was lost. The safety-critical vote-*grant* path persists via
+// persistTermAndVotedFor and checks the error directly.
+func (r *raft) persistTermAndVotedForLogged() {
+	if err := r.persistTermAndVotedFor(); err != nil {
+		r.logger.Error("failed to persist term/votedFor", zap.Error(err))
+	}
+}
+
 // persistCommitIndex requests that the current commitIndex be flushed to the
 // stable store so it survives restarts. It is called whenever commitIndex
 // advances, typically while r.mu is held.
@@ -2685,7 +2701,7 @@ func (r *raft) truncateLog(index uint64) error {
 }
 
 // rpcContext derives a per-RPC context with a deadline (~one election timeout)
-// that is also cancelled when the node stops (M-C1). This bounds outbound
+// that is also canceled when the node stops (M-C1). This bounds outbound
 // replicate/vote/prevote/timeoutnow/snapshot RPCs so a stuck peer cannot pin an
 // in-flight slot indefinitely, and lets a shutdown promptly abort them. The
 // caller MUST invoke the returned cancel func.
@@ -2715,7 +2731,7 @@ func (r *raft) electionTimeout() time.Duration {
 	return time.Duration(r.config.ElectionTick) * 50 * time.Millisecond
 }
 
-// randomElectionTickCount returns a randomised election timeout expressed as a
+// randomElectionTickCount returns a randomized election timeout expressed as a
 // number of heartbeat ticks, between ElectionTick and 2*ElectionTick.
 func (r *raft) randomElectionTickCount() int {
 	jitter := rand.Intn(r.config.ElectionTick + 1)
@@ -2772,7 +2788,7 @@ func (r *raft) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		// Clear stale acks: a re-elected leader must re-confirm quorum.
 		r.heartbeatAcks = make(map[ServerID]time.Time)
 		metrics.RecordTerm(r.term)
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 	}
 
 	// Step down if we were candidate and receive AppendEntries from a valid leader.
@@ -2937,7 +2953,7 @@ func (r *raft) handleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 		r.state = StateFollower
 		r.votedFor = ""
 		metrics.RecordTerm(r.term)
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 	}
 
 	// Grant vote only if we haven't voted for someone else this term.
@@ -2958,7 +2974,7 @@ func (r *raft) handleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 	r.votedFor = req.CandidateID
 	// Reset election timer when granting vote.
 	r.electionTicks = r.randomElectionTickCount()
-	r.persistTermAndVotedFor()
+	r.persistTermAndVotedForLogged()
 	resp.Term = r.term
 	resp.VoteGranted = true
 
@@ -2986,7 +3002,7 @@ func (r *raft) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		// must re-confirm quorum rather than using stale acks from the old term.
 		r.heartbeatAcks = make(map[ServerID]time.Time)
 		metrics.RecordTerm(r.term)
-		r.persistTermAndVotedFor()
+		r.persistTermAndVotedForLogged()
 	}
 
 	r.leaderID = req.LeaderID
@@ -3066,7 +3082,7 @@ func (r *raft) restoreSnapshotData(req *InstallSnapshotRequest) error {
 	}
 
 	if _, err := sink.Write(req.Data); err != nil {
-		sink.Cancel()
+		_ = sink.Cancel() // best-effort cleanup; original write error is what we report
 		return err
 	}
 

@@ -431,7 +431,11 @@ func NewGrpcTransportInsecure(listenAddr string, logger *zap.Logger) (*GrpcTrans
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
-		t.server.Serve(ln)
+		// Serve returns grpc.ErrServerStopped on graceful Stop(); other errors
+		// mean the listener died and are logged for diagnosis.
+		if err := t.server.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+			t.logger.Warn("gRPC server stopped", zap.Error(err))
+		}
 	}()
 
 	t.wg.Add(1)
@@ -519,7 +523,11 @@ func NewGrpcTransport(listenAddr string, logger *zap.Logger, cert tls.Certificat
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
-		t.server.Serve(ln)
+		// Serve returns grpc.ErrServerStopped on graceful Stop(); other errors
+		// mean the listener died and are logged for diagnosis.
+		if err := t.server.Serve(ln); err != nil && err != grpc.ErrServerStopped {
+			t.logger.Warn("gRPC server stopped", zap.Error(err))
+		}
 	}()
 
 	// Background reconnect loop: periodically re-dials any peer whose

@@ -342,7 +342,9 @@ func openSegment(path string) (*segment, error) {
 
 func parseBaseIndex(name string) uint64 {
 	var idx uint64
-	fmt.Sscanf(name[:len(name)-len(segmentFileExt)], "%020d", &idx)
+	// Segment names are produced by this package; a parse failure leaves idx=0,
+	// which callers already treat as "not a valid segment".
+	_, _ = fmt.Sscanf(name[:len(name)-len(segmentFileExt)], "%020d", &idx)
 	return idx
 }
 
@@ -865,7 +867,7 @@ func (w *WAL) Close() error {
 	return firstErr
 }
 
-// encodeRecord serialises a log record into the on-disk format:
+// encodeRecord serializes a log record into the on-disk format:
 //
 //	[0:4]   CRC32 of everything after the checksum field
 //	[4:8]   payload length = len(data) + 9

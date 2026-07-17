@@ -87,7 +87,7 @@ func TestValidateRejectsTightElectionTick(t *testing.T) {
 
 func TestStartElectionWithExplicitPreVoteFlag(t *testing.T) {
 	// Use a multi-node config so pre-vote does not immediately short-circuit to a
-	// real election; this isolates the alreadyPreVoted flag behaviour.
+	// real election; this isolates the alreadyPreVoted flag behavior.
 	r, _, _ := makeRaftNode("a", threeConfig("a", "b", "c"))
 	r.config.PreVote = true
 	r.mu.Lock()

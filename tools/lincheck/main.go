@@ -131,13 +131,14 @@ func main() {
 					c := now()
 					code, body := httpDo("GET", fmt.Sprintf("http://%s/v1/kv/%s", ep, key), "")
 					r := now()
-					if code == 200 {
+					switch code {
+					case 200:
 						// extract "value":"..."
 						val := extractValue(body)
 						mu.Lock()
 						events = append(events, event{id, regInput{"get", key, ""}, val, c, r})
 						mu.Unlock()
-					} else if code == 404 {
+					case 404:
 						mu.Lock()
 						events = append(events, event{id, regInput{"get", key, ""}, "", c, r})
 						mu.Unlock()

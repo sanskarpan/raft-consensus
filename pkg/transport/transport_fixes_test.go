@@ -257,7 +257,7 @@ func TestGrpcInstallSnapshot_SingleFrame(t *testing.T) {
 	}
 }
 
-// M5 — sendRequest honors an already-cancelled context (fails fast).
+// M5 — sendRequest honors an already-canceled context (fails fast).
 func TestTCPTransport_SendRequestHonorsCancelledContext(t *testing.T) {
 	tr, err := NewTCPTransport(":0", nil, 2*time.Second, zap.NewNop())
 	if err != nil {
@@ -270,10 +270,10 @@ func TestTCPTransport_SendRequestHonorsCancelledContext(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already cancelled
+	cancel() // already canceled
 
 	_, err = tr.RequestVote(ctx, "peer1", &raft.RequestVoteRequest{Term: 1})
 	if err == nil {
-		t.Fatal("RequestVote with cancelled ctx returned nil error, want context error")
+		t.Fatal("RequestVote with canceled ctx returned nil error, want context error")
 	}
 }

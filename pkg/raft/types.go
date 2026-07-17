@@ -322,7 +322,7 @@ func (c *Config) Validate() error {
 	if c.HeartbeatTick <= 0 {
 		return fmt.Errorf("HeartbeatTick must be positive")
 	}
-	// L1/L7: the randomised election timeout must leave enough headroom over the
+	// L1/L7: the randomized election timeout must leave enough headroom over the
 	// heartbeat interval that a healthy leader's heartbeats reliably reset the
 	// follower's election timer before it fires. Hard-fail below the 3x floor;
 	// the recommended ratio is ~10x (surfaced via LastValidateWarning so

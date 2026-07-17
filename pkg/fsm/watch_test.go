@@ -158,7 +158,7 @@ func TestWatchCancel(t *testing.T) {
 	// Give goroutines time to clean up.
 	time.Sleep(50 * time.Millisecond)
 
-	// Apply a put — the watcher is cancelled so the event should NOT arrive.
+	// Apply a put — the watcher is canceled so the event should NOT arrive.
 	applyPut(kv, "mykey", "val")
 
 	time.Sleep(50 * time.Millisecond)

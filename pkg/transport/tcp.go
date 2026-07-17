@@ -718,7 +718,7 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 		ctx = context.Background()
 	}
 
-	// M5: honor the caller's context up front — if it is already cancelled or
+	// M5: honor the caller's context up front — if it is already canceled or
 	// past its deadline, fail fast rather than dialing/writing.
 	if err := ctx.Err(); err != nil {
 		return nil, err

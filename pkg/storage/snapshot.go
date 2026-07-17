@@ -48,7 +48,7 @@ type FileSnapshotStore struct {
 // sidecarMeta is the storage-local JSON shape persisted in the .meta sidecar.
 // It embeds the raft.SnapshotMeta fields plus a Checksummed flag that records
 // whether the snapshot was written with a CRC32 footer (M15). The raft package
-// type cannot be modified from here, so we serialise a superset.
+// type cannot be modified from here, so we serialize a superset.
 type sidecarMeta struct {
 	Index         uint64             `json:"Index"`
 	Term          uint64             `json:"Term"`
@@ -216,7 +216,7 @@ func (s *FileSnapshotStore) Create(version raft.SnapshotVersion, index, term uin
 func (s *fileSnapshotSink) Write(p []byte) (int, error) {
 	n, err := s.file.Write(p)
 	if n > 0 {
-		s.hasher.Write(p[:n])
+		_, _ = s.hasher.Write(p[:n]) // hash.Hash.Write is documented never to error
 	}
 	return n, err
 }

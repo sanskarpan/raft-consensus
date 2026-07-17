@@ -2859,7 +2859,7 @@ func TestReadIndexContextCancelled(t *testing.T) {
 	// Use a single-node that is configured as a 3-node cluster member so
 	// that it needs a quorum of 2 for ReadIndex.  Because no follower is
 	// connected, no heartbeat acks ever arrive and ReadIndex must fail
-	// when the context is cancelled.
+	// when the context is canceled.
 	cfg := Configuration{Servers: []Server{
 		{ID: "n1"},
 		{ID: "n2"},

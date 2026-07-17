@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// baseHttpOffset is added to a node's raft port to derive its HTTP port.
-const baseHttpOffset = 100
+// baseHTTPOffset is added to a node's raft port to derive its HTTP port.
+const baseHTTPOffset = 100
 
 // HarnessOption is a functional option for creating a Harness.
 type HarnessOption func(*Harness)
@@ -42,14 +42,14 @@ type Harness struct {
 type Node struct {
 	ID       string
 	Addr     string // raft/TCP address (":port")
-	HttpAddr string // HTTP address (":httpPort")
+	HTTPAddr string // HTTP address (":httpPort")
 	Config   string
 	Process  *exec.Cmd
 	DataDir  string
 }
 
 // NewHarness creates a Harness that will store node data under dir and assign
-// raft ports starting at basePort.  HTTP ports are basePort+baseHttpOffset.
+// raft ports starting at basePort.  HTTP ports are basePort+baseHTTPOffset.
 func NewHarness(dir string, basePort int, opts ...HarnessOption) *Harness {
 	h := &Harness{
 		nodes:         make(map[string]*Node),
@@ -64,9 +64,9 @@ func NewHarness(dir string, basePort int, opts ...HarnessOption) *Harness {
 	return h
 }
 
-// HttpPortForID returns the HTTP port assigned to the node with the given id.
+// HTTPPortForID returns the HTTP port assigned to the node with the given id.
 // The port is based on the order in which nodes were started.
-func (h *Harness) HttpPortForID(id string) int {
+func (h *Harness) HTTPPortForID(id string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -76,8 +76,8 @@ func (h *Harness) HttpPortForID(id string) int {
 		return 0
 	}
 	var port int
-	fmt.Sscanf(node.Addr, ":%d", &port)
-	return port + baseHttpOffset
+	_, _ = fmt.Sscanf(node.Addr, ":%d", &port)
+	return port + baseHTTPOffset
 }
 
 // GetNodeAddr returns the HTTP address (host:port) of the node with the given id.
@@ -89,13 +89,13 @@ func (h *Harness) GetNodeAddr(id string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("node not found: %s", id)
 	}
-	return node.HttpAddr, nil
+	return node.HTTPAddr, nil
 }
 
 // StartNode starts a raftd process for the given node id.
 // The raft port is determined by the order in which the node was first
 // started (stored in assignedPorts) so that restarted nodes always bind
-// the same port.  The HTTP port is raftPort + baseHttpOffset.
+// the same port.  The HTTP port is raftPort + baseHTTPOffset.
 func (h *Harness) StartNode(id string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -107,7 +107,7 @@ func (h *Harness) StartNode(id string) error {
 		raftPort = h.basePort + len(h.assignedPorts)
 		h.assignedPorts[id] = raftPort
 	}
-	httpPort := raftPort + baseHttpOffset
+	httpPort := raftPort + baseHTTPOffset
 
 	raftAddr := fmt.Sprintf(":%d", raftPort)
 	httpAddr := fmt.Sprintf(":%d", httpPort)
@@ -135,7 +135,7 @@ func (h *Harness) StartNode(id string) error {
 	node := &Node{
 		ID:       id,
 		Addr:     raftAddr,
-		HttpAddr: httpAddr,
+		HTTPAddr: httpAddr,
 		Config:   configPath,
 		Process:  cmd,
 		DataDir:  dataDir,
@@ -159,8 +159,8 @@ func (h *Harness) StopNode(id string) error {
 	}
 
 	if node.Process != nil && node.Process.Process != nil {
-		node.Process.Process.Kill()
-		node.Process.Wait() //nolint:errcheck
+		_ = node.Process.Process.Kill() // best-effort teardown
+		node.Process.Wait()             //nolint:errcheck
 	}
 
 	delete(h.nodes, id)
@@ -174,8 +174,8 @@ func (h *Harness) StopAll() error {
 
 	for id := range h.nodes {
 		if node, ok := h.nodes[id]; ok && node.Process != nil && node.Process.Process != nil {
-			node.Process.Process.Kill()
-			node.Process.Wait() //nolint:errcheck
+			_ = node.Process.Process.Kill() // best-effort teardown
+			node.Process.Wait()             //nolint:errcheck
 		}
 	}
 
@@ -230,7 +230,7 @@ func (h *Harness) WaitForLeader(timeout time.Duration) (string, error) {
 		h.mu.Unlock()
 
 		for _, node := range nodes {
-			url := fmt.Sprintf("http://localhost%s/admin/cluster", node.HttpAddr)
+			url := fmt.Sprintf("http://localhost%s/admin/cluster", node.HTTPAddr)
 			resp, err := httpClient.Get(url)
 			if err != nil {
 				continue
@@ -291,7 +291,7 @@ func (h *Harness) SubmitCommand(key, value string) error {
 		}
 
 		for _, node := range nodes {
-			url := fmt.Sprintf("http://localhost%s/command", node.HttpAddr)
+			url := fmt.Sprintf("http://localhost%s/command", node.HTTPAddr)
 			resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
 			if err != nil {
 				continue
@@ -346,7 +346,7 @@ func (h *Harness) createConfig(id, raftAddr, httpAddr, configPath string) error 
 	clusterLines := ""
 	for i, name := range nodeNames {
 		port := h.basePort + i
-		httpPort := port + baseHttpOffset
+		httpPort := port + baseHTTPOffset
 		clusterLines += fmt.Sprintf("  - id: %s\n    address: localhost:%d\n    http_address: localhost:%d\n", name, port, httpPort)
 	}
 
@@ -358,5 +358,5 @@ allow_no_auth: true
 cluster:
 %s`, id, raftAddr, httpAddr, filepath.Join(h.dir, id, "data"), clusterLines)
 
-	return os.WriteFile(configPath, []byte(config), 0644)
+	return os.WriteFile(configPath, []byte(config), 0o600)
 }

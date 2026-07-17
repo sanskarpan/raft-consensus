@@ -309,7 +309,7 @@ func (r *stubRaft) LastTerm() uint64      { return 1 }
 func (r *stubRaft) AppliedIndex() uint64  { r.mu.Lock(); defer r.mu.Unlock(); return r.applied }
 
 // WaitApplied returns nil once the stored applied index is at least idx, or the
-// context error if it is cancelled first. The stub does not advance applied on
+// context error if it is canceled first. The stub does not advance applied on
 // its own, so a caller that asks for a higher index blocks until ctx is done.
 func (r *stubRaft) WaitApplied(ctx context.Context, idx uint64) error {
 	r.mu.Lock()
@@ -503,7 +503,7 @@ func TestMembershipRemovePropagatesToResponse(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // waitAppliedStub decouples AppliedIndex() from WaitApplied: AppliedIndex()
-// always reports 0, while WaitApplied honours a stored ready index. The old
+// always reports 0, while WaitApplied honors a stored ready index. The old
 // busy-poll waitApplied consulted AppliedIndex() and would therefore block
 // forever here; the delegating implementation returns immediately.
 type waitAppliedStub struct {
@@ -573,7 +573,7 @@ func TestWaitAppliedPropagatesContextError(t *testing.T) {
 // Auth guards for v1 routes
 // ---------------------------------------------------------------------------
 
-// authServer builds a Server whose HTTP mux is initialised and whose admin
+// authServer builds a Server whose HTTP mux is initialized and whose admin
 // token is set to "secret", so authMiddleware is active.
 func authServer(t *testing.T) *Server {
 	t.Helper()

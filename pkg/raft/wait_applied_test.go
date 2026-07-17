@@ -102,7 +102,7 @@ func TestWaitAppliedUnblocksWhenApplyOvershoots(t *testing.T) {
 }
 
 // TestWaitAppliedRespectsContext verifies the waiter returns ctx.Err() when the
-// context is cancelled before the target index is applied — and does not hang.
+// context is canceled before the target index is applied — and does not hang.
 func TestWaitAppliedRespectsContext(t *testing.T) {
 	r, _, _ := makeRaftNode("n1", singleNodeConfig("n1"))
 

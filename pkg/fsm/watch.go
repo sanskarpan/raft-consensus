@@ -70,7 +70,7 @@ func NewWatchManager(kv *KVStore) *WatchManager {
 	}
 }
 
-// Start launches the event-dispatch goroutine. It runs until ctx is cancelled.
+// Start launches the event-dispatch goroutine. It runs until ctx is canceled.
 func (wm *WatchManager) Start(ctx context.Context) {
 	go func() {
 		for {
@@ -105,7 +105,7 @@ func (wm *WatchManager) dispatch(events []Event) {
 	}
 
 	for _, entry := range wm.watchers {
-		// Skip entries whose context has already been cancelled: the subscriber
+		// Skip entries whose context has already been canceled: the subscriber
 		// is gone and delivering to it would race with removal (H11).
 		select {
 		case <-entry.ctx.Done():
@@ -156,7 +156,7 @@ func (e *watchEntry) matches(key string) bool {
 
 // Watch subscribes to changes for the exact key.
 // If sinceRevision > 0 buffered history events are replayed before live events.
-// The returned channel is closed when the watch is cancelled.
+// The returned channel is closed when the watch is canceled.
 func (wm *WatchManager) Watch(ctx context.Context, key string, sinceRevision int64) (<-chan WatchEvent, WatchID) {
 	return wm.subscribe(ctx, key, false, sinceRevision)
 }
