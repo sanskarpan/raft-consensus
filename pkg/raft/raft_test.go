@@ -2227,7 +2227,10 @@ func TestSnapshotRestoreLargeFSMOver100MB(t *testing.T) {
 	}
 	defer r2.Shutdown()
 
-	waitState(t, r2, StateLeader, 10*time.Second)
+	// Generous election timeout: this test builds a >100MB FSM and runs under
+	// -race, so under CPU contention the election ticker can be starved well
+	// past a few seconds (surfaced by an extended soak on a loaded machine).
+	waitState(t, r2, StateLeader, 30*time.Second)
 	waitApplied(t, r2, lastIdx, 120*time.Second)
 
 	if fsm2.count() < 100_000 {

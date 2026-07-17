@@ -5,6 +5,7 @@ go 1.25.0
 toolchain go1.26.5
 
 require (
+	github.com/anishathalye/porcupine v1.3.0
 	github.com/prometheus/client_golang v1.23.2
 	go.etcd.io/bbolt v1.4.3
 	go.opentelemetry.io/otel v1.41.0
