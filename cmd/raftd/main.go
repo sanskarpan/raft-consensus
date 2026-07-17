@@ -2006,10 +2006,20 @@ func (s *Server) handleV1KVList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix := r.URL.Query().Get("prefix")
+	limit := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		n, err := strconv.Atoi(l)
+		if err != nil || n < 0 {
+			s.writeGenericError(w, http.StatusBadRequest, "limit must be a non-negative integer", nil)
+			return
+		}
+		limit = n
+	}
+	startAfter := r.URL.Query().Get("start_after")
 
 	if r.URL.Query().Get("consistency") == "stale" {
 		w.Header().Set("X-Consistency", "stale")
-		s.serveRange(w, prefix)
+		s.serveRange(w, prefix, limit, startAfter)
 		return
 	}
 
@@ -2031,11 +2041,31 @@ func (s *Server) handleV1KVList(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, err)
 		return
 	}
-	s.serveRange(w, prefix)
+	s.serveRange(w, prefix, limit, startAfter)
 }
 
 // serveRange writes the range scan for prefix as a JSON array ([] not null).
-func (s *Server) serveRange(w http.ResponseWriter, prefix string) {
+// When limit > 0 it paginates: at most limit keys strictly after startAfter are
+// returned, and the response carries X-Has-More ("true"/"false") plus
+// X-Next-Cursor (the last key, to pass as the next start_after).
+func (s *Server) serveRange(w http.ResponseWriter, prefix string, limit int, startAfter string) {
+	if limit > 0 {
+		kvs, more, err := s.kv.RangePage(prefix, startAfter, limit)
+		if err != nil {
+			s.writeError(w, err)
+			return
+		}
+		if kvs == nil {
+			kvs = []*fsm.KeyValue{}
+		}
+		w.Header().Set("X-Has-More", strconv.FormatBool(more))
+		if len(kvs) > 0 {
+			w.Header().Set("X-Next-Cursor", kvs[len(kvs)-1].Key)
+		}
+		writeJSON(w, kvs)
+		return
+	}
+
 	kvs, err := s.kv.Range(prefix)
 	if err != nil {
 		s.writeError(w, err)
