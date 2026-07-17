@@ -112,7 +112,7 @@ func TestAdversarialReplicationConsistency(t *testing.T) {
 	}, "replicas did not converge to a consistent committed state")
 
 	c0, c1, c2 := fsms[0].count(), fsms[1].count(), fsms[2].count()
-	if !(c0 == c1 && c1 == c2) {
+	if c0 != c1 || c1 != c2 {
 		t.Fatalf("DIVERGENCE: FSM counts differ across replicas: %d/%d/%d", c0, c1, c2)
 	}
 	if c0 < acked {

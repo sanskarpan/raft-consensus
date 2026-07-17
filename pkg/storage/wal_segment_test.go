@@ -117,7 +117,7 @@ func TestGetEntryRejectsStaleSegmentOwnership(t *testing.T) {
 
 	// Inject a stale index entry for index 99 that claims to be owned by a
 	// baseIndex that no live segment matches. The exact-ownership lookup must
-	// reject it rather than reading from segment 1 (the pre-fix behaviour).
+	// reject it rather than reading from segment 1 (the pre-fix behavior).
 	w.index.mu.Lock()
 	w.index.indexes[99] = &indexEntry{term: 1, baseIndex: 12345, offset: 0}
 	if w.index.lastIndex < 99 {

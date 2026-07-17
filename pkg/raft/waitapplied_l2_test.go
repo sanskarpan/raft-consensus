@@ -9,7 +9,7 @@ import (
 )
 
 // L2: WaitApplied must not spawn a per-call watcher goroutine. Launch many
-// concurrent waiters that all get cancelled, then confirm the goroutine count
+// concurrent waiters that all get canceled, then confirm the goroutine count
 // returns to (near) baseline — i.e. no leak / no per-call goroutine lingering.
 func TestWaitAppliedNoPerCallGoroutine(t *testing.T) {
 	cfg := Configuration{Servers: []Server{{ID: "n1"}}}

@@ -125,7 +125,7 @@ func (c *compactLogStore) Compact(upto uint64) error {
 		c.first = upto + 1
 	}
 	// Drop the underlying entries so Get on a compacted index fails.
-	_ = c.memLogStore.DeleteRange(1, upto)
+	_ = c.DeleteRange(1, upto)
 	return nil
 }
 
@@ -596,7 +596,7 @@ func TestL7_ElectionRatioWarning(t *testing.T) {
 }
 
 // =============================================================================
-// M-C1: outbound RPC context carries a deadline and is cancelled on stop
+// M-C1: outbound RPC context carries a deadline and is canceled on stop
 // =============================================================================
 
 func TestMC1_RPCContextHasDeadlineAndCancelsOnStop(t *testing.T) {
@@ -615,6 +615,6 @@ func TestMC1_RPCContextHasDeadlineAndCancelsOnStop(t *testing.T) {
 	select {
 	case <-ctx.Done():
 	case <-time.After(time.Second):
-		t.Fatal("rpcContext not cancelled after stopCh closed")
+		t.Fatal("rpcContext not canceled after stopCh closed")
 	}
 }
