@@ -75,6 +75,60 @@ func TestE2EAtomicCounter(t *testing.T) {
 	}
 }
 
+// TestE2ERangePagination seeds more keys than a page holds and verifies the
+// client walks every page in order, with no gaps or duplicates, against a live
+// cluster (#206).
+func TestE2ERangePagination(t *testing.T) {
+	const basePort = 20900
+	_, _, addrs := setupV1Cluster(t, basePort)
+	c := client.NewClient(client.WithAddresses(addrs), client.WithTimeout(10*time.Second))
+
+	const total = 23
+	for i := 0; i < total; i++ {
+		if _, err := c.Put(fmt.Sprintf("page/%03d", i), "v"); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+	// A decoy under a different prefix must never appear in the paged results.
+	if _, err := c.Put("zzz/decoy", "v"); err != nil {
+		t.Fatalf("Put decoy: %v", err)
+	}
+
+	var got []string
+	cursor := ""
+	pages := 0
+	for {
+		page, next, more, err := c.RangePage("page/", cursor, 10)
+		if err != nil {
+			t.Fatalf("RangePage: %v", err)
+		}
+		pages++
+		for _, kv := range page {
+			got = append(got, kv.Key)
+		}
+		if !more {
+			break
+		}
+		cursor = next
+		if pages > total {
+			t.Fatal("pagination not terminating")
+		}
+	}
+
+	if len(got) != total {
+		t.Fatalf("collected %d keys, want %d", len(got), total)
+	}
+	for i := 0; i < total; i++ {
+		want := fmt.Sprintf("page/%03d", i)
+		if got[i] != want {
+			t.Fatalf("key[%d]=%q want %q (order/gap/dupe)", i, got[i], want)
+		}
+	}
+	if pages != 3 { // 10 + 10 + 3
+		t.Fatalf("pages=%d, want 3 for %d keys @ limit 10", pages, total)
+	}
+}
+
 // TestE2EIncrementErrors verifies FSM-level increment errors surface as
 // non-retryable client errors end-to-end.
 func TestE2EIncrementErrors(t *testing.T) {

@@ -796,6 +796,39 @@ func (c *Client) Range(prefix string) ([]*KVPair, error) {
 	return result, err
 }
 
+// RangePage returns up to limit keys with the given prefix, ordered by key and
+// strictly after startAfter (pass "" for the first page). It returns the page,
+// the cursor to pass as the next startAfter, and whether more keys remain. This
+// bounds the response size regardless of how many keys match.
+//
+// Example (iterate everything under "users/"):
+//
+//	cur := ""
+//	for {
+//	    page, next, more, err := c.RangePage("users/", cur, 500)
+//	    if err != nil { ... }
+//	    process(page)
+//	    if !more { break }
+//	    cur = next
+//	}
+func (c *Client) RangePage(prefix, startAfter string, limit int) (kvs []*KVPair, nextCursor string, more bool, err error) {
+	err = c.doWithRetry(func() error {
+		for _, addr := range c.addrs {
+			u := fmt.Sprintf("http://%s/v1/kv?prefix=%s&limit=%d", addr, url.QueryEscape(prefix), limit)
+			if startAfter != "" {
+				u += "&start_after=" + url.QueryEscape(startAfter)
+			}
+			page, cur, m, e := c.doGetKVListPaged(u)
+			if e == nil {
+				kvs, nextCursor, more = page, cur, m
+				return nil
+			}
+		}
+		return fmt.Errorf("RangePage: all nodes failed")
+	})
+	return kvs, nextCursor, more, err
+}
+
 // Txn submits a transaction via POST /v1/txn.
 // Retries up to v2RetryMax times with exponential backoff.
 func (c *Client) Txn(req *ClientTxnRequest) (*ClientTxnResponse, error) {
@@ -1146,6 +1179,33 @@ func (c *Client) doGetKVList(rawURL string) ([]*KVPair, error) {
 		return nil, err
 	}
 	return kvs, nil
+}
+
+// doGetKVListPaged is doGetKVList that also returns pagination metadata from the
+// X-Next-Cursor / X-Has-More response headers.
+func (c *Client) doGetKVListPaged(rawURL string) (kvs []*KVPair, nextCursor string, more bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", false, err
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, "", false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", false, fmt.Errorf("GET list %s: status %d", rawURL, resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&kvs); err != nil {
+		return nil, "", false, err
+	}
+	nextCursor = resp.Header.Get("X-Next-Cursor")
+	more = resp.Header.Get("X-Has-More") == "true"
+	return kvs, nextCursor, more, nil
 }
 
 // doPost sends a mutating POST (currently transactions). When seqNum > 0 it

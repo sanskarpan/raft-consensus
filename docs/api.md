@@ -174,8 +174,16 @@ Range scan by prefix. **Linearizable by default**; forwarded to the leader and
 gated on ReadIndex. Pass `?consistency=stale` for a local read (response carries
 `X-Consistency: stale`). Returns a JSON array (`[]` when empty, never `null`).
 
+**Pagination** — add `&limit=N` (and `&start_after=<cursor>`) to bound the
+response to `N` keys strictly after the cursor, in key order. The response then
+carries `X-Has-More: true|false` and `X-Next-Cursor: <last-key>`; pass that
+cursor as the next `start_after` to walk large key sets without the single-shot
+10k-key cap.
+
 ```bash
 curl "localhost:8002/v1/kv?prefix=user/" -H "Authorization: Bearer $T"
+# paginated
+curl -i "localhost:8002/v1/kv?prefix=user/&limit=500" -H "Authorization: Bearer $T"
 ```
 
 ```json
