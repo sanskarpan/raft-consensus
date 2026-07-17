@@ -18,6 +18,27 @@ spec:
       labels:
         app: {{ .Release.Name }}-raft
     spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 40 }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else }}
+      # Default soft anti-affinity: prefer scheduling quorum members onto
+      # distinct nodes without blocking on small clusters.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: {{ .Release.Name }}-raft
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       # distroless runs as uid 65532 (nonroot); fsGroup makes the mounted
       # PVC group-writable so the process can create its data dir.
       securityContext:
@@ -31,6 +52,15 @@ spec:
           args:
             - -config
             - /etc/raftd/config.yaml
+          env:
+            # Injected into the config via $ADMIN_TOKEN (os.ExpandEnv). Optional so
+            # allow-no-auth demos with no Secret still start ($ADMIN_TOKEN -> "").
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.existingSecret | default (printf "%s-raft-token" .Release.Name) }}
+                  key: {{ .Values.config.existingSecretKey | default "admin-token" }}
+                  optional: true
           ports:
             - name: raft
               containerPort: {{ .Values.service.raftPort }}

@@ -10,7 +10,8 @@ data:
     data_dir: /data
     election_tick: {{ .Values.config.electionTick }}
     heartbeat_tick: {{ .Values.config.heartbeatTick }}
-    admin_token: "{{ .Values.config.adminToken }}"
+    # Sourced from the $ADMIN_TOKEN env (a Secret), not rendered in plaintext.
+    admin_token: "${ADMIN_TOKEN}"
     allow_no_auth: {{ .Values.config.allowNoAuth }}
     check_quorum: {{ .Values.config.checkQuorum }}
     cluster:
