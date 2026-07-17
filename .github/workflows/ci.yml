@@ -126,3 +126,20 @@ jobs:
           tags: raftd:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # Nightly chaos/soak run, gated to the scheduled trigger (2 AM UTC cron above)
+  # so it does not run on every push/PR. Previously lived in release.yml, which
+  # only triggers on tags, so this job never actually ran.
+  nightly:
+    name: Nightly Chaos Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Run chaos tests (no -short flag)
+        run: go test -race -timeout 300s -run "TestAT|TestChaos|TestPartition" ./pkg/raft/
