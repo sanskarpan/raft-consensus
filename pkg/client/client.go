@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	mathrand "math/rand"
@@ -21,6 +22,10 @@ import (
 	"github.com/raft-consensus/pkg/fsm"
 	"github.com/raft-consensus/pkg/raft"
 )
+
+// ErrKeyNotFound is returned by GetKV/GetKVStale when the key does not exist
+// (HTTP 404). It is authoritative and not retried.
+var ErrKeyNotFound = errors.New("key not found")
 
 // retryBackoff returns the wait duration before retry attempt n (0-indexed).
 // 50ms → 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms (capped).
@@ -81,6 +86,9 @@ func (c *Client) doWithRetry(fn func() error) error {
 	for i := 0; i < v2RetryMax; i++ {
 		if err = fn(); err == nil {
 			return nil
+		}
+		if errors.Is(err, ErrKeyNotFound) {
+			return err // authoritative, non-retryable
 		}
 		if i < v2RetryMax-1 {
 			time.Sleep(retryBackoff(i))
@@ -642,6 +650,9 @@ func (c *Client) GetKV(key string) (*KVPair, error) {
 				result = kv
 				return nil
 			}
+			if errors.Is(err, ErrKeyNotFound) {
+				return err // authoritative 404 from the leader; stop
+			}
 		}
 		return fmt.Errorf("GetKV: all nodes failed")
 	})
@@ -659,6 +670,9 @@ func (c *Client) GetKVStale(key string) (*KVPair, error) {
 			if err == nil {
 				result = kv
 				return nil
+			}
+			if errors.Is(err, ErrKeyNotFound) {
+				return err
 			}
 		}
 		return fmt.Errorf("GetKVStale: all nodes failed")
@@ -949,7 +963,7 @@ func (c *Client) doGetKV(rawURL string) (*KVPair, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("key not found")
+		return nil, ErrKeyNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: status %d", rawURL, resp.StatusCode)

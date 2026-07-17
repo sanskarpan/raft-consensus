@@ -9,7 +9,6 @@
 #   localhost:8004  (node2 HTTP)
 #   localhost:8006  (node3 HTTP)
 
-version: "3.9"
 
 services:
   node1:
