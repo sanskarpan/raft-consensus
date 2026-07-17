@@ -614,6 +614,39 @@ func (k *KVStore) Range(prefix string) ([]*KeyValue, error) {
 	return result, nil
 }
 
+// RangePage returns up to limit KeyValues whose key has the given prefix and is
+// lexicographically greater than startAfter (an exclusive cursor; "" starts at
+// the beginning), sorted by key. The bool reports whether more matching keys
+// exist beyond this page — the caller pages by passing the last returned key as
+// the next startAfter. limit is clamped to (0, maxRangeResults]. This bounds the
+// response size regardless of how many keys match, unlike Range.
+func (k *KVStore) RangePage(prefix, startAfter string, limit int) ([]*KeyValue, bool, error) {
+	if limit <= 0 || limit > maxRangeResults {
+		limit = maxRangeResults
+	}
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	var keys []string
+	for key := range k.data {
+		if strings.HasPrefix(key, prefix) && key > startAfter {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	more := false
+	if len(keys) > limit {
+		keys = keys[:limit]
+		more = true
+	}
+	result := make([]*KeyValue, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, kvClone(k.data[key]))
+	}
+	return result, more, nil
+}
+
 // GetRevision returns the current global cluster revision.
 func (k *KVStore) GetRevision() int64 {
 	k.mu.RLock()
