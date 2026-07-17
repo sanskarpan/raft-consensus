@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -299,6 +301,48 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 			return nil, err
 		}
 		res, applyErr = json.Marshal(KvResult{Value: string(rangeJSON)})
+
+	case "incr":
+		// Atomic counter: interpret the current value and the delta (carried in
+		// cmd.Value) as base-10 int64s, add them, and store the result. A missing
+		// key starts at 0. Determinism holds because Apply runs serially and the
+		// arithmetic is a pure function of the log.
+		if k.revisionExhausted() {
+			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
+			break
+		}
+		delta, derr := strconv.ParseInt(cmd.Value, 10, 64)
+		if derr != nil {
+			res, applyErr = json.Marshal(KvResult{Error: "incr: delta is not a base-10 int64"})
+			break
+		}
+		prev := k.data[cmd.Key]
+		var cur int64
+		if prev != nil {
+			cur, derr = strconv.ParseInt(prev.Value, 10, 64)
+			if derr != nil {
+				res, applyErr = json.Marshal(KvResult{Error: "incr: existing value is not a base-10 int64"})
+				break
+			}
+		}
+		if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
+			res, applyErr = json.Marshal(KvResult{Error: "incr: int64 overflow"})
+			break
+		}
+		kv := k.applyPutLocked(cmd.Key, strconv.FormatInt(cur+delta, 10), prev)
+		k.emitEvents([]Event{{
+			Type:     EventPut,
+			Key:      cmd.Key,
+			KV:       kvClone(kv),
+			PrevKV:   kvClone(prev),
+			Revision: k.revision,
+		}})
+		kvJSON, err := json.Marshal(kv)
+		if err != nil {
+			return nil, err
+		}
+		res, applyErr = json.Marshal(KvResult{Value: string(kvJSON)})
+		isMutation = true
 
 	case "txn":
 		if cmd.Txn == nil {

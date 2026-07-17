@@ -145,6 +145,20 @@ curl -X PUT localhost:8002/v1/kv/hello -H "Authorization: Bearer $T" \
      -H 'Content-Type: application/json' -d '{"value":"world"}'
 ```
 
+### `POST /v1/kv/{key}?op=incr`
+Atomically add a signed `delta` to an integer-valued key and return the updated
+`KeyValue` (`value` is the new count). A missing key starts at `0`. Requires the
+`write` role. Optional `X-Client-ID` / `X-Seq-Num` for idempotent retries.
+Responses include `X-Raft-Leader-Address` so clients can route writes to the leader.
+
+- **200** — the updated `KeyValue`.
+- **400** — non-integer delta, non-integer existing value, or int64 overflow.
+
+```bash
+curl -X POST 'localhost:8002/v1/kv/visits?op=incr' -H "Authorization: Bearer $T" \
+     -H 'Content-Type: application/json' -d '{"delta":1}'
+```
+
 ### `DELETE /v1/kv/{key}`
 Delete a key. Requires `write`. Optional idempotency headers.
 

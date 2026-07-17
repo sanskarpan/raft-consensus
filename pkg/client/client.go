@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,10 @@ import (
 // ErrKeyNotFound is returned by GetKV/GetKVStale when the key does not exist
 // (HTTP 404). It is authoritative and not retried.
 var ErrKeyNotFound = errors.New("key not found")
+
+// errClientRequest wraps a 4xx response (e.g. incrementing a non-integer value).
+// It is a client error, not retryable across nodes.
+var errClientRequest = errors.New("client request rejected")
 
 // retryBackoff returns the wait duration before retry attempt n (0-indexed).
 // 50ms → 100ms → 200ms → 400ms → 800ms → 1600ms → 2000ms (capped).
@@ -87,8 +92,8 @@ func (c *Client) doWithRetry(fn func() error) error {
 		if err = fn(); err == nil {
 			return nil
 		}
-		if errors.Is(err, ErrKeyNotFound) {
-			return err // authoritative, non-retryable
+		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, errClientRequest) {
+			return err // authoritative client error, non-retryable
 		}
 		if i < v2RetryMax-1 {
 			time.Sleep(retryBackoff(i))
@@ -99,8 +104,9 @@ func (c *Client) doWithRetry(fn func() error) error {
 
 // idempotencyHeader names the HTTP request headers carrying idempotency info.
 const (
-	headerClientID = "X-Client-ID"
-	headerSeqNum   = "X-Seq-Num"
+	headerClientID   = "X-Client-ID"
+	headerSeqNum     = "X-Seq-Num"
+	headerLeaderAddr = "X-Raft-Leader-Address"
 )
 
 // defaultMaxLeaseDuration is the fallback leader-lease window used for
@@ -201,6 +207,46 @@ func (c *Client) getCurrentAddr() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.currentAddr
+}
+
+func (c *Client) setCurrentAddr(addr string) {
+	c.mu.Lock()
+	c.currentAddr = addr
+	c.mu.Unlock()
+}
+
+// CurrentAddr returns the address the client currently prefers for writes (the
+// last-known leader, learned from the X-Raft-Leader-Address response header).
+// Empty until the first successful cluster contact.
+func (c *Client) CurrentAddr() string {
+	return c.getCurrentAddr()
+}
+
+// writeAddrs returns the configured addresses with the last-known-good address
+// first (currentAddr, which is kept pointed at the leader via the
+// X-Raft-Leader-Address response header). This makes v2 writes prefer the leader
+// and avoid a follower→leader forward hop, instead of always starting at addrs[0].
+func (c *Client) writeAddrs() []string {
+	cur := c.getCurrentAddr()
+	if cur == "" {
+		return c.addrs
+	}
+	ordered := make([]string, 0, len(c.addrs)+1)
+	ordered = append(ordered, cur)
+	for _, a := range c.addrs {
+		if a != cur {
+			ordered = append(ordered, a)
+		}
+	}
+	return ordered
+}
+
+// noteLeaderFromResponse updates the preferred address from the leader hint the
+// server attaches to v2 write responses, so the client converges on the leader.
+func (c *Client) noteLeaderFromResponse(resp *http.Response) {
+	if la := resp.Header.Get(headerLeaderAddr); la != "" {
+		c.setCurrentAddr(la)
+	}
 }
 
 func (c *Client) GetClusterInfo() (*ClusterInfo, error) {
@@ -625,7 +671,7 @@ func (c *Client) Put(key, value string) (*KVPair, error) {
 	seq := c.nextSeqNum()
 	var result *KVPair
 	err := c.doWithRetry(func() error {
-		for _, addr := range c.addrs {
+		for _, addr := range c.writeAddrs() {
 			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
 			kv, err := c.doPutKV(rawURL, []byte(value), seq)
 			if err == nil {
@@ -636,6 +682,43 @@ func (c *Client) Put(key, value string) (*KVPair, error) {
 		return fmt.Errorf("Put: all nodes failed")
 	})
 	return result, err
+}
+
+// Increment atomically adds delta (which may be negative) to the integer value
+// stored at key and returns the new value. A missing key starts at 0. It is a
+// linearizable write routed to the leader.
+//
+// Concurrency: a Client is a single-writer. Its idempotency scheme dedups on a
+// monotonic per-client sequence number, so overlapping writes from one Client
+// can be dropped as stale retries. Use one Client per concurrent writer.
+func (c *Client) Increment(key string, delta int64) (int64, error) {
+	seq := c.nextSeqNum()
+	body, _ := json.Marshal(map[string]int64{"delta": delta})
+	var newVal int64
+	err := c.doWithRetry(func() error {
+		var lastErr error
+		for _, addr := range c.writeAddrs() {
+			rawURL := fmt.Sprintf("http://%s/v1/kv/%s?op=incr", addr, url.PathEscape(key))
+			kv, err := c.doIncr(rawURL, body, seq)
+			if err == nil {
+				v, perr := strconv.ParseInt(kv.Value, 10, 64)
+				if perr != nil {
+					return perr // server returned a non-integer; not retryable
+				}
+				newVal = v
+				return nil
+			}
+			if errors.Is(err, errClientRequest) {
+				return err // 4xx (e.g. non-integer/overflow): don't retry
+			}
+			lastErr = err
+		}
+		if lastErr != nil {
+			return lastErr
+		}
+		return fmt.Errorf("Increment: all nodes failed")
+	})
+	return newVal, err
 }
 
 // GetKV performs a linearizable GET via /v1/kv/{key}.
@@ -685,7 +768,7 @@ func (c *Client) GetKVStale(key string) (*KVPair, error) {
 func (c *Client) DeleteKV(key string) error {
 	seq := c.nextSeqNum()
 	return c.doWithRetry(func() error {
-		for _, addr := range c.addrs {
+		for _, addr := range c.writeAddrs() {
 			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
 			if err := c.doDeleteKV(rawURL, seq); err == nil {
 				return nil
@@ -726,7 +809,7 @@ func (c *Client) Txn(req *ClientTxnRequest) (*ClientTxnResponse, error) {
 	seq := c.nextSeqNum()
 	var result *ClientTxnResponse
 	err = c.doWithRetry(func() error {
-		for _, addr := range c.addrs {
+		for _, addr := range c.writeAddrs() {
 			rawURL := fmt.Sprintf("http://%s/v1/txn", addr)
 			resp, err := c.doPost(rawURL, data, seq)
 			if err == nil {
@@ -935,6 +1018,7 @@ func (c *Client) doPutKV(rawURL string, body []byte, seqNum uint64) (*KVPair, er
 		return nil, err
 	}
 	defer resp.Body.Close()
+	c.noteLeaderFromResponse(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("PUT %s: status %d", rawURL, resp.StatusCode)
@@ -945,6 +1029,44 @@ func (c *Client) doPutKV(rawURL string, body []byte, seqNum uint64) (*KVPair, er
 		return nil, err
 	}
 	return &kv, nil
+}
+
+// doIncr POSTs an atomic increment. A 4xx (non-integer value/delta, overflow) is
+// returned wrapped in errClientRequest so callers do not retry it across nodes.
+func (c *Client) doIncr(rawURL string, body []byte, seqNum uint64) (*KVPair, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerClientID, c.clientID)
+	req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	c.noteLeaderFromResponse(resp)
+
+	if resp.StatusCode == http.StatusOK {
+		var kv KVPair
+		if err := json.NewDecoder(resp.Body).Decode(&kv); err != nil {
+			return nil, err
+		}
+		return &kv, nil
+	}
+	// Only a 400 Bad Request is a hard, non-retryable client error (non-integer
+	// value/delta, overflow). 429 (rate limit) and 5xx are transient and are
+	// left retryable so doWithRetry backs off and tries again.
+	if resp.StatusCode == http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%w: incr %s: %s", errClientRequest, rawURL, strings.TrimSpace(string(b)))
+	}
+	return nil, fmt.Errorf("incr %s: status %d", rawURL, resp.StatusCode)
 }
 
 func (c *Client) doGetKV(rawURL string) (*KVPair, error) {
@@ -991,6 +1113,7 @@ func (c *Client) doDeleteKV(rawURL string, seqNum uint64) error {
 	if err != nil {
 		return err
 	}
+	c.noteLeaderFromResponse(resp)
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
@@ -1047,6 +1170,7 @@ func (c *Client) doPost(rawURL string, body []byte, seqNum uint64) ([]byte, erro
 		return nil, err
 	}
 	defer resp.Body.Close()
+	c.noteLeaderFromResponse(resp)
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("POST %s: status %d", rawURL, resp.StatusCode)

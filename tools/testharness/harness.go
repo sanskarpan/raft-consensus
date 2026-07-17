@@ -355,6 +355,8 @@ listen_addr: "%s"
 http_addr: "%s"
 data_dir: %s
 allow_no_auth: true
+rate_limit_rps: 100000
+per_ip_rate_limit_rps: 100000
 cluster:
 %s`, id, raftAddr, httpAddr, filepath.Join(h.dir, id, "data"), clusterLines)
 

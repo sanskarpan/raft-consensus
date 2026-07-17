@@ -206,8 +206,8 @@ limits, kvctl put/get/delete/range/txn/watch/status.
 | `[key, range_end)` intervals | H | M | Range is prefix-only; etcd's core primitive is a half-open key interval (prefix is a special case). | `Range`, `evalCompare` |
 | TTL / lease-based key expiry | H | L | No TTL/lease anywhere — table-stakes for leader election / service registration. Needs deterministic apply-time ticks. | `KeyValue`, `Apply`; lease ops |
 | MVCC historical reads (read at revision) | H | L | Revision metadata exists but only the latest version is stored; no time-travel reads (etcd's defining feature). | `KVStore.data`, `Get`, `Range` |
-| Atomic counter / increment op | M | S | No server-side INCR/ADD; clients must do racy read-modify-write via Txn. | `Apply` switch |
-| Client leader-routing for v2 writes | M | S | `Put`/`DeleteKV`/`Txn` loop over addrs in list order, not preferring the leader hint (unlike SubmitCommand) — every write may pay a forward hop. | client `Put`/`DeleteKV`/`Txn` |
+| ✅ Atomic counter / increment op | M | S | **Shipped (#208).** FSM `incr` op + `POST /v1/kv/{key}?op=incr` + `client.Increment` + `kvctl incr`; e2e-verified (concurrent clients, no lost updates). | `Apply` switch |
+| ✅ Client leader-routing for v2 writes | M | S | **Shipped (#209).** `Put`/`DeleteKV`/`Txn`/`Increment` prefer the leader via `writeAddrs()` + `X-Raft-Leader-Address` convergence; e2e-verified. | client `Put`/`DeleteKV`/`Txn` |
 | Conditional PUT/DELETE (If-Match) | M | S | CAS only via full `/v1/txn`; a lightweight `If-Match: <mod_revision>` header skips the txn envelope. | `handleV1Put` |
 | Batch get / multi-key get | M | S | `GetKV` is one key per round trip; add `BatchGet`. | client `GetKV` |
 | Richer Txn ops (range/get/nested) | M | M | Txn supports only put/delete branches; add range-read/get/nested and lexical value compares. | `applyTxnLocked`, `evalCompare` |

@@ -7,6 +7,7 @@
 // Commands:
 //
 //	put    <key> <value>           Set a key
+//	incr   <key> <delta>           Atomically add delta to an integer key
 //	get    <key>                   Get a key (linearizable by default)
 //	delete <key>                   Delete a key
 //	range  <prefix>                List all keys with prefix
@@ -31,6 +32,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -81,6 +83,12 @@ func main() {
 		}
 		runGet(c, cmdArgs[0], *stale)
 
+	case "incr":
+		if len(cmdArgs) < 2 {
+			fatalf("incr requires <key> <delta>\n")
+		}
+		runIncr(c, cmdArgs[0], cmdArgs[1])
+
 	case "delete":
 		if len(cmdArgs) < 1 {
 			fatalf("delete requires <key>\n")
@@ -127,6 +135,7 @@ Usage:
 
 Commands:
   put    <key> <value>     Set a key
+  incr   <key> <delta>     Atomically add delta (may be negative) to an integer key
   get    <key>             Get a key (linearizable by default; --stale for local FSM read)
   delete <key>             Delete a key
   range  [prefix]          List all keys (optionally filtered by prefix)
@@ -162,6 +171,18 @@ func runPut(c *client.Client, key, value string) {
 		fatalf("put failed: %v\n", err)
 	}
 	fmt.Println(prettyJSON(kv))
+}
+
+func runIncr(c *client.Client, key, deltaStr string) {
+	delta, err := strconv.ParseInt(deltaStr, 10, 64)
+	if err != nil {
+		fatalf("incr: delta must be an integer: %v\n", err)
+	}
+	v, err := c.Increment(key, delta)
+	if err != nil {
+		fatalf("incr failed: %v\n", err)
+	}
+	fmt.Println(v)
 }
 
 func runGet(c *client.Client, key string, stale bool) {
