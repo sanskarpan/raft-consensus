@@ -534,7 +534,55 @@ func (r *raft) tickCandidate() {
 	}
 }
 
+// checkQuorum steps the leader down if it has not received acknowledgements from
+// a quorum of voters within the last election timeout. This bounds how long a
+// partitioned-minority leader keeps leadership (and keeps failing/forwarding
+// writes to nowhere) before a majority-side election can succeed. Opt-in via
+// Config.CheckQuorum. Caller must hold r.mu (write); called from tickLeader.
+func (r *raft) checkQuorum() {
+	if !r.config.CheckQuorum || r.state != StateLeader {
+		return
+	}
+	quorum := r.configuration.QuorumSize()
+	if quorum <= 1 {
+		return // single-voter cluster always has quorum with itself
+	}
+
+	cutoff := time.Now().Add(-r.electionTimeout())
+	count := 1 // self
+	for id, ackTime := range r.heartbeatAcks {
+		if ackTime.After(cutoff) && r.configuration.IsVoter(id) {
+			count++
+		}
+	}
+	if count >= quorum {
+		return
+	}
+
+	r.logger.Warn("CheckQuorum: lost contact with a quorum of voters; stepping down",
+		zap.Int("acked_voters", count), zap.Int("quorum", quorum), zap.Uint64("term", r.term))
+	metrics.RecordRejection("check_quorum")
+
+	// Same-term step-down: keep term/votedFor (we did not observe a higher term),
+	// but relinquish leadership so a majority-side node can win an election.
+	r.state = StateFollower
+	r.leaderID = ""
+	r.electionTicks = r.randomElectionTickCount()
+	r.heartbeatAcks = make(map[ServerID]time.Time)
+	metrics.RecordLeaderID(false)
+	r.failPendingFutures()
+	if r.leadershipTransfer != nil {
+		r.finishTransfer(ErrNotLeader)
+	}
+}
+
 func (r *raft) tickLeader() {
+	r.checkQuorum()
+	// checkQuorum may have stepped us down; only continue leader work if we are
+	// still the leader.
+	if r.state != StateLeader {
+		return
+	}
 	r.sendHeartbeat()
 
 	// If a leadership transfer is pending, check whether the target is caught
