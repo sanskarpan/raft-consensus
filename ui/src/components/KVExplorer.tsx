@@ -97,6 +97,11 @@ function BrowseTab({ nodeAddrs, token }: Props) {
   }, [nodeAddrs, prefix, token])
 
   useEffect(() => {
+    // Fetch-on-mount / on-prefix-change. `load` intentionally sets loading/error
+    // state up front to show the spinner immediately when the user changes the
+    // prefix; this is the documented data-fetching-in-an-effect pattern, not a
+    // render-cascade bug. Same convention as useCluster.ts.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load()
   }, [load])
 
