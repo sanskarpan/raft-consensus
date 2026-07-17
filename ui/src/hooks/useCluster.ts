@@ -52,21 +52,23 @@ export function useCluster(nodeAddrs: string[], token?: string, intervalMs = 200
   }, [nodeAddrs, token])
 
   useEffect(() => {
-    // Initialize states for new nodes
-    setNodes((prev) => {
-      const next: Record<string, NodeState> = {}
-      for (const addr of nodeAddrs) {
-        next[addr] = prev[addr] ?? { addr, info: null, error: null, loading: true }
-      }
-      return next
-    })
-
+    // Canonical poll-on-mount: fetchAll sets state only AFTER an await (async),
+    // so this is not a synchronous setState-in-effect; the experimental rule
+    // cannot see through the async boundary. Data fetching in an effect is the
+    // documented, intended use here.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchAll()
     const id = setInterval(fetchAll, intervalMs)
     return () => clearInterval(id)
-  }, [fetchAll, intervalMs, nodeAddrs])
+  }, [fetchAll, intervalMs])
 
-  return nodes
+  // Derive the returned map during render so newly-added node addresses appear
+  // immediately (with a loading placeholder) without a setState-in-effect.
+  const merged: Record<string, NodeState> = {}
+  for (const addr of nodeAddrs) {
+    merged[addr] = nodes[addr] ?? { addr, info: null, error: null, loading: true }
+  }
+  return merged
 }
 
 export function useLeaderInfo(nodes: Record<string, NodeState>): ClusterInfo | null {

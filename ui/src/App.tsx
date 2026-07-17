@@ -20,7 +20,9 @@ function loadNodes(): string[] {
   try {
     const raw = localStorage.getItem(NODES_KEY)
     if (raw) return JSON.parse(raw)
-  } catch {}
+  } catch {
+    // ignore malformed stored value
+  }
   return DEFAULT_NODES
 }
 
@@ -37,12 +39,11 @@ export default function App() {
     localStorage.setItem('raft_dark', String(dark))
   }, [dark])
 
-  // Keep selectedMetricsNode valid when nodes list changes
-  useEffect(() => {
-    if (nodes.length > 0 && !nodes.includes(selectedMetricsNode)) {
-      setSelectedMetricsNode(nodes[0])
-    }
-  }, [nodes, selectedMetricsNode])
+  // Derived during render (no setState-in-effect): fall back to the first node
+  // whenever the current selection is not in the list.
+  const effectiveMetricsNode = nodes.includes(selectedMetricsNode)
+    ? selectedMetricsNode
+    : (nodes[0] ?? '')
 
   function saveNodes() {
     const list = nodeInput.split('\n').map(s => s.trim()).filter(Boolean)
@@ -114,7 +115,7 @@ export default function App() {
                   Node:
                 </label>
                 <select
-                  value={selectedMetricsNode}
+                  value={effectiveMetricsNode}
                   onChange={e => setSelectedMetricsNode(e.target.value)}
                   className="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
                 >
@@ -129,7 +130,7 @@ export default function App() {
                 No nodes configured. Add node addresses in Settings.
               </p>
             ) : (
-              <MetricsDashboard nodeAddr={selectedMetricsNode || nodes[0]} />
+              <MetricsDashboard nodeAddr={effectiveMetricsNode} />
             )}
           </div>
         )}

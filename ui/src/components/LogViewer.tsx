@@ -84,7 +84,9 @@ export default function LogViewer({ nodeAddrs, token }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const snapshotsRef = useRef<Map<string, NodeSnapshot>>(new Map())
   const pausedRef = useRef(paused)
-  pausedRef.current = paused
+  useEffect(() => {
+    pausedRef.current = paused
+  }, [paused])
 
   const appendEntries = useCallback((newEntries: LogEntry[]) => {
     if (newEntries.length === 0) return
