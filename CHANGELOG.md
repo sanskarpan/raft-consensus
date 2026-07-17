@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- CheckQuorum: leaders step down on lost quorum contact (opt-in `check_quorum`)
+- Disruptive-server vote rejection on the real-vote path (Ongaro §4.2.3), gated on CheckQuorum
+- Metrics: `raft_leader_changes_total`, `raft_proposal_commit_latency_seconds`, `raft_snapshot_size_bytes`
+- Grafana dashboard (`docs/grafana-dashboard.json`) and opt-in Helm `PrometheusRule` alerts
+- Nightly chaos/soak job now runs on the CI cron
 - Pre-vote protocol to prevent term inflation during network partitions
 - Joint consensus for safe two-phase membership changes
 - Learner replication and promotion safety (ErrLearnerNotReady)
@@ -24,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Architecture documentation and operations runbook
 
 ### Fixed
+- InstallSnapshot: snapshots larger than 1 MiB restored from only the final chunk (data corruption)
+- Election safety: a vote was reported granted before it was durably persisted
+- Module path aligned with the repository (`github.com/sanskarpan/raft-consensus`) so the library is `go get`-able
 - WAL header buffer overflow (20→25 bytes)
 - WAL deadlock in Compact() via locked helpers
 - WAL index tracking recording actual file offsets
