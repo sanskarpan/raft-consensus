@@ -202,7 +202,7 @@ limits, kvctl put/get/delete/range/txn/watch/status.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Range pagination (limit/cursor) | H | M | `Range` hard-caps at 10k and *errors* past it — no limit/continuation. >10k keys under a prefix are unlistable. | `KVStore.Range`, `serveRange`, client `Range` |
+| ✅ Range pagination (limit/cursor) | H | M | **Shipped (#206).** `RangePage` + `?limit=&start_after=` with `X-Next-Cursor`/`X-Has-More` headers + `client.RangePage` + `kvctl range --limit`; e2e-verified. | `KVStore.RangePage`, `serveRange` |
 | `[key, range_end)` intervals | H | M | Range is prefix-only; etcd's core primitive is a half-open key interval (prefix is a special case). | `Range`, `evalCompare` |
 | TTL / lease-based key expiry | H | L | No TTL/lease anywhere — table-stakes for leader election / service registration. Needs deterministic apply-time ticks. | `KeyValue`, `Apply`; lease ops |
 | MVCC historical reads (read at revision) | H | L | Revision metadata exists but only the latest version is stored; no time-travel reads (etcd's defining feature). | `KVStore.data`, `Get`, `Range` |
