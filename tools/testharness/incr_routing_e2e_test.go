@@ -21,7 +21,7 @@ func httpAddrForLeader(leaderID string, basePort int) string {
 // 3-node cluster: concurrent increments from many goroutines must not lose
 // updates, and the final counter must equal the exact number of increments.
 func TestE2EAtomicCounter(t *testing.T) {
-	const basePort = 20600
+	const basePort = 22000
 	_, _, addrs := setupV1Cluster(t, basePort)
 	c := client.NewClient(client.WithAddresses(addrs), client.WithTimeout(10*time.Second))
 
@@ -79,7 +79,7 @@ func TestE2EAtomicCounter(t *testing.T) {
 // client walks every page in order, with no gaps or duplicates, against a live
 // cluster (#206).
 func TestE2ERangePagination(t *testing.T) {
-	const basePort = 20900
+	const basePort = 22600
 	_, _, addrs := setupV1Cluster(t, basePort)
 	c := client.NewClient(client.WithAddresses(addrs), client.WithTimeout(10*time.Second))
 
@@ -132,7 +132,7 @@ func TestE2ERangePagination(t *testing.T) {
 // TestE2EIncrementErrors verifies FSM-level increment errors surface as
 // non-retryable client errors end-to-end.
 func TestE2EIncrementErrors(t *testing.T) {
-	const basePort = 20700
+	const basePort = 22200
 	_, _, addrs := setupV1Cluster(t, basePort)
 	c := client.NewClient(client.WithAddresses(addrs), client.WithTimeout(10*time.Second))
 
@@ -153,7 +153,7 @@ func TestE2EIncrementErrors(t *testing.T) {
 // client's address list starts with a follower, and that the client converges
 // its preferred address onto the leader via the X-Raft-Leader-Address hint.
 func TestE2ELeaderRouting(t *testing.T) {
-	const basePort = 20800
+	const basePort = 22400
 	_, leaderID, addrs := setupV1Cluster(t, basePort)
 	leaderAddr := httpAddrForLeader(leaderID, basePort)
 
