@@ -41,3 +41,4 @@ scripts/certs/generated/
 # Runtime state files
 *.db
 *.wal
+/lincheck
