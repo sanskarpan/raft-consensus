@@ -13,7 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
+	_ "net/http/pprof" //nolint:gosec // G108: pprof is served only on the auth-gated debug mux (see H12 checks in run()), never on the public API listener.
 	"os"
 	"os/signal"
 	"strconv"
@@ -44,7 +44,7 @@ type roleContextKey struct{}
 type Config struct {
 	NodeID        string            `yaml:"node_id"`
 	ListenAddr    string            `yaml:"listen_addr"`
-	HttpAddr      string            `yaml:"http_addr"`
+	HTTPAddr      string            `yaml:"http_addr"`
 	DataDir       string            `yaml:"data_dir"`
 	Cluster       []ClusterMember   `yaml:"cluster"`
 	ElectionTick  int               `yaml:"election_tick"`
@@ -120,7 +120,7 @@ type Config struct {
 type ClusterMember struct {
 	ID          string `yaml:"id"`
 	Address     string `yaml:"address"`
-	HttpAddress string `yaml:"http_address"` // HTTP address for leader forwarding
+	HTTPAddress string `yaml:"http_address"` // HTTP address for leader forwarding
 }
 
 // writeLimiter is a simple token-bucket rate limiter for write endpoints.
@@ -283,7 +283,7 @@ func (s *Server) perIPLimiterFor(addr string) *writeLimiter {
 
 // sweepPerIPLimiters evicts per-IP limiter entries that have been idle for
 // more than 5 minutes, bounding unbounded growth.  It exits when ctx is
-// cancelled (i.e. when the server shuts down).
+// canceled (i.e. when the server shuts down).
 func (s *Server) sweepPerIPLimiters(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -424,8 +424,8 @@ func loadConfig(path string) (*Config, error) {
 		config.ListenAddr = ":8080"
 	}
 
-	if config.HttpAddr == "" {
-		config.HttpAddr = ":8081"
+	if config.HTTPAddr == "" {
+		config.HTTPAddr = ":8081"
 	}
 
 	if config.DataDir == "" {
@@ -541,7 +541,7 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	s.initHTTP()
 
 	// Launch background goroutine to sweep stale per-IP rate limiter entries.
-	// The context is cancelled in Shutdown() to stop the goroutine cleanly.
+	// The context is canceled in Shutdown() to stop the goroutine cleanly.
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	s.sweepCancel = sweepCancel
 	go s.sweepPerIPLimiters(sweepCtx)
@@ -696,7 +696,10 @@ func (s *Server) initRaft() error {
 		}
 		for _, member := range s.config.Cluster {
 			if member.ID != s.config.NodeID {
-				tcpTrans.AddPeer(raft.ServerID(member.ID), raft.ServerAddress(member.Address))
+				if err := tcpTrans.AddPeer(raft.ServerID(member.ID), raft.ServerAddress(member.Address)); err != nil {
+					s.logger.Warn("failed to add static peer",
+						zap.String("peer", member.ID), zap.Error(err))
+				}
 			}
 		}
 		trans = tcpTrans
@@ -743,7 +746,7 @@ func (s *Server) initRaft() error {
 //
 // M13: CORS defaults to DENY. Cross-origin access must be opted into via an
 // explicit allowlist in config.CORSOrigins (comma-separated origins, or the
-// literal "*" to allow all — which is only honoured when set explicitly). When
+// literal "*" to allow all — which is only honored when set explicitly). When
 // the request Origin is not in the allowlist no Access-Control-Allow-Origin
 // header is emitted, so the browser blocks the response.
 func (s *Server) corsMiddleware(next http.Handler) http.Handler {
@@ -823,7 +826,7 @@ func (s *Server) rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // waitApplied blocks until the node's FSM has applied at least idx, or ctx
-// is cancelled.  Used by linearizable reads (ReadIndex) to ensure the local
+// is canceled.  Used by linearizable reads (ReadIndex) to ensure the local
 // FSM reflects the confirmed commit state before serving the response.
 //
 // L9: this delegates to the raft node's WaitApplied, which is woken by an
@@ -834,7 +837,7 @@ func (s *Server) waitApplied(ctx context.Context, idx uint64) error {
 
 func (s *Server) initHTTP() {
 	s.http = &http.Server{
-		Addr:         s.config.HttpAddr,
+		Addr:         s.config.HTTPAddr,
 		Handler:      s.requestIDMiddleware(s.corsMiddleware(s.buildMux())),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
@@ -885,7 +888,7 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 }
 
 // instrument wraps a route handler so its latency is recorded in
-// raft_http_request_duration_seconds labelled by handler/method/code (M-O1).
+// raft_http_request_duration_seconds labeled by handler/method/code (M-O1).
 func instrument(name string, h http.HandlerFunc) http.HandlerFunc {
 	wrapped := promhttp.InstrumentHandlerDuration(
 		metrics.HTTPRequestDuration.MustCurryWith(prometheus.Labels{"handler": name}),
@@ -967,7 +970,7 @@ func (s *Server) Start() error {
 		if s.config.HTTPSCert != "" {
 			s.logger.Info("HTTPS enabled",
 				zap.String("cert", s.config.HTTPSCert),
-				zap.String("addr", s.config.HttpAddr),
+				zap.String("addr", s.config.HTTPAddr),
 			)
 			err = s.http.ListenAndServeTLS(s.config.HTTPSCert, s.config.HTTPSKey)
 		} else {
@@ -1282,7 +1285,8 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 		// H6: bound the forwarded body, carry the request context, validate the
 		// leader address, and use https:// when TLS is configured.
 		r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxRequestBodyBytes)
-		s.forwardToLeader(w, r, string(leader), "/command")
+		// forwardToLeader writes its own error response to w on failure.
+		_ = s.forwardToLeader(w, r, string(leader), "/command")
 		return
 	}
 
@@ -1323,8 +1327,8 @@ func (s *Server) handleCommand(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getMemberAddress(nodeID string) string {
 	for _, member := range s.config.Cluster {
 		if member.ID == nodeID {
-			if member.HttpAddress != "" {
-				return member.HttpAddress
+			if member.HTTPAddress != "" {
+				return member.HTTPAddress
 			}
 			return member.Address
 		}
@@ -1553,6 +1557,7 @@ func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request, leaderI
 		forwardURL += "?" + r.URL.RawQuery
 	}
 
+	//nolint:gosec // G704: forwardURL is built from a config-sourced leader address that is validated with net.SplitHostPort above; not user-controlled.
 	req, err := http.NewRequestWithContext(r.Context(), r.Method, forwardURL, r.Body)
 	if err != nil {
 		s.writeGenericError(w, http.StatusInternalServerError, "internal error", err)
@@ -1572,6 +1577,7 @@ func (s *Server) forwardToLeader(w http.ResponseWriter, r *http.Request, leaderI
 	}
 
 	client := &http.Client{Timeout: 8 * time.Second}
+	//nolint:gosec // G704: req targets the validated, config-sourced leader address (see above); not user-controlled.
 	resp, err := client.Do(req)
 	if err != nil {
 		s.logger.Warn("forwarding to leader failed",

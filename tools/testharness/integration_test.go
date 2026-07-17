@@ -506,7 +506,7 @@ func TestMembershipAPI(t *testing.T) {
 		t.Fatalf("WaitForLeader: %v", err)
 	}
 
-	leaderPort := h.HttpPortForID(leaderID)
+	leaderPort := h.HTTPPortForID(leaderID)
 	leaderAddr := fmt.Sprintf("http://localhost:%d", leaderPort)
 	hc := &http.Client{Timeout: 10 * time.Second}
 

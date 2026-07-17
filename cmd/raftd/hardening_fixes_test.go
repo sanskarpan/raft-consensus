@@ -43,7 +43,7 @@ func (r *leaderStub) AppliedIndex() uint64              { atomic.AddInt64(&r.app
 func (r *leaderStub) Configuration() raft.Configuration { return raft.Configuration{} }
 
 // WaitApplied returns nil immediately when the stub's applied index already
-// satisfies idx, otherwise blocks until the context is cancelled. It counts as
+// satisfies idx, otherwise blocks until the context is canceled. It counts as
 // an "applied" observation so tests can assert waitApplied consulted the node.
 func (r *leaderStub) WaitApplied(ctx context.Context, idx uint64) error {
 	atomic.AddInt64(&r.appliedCall, 1)
@@ -147,7 +147,7 @@ func TestDebugAddrIsLoopback(t *testing.T) {
 func TestStartRefusesUnauthPprofOnPublicAddr(t *testing.T) {
 	s := bareServer("") // no tokens
 	s.config.AllowNoAuth = true
-	s.config.HttpAddr = "127.0.0.1:0"
+	s.config.HTTPAddr = "127.0.0.1:0"
 	s.config.DebugAddr = "0.0.0.0:6060"
 	s.raftNode = &leaderStub{leader: "self"}
 	s.kv = fsm.NewKVStore()
@@ -384,7 +384,7 @@ func TestLeaderSchemeFollowsTLS(t *testing.T) {
 func TestForwardToLeaderRejectsInvalidAddress(t *testing.T) {
 	s := bareServer("tok")
 	// Cluster member with a bogus (no host:port) address for the leader.
-	s.config.Cluster = []ClusterMember{{ID: "leader", HttpAddress: "not-a-valid-address"}}
+	s.config.Cluster = []ClusterMember{{ID: "leader", HTTPAddress: "not-a-valid-address"}}
 	s.raftNode = &leaderStub{leader: "leader"}
 
 	r := httptest.NewRequest(http.MethodPost, "/command", strings.NewReader("{}"))
@@ -417,7 +417,7 @@ func TestForwardToLeaderForwardsToConfiguredAddr(t *testing.T) {
 	addr := strings.TrimPrefix(leaderSrv.URL, "http://")
 
 	s := bareServer("secret") // TLS off => http scheme
-	s.config.Cluster = []ClusterMember{{ID: "leader", HttpAddress: addr}}
+	s.config.Cluster = []ClusterMember{{ID: "leader", HTTPAddress: addr}}
 	s.raftNode = &leaderStub{leader: "leader"}
 
 	r := httptest.NewRequest(http.MethodPost, "/command", strings.NewReader("{}"))
