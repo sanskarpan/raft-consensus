@@ -31,3 +31,13 @@ config:
   adminToken: ""
   # Set true ONLY for local/dev demos with no token; fails closed otherwise.
   allowNoAuth: false
+  # Step down if a quorum of voters cannot be reached within an election
+  # timeout (bounds partitioned-minority leadership). Recommended in production.
+  checkQuorum: false
+
+# PrometheusRule (requires the Prometheus Operator CRD). When enabled, ships
+# alerting rules for leader loss/flapping, apply/replication lag, WAL fsync
+# latency, commit latency, and rejection rate.
+prometheusRule:
+  enabled: false
+  labels: {}
