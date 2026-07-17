@@ -42,15 +42,18 @@ import (
 type roleContextKey struct{}
 
 type Config struct {
-	NodeID        string            `yaml:"node_id"`
-	ListenAddr    string            `yaml:"listen_addr"`
-	HTTPAddr      string            `yaml:"http_addr"`
-	DataDir       string            `yaml:"data_dir"`
-	Cluster       []ClusterMember   `yaml:"cluster"`
-	ElectionTick  int               `yaml:"election_tick"`
-	HeartbeatTick int               `yaml:"heartbeat_tick"`
-	AdminToken    string            `yaml:"admin_token"`
-	AdminTokens   map[string]string `yaml:"admin_tokens"`
+	NodeID        string          `yaml:"node_id"`
+	ListenAddr    string          `yaml:"listen_addr"`
+	HTTPAddr      string          `yaml:"http_addr"`
+	DataDir       string          `yaml:"data_dir"`
+	Cluster       []ClusterMember `yaml:"cluster"`
+	ElectionTick  int             `yaml:"election_tick"`
+	HeartbeatTick int             `yaml:"heartbeat_tick"`
+	// CheckQuorum makes a leader step down if it cannot reach a quorum of voters
+	// within an election timeout, bounding partitioned-minority leadership.
+	CheckQuorum bool              `yaml:"check_quorum"`
+	AdminToken  string            `yaml:"admin_token"`
+	AdminTokens map[string]string `yaml:"admin_tokens"`
 	// AllowNoAuth must be set explicitly to run WITHOUT any authentication.
 	// When no tokens are configured and this is false, the auth middleware fails
 	// closed (rejects every request) rather than silently allowing all callers
@@ -610,6 +613,7 @@ func (s *Server) initRaft() error {
 		LocalID:       raft.ServerID(s.config.NodeID),
 		ElectionTick:  s.config.ElectionTick,
 		HeartbeatTick: s.config.HeartbeatTick,
+		CheckQuorum:   s.config.CheckQuorum,
 		InitialConfiguration: raft.Configuration{
 			Servers: servers,
 		},
