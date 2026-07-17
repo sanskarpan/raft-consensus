@@ -121,6 +121,14 @@ var (
 		Buckets: prometheus.DefBuckets,
 	})
 
+	// SnapshotSizeBytesGauge exports the byte size of the most recent snapshot
+	// transferred through InstallSnapshot (sent by a leader or received by a
+	// follower). Consumed by the dashboard's snapshot-size card.
+	SnapshotSizeBytesGauge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "raft_snapshot_size_bytes",
+		Help: "Byte size of the most recent snapshot transferred via InstallSnapshot",
+	})
+
 	// WatchConnectionsGauge exports the number of open watch (SSE) streams (M-O1).
 	WatchConnectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "raft_watch_connections",
@@ -212,6 +220,11 @@ func RecordRejection(kind string) {
 
 func RecordInstallSnapshotLatency(seconds float64) {
 	InstallSnapshotLatencyHistogram.Observe(seconds)
+}
+
+// RecordSnapshotSize sets the gauge for the most recent snapshot transferred.
+func RecordSnapshotSize(bytes int) {
+	SnapshotSizeBytesGauge.Set(float64(bytes))
 }
 
 func SetWatchConnections(n int) {

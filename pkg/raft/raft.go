@@ -1209,6 +1209,8 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 	spanCtx, span := tracing.SpanSnapshot(ctx, serverID.String(), lastIncludedIndex)
 	defer span.End()
 
+	snapStart := time.Now()
+
 	buf := make([]byte, snapshotChunkSize)
 	var offset uint64
 	for {
@@ -1267,6 +1269,10 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 	}
 
 	// Success: the follower now holds state through lastIncludedIndex.
+	// offset is the total bytes streamed (the snapshot size).
+	metrics.RecordInstallSnapshotLatency(time.Since(snapStart).Seconds())
+	metrics.RecordSnapshotSize(int(offset))
+
 	r.mu.Lock()
 	if r.state == StateLeader && r.term == reqTerm {
 		if lastIncludedIndex > r.matchIndex[serverID] {
@@ -2997,10 +3003,24 @@ func (r *raft) handleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 		return resp
 	}
 
+	prevVotedFor := r.votedFor
 	r.votedFor = req.CandidateID
-	// Reset election timer when granting vote.
+	// Durability is a precondition for granting a vote: if the vote cannot be
+	// persisted, we must NOT tell the candidate it was granted. Otherwise a crash
+	// before the write reaches disk could let this node grant its vote again in
+	// the same term to a different candidate — electing two leaders in one term.
+	// (Step-down/term-bump paths use the best-effort ...Logged variant because a
+	// lost write there is recovered by term comparison on restart; a lost *grant*
+	// is not.)
+	if err := r.persistTermAndVotedFor(); err != nil {
+		r.logger.Error("failed to persist vote grant; denying vote", zap.Error(err))
+		r.votedFor = prevVotedFor
+		resp.Term = r.term
+		resp.VoteGranted = false
+		return resp
+	}
+	// Reset election timer only once the vote is durably granted.
 	r.electionTicks = r.randomElectionTickCount()
-	r.persistTermAndVotedForLogged()
 	resp.Term = r.term
 	resp.VoteGranted = true
 
@@ -3143,6 +3163,7 @@ func (r *raft) restoreSnapshotData(req *InstallSnapshotRequest) error {
 		return err
 	}
 
+	metrics.RecordSnapshotSize(len(req.Data))
 	if _, err := sink.Write(req.Data); err != nil {
 		_ = sink.Cancel() // best-effort cleanup; original write error is what we report
 		return err

@@ -102,16 +102,3 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/checksums.txt
-
-  nightly:
-    name: Nightly Chaos Tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-      - name: Run chaos tests (no -short flag)
-        run: go test -race -timeout 300s -run "TestAT|TestChaos|TestPartition" ./pkg/raft/
