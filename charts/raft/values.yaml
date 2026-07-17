@@ -28,12 +28,51 @@ persistence:
 config:
   electionTick: 10
   heartbeatTick: 1
+  # adminToken, when set, is stored in a chart-managed Secret (not the
+  # ConfigMap) and injected as $ADMIN_TOKEN. Prefer referencing an existing
+  # Secret via existingSecret/existingSecretKey.
   adminToken: ""
+  existingSecret: ""
+  existingSecretKey: admin-token
   # Set true ONLY for local/dev demos with no token; fails closed otherwise.
   allowNoAuth: false
   # Step down if a quorum of voters cannot be reached within an election
   # timeout (bounds partitioned-minority leadership). Recommended in production.
   checkQuorum: false
+
+# Graceful shutdown budget. raftd transfers leadership and drains HTTP on
+# SIGTERM; this must exceed that internal budget (~10s drain + transfer).
+terminationGracePeriodSeconds: 40
+
+# Pod anti-affinity keeps quorum members off the same node. Default is SOFT
+# (preferred) so scheduling still succeeds on small clusters; set a full
+# affinity block here to override (e.g. requiredDuringScheduling for hard
+# anti-affinity). Leave empty to use the default soft rule.
+affinity: {}
+
+# Spread pods across failure domains (e.g. zones). Empty by default.
+# Example:
+#   - maxSkew: 1
+#     topologyKey: topology.kubernetes.io/zone
+#     whenUnsatisfiable: ScheduleAnyway
+#     labelSelector:
+#       matchLabels: { app: <release>-raft }
+topologySpreadConstraints: []
+
+# PodDisruptionBudget: cap voluntary disruptions so a node drain/upgrade cannot
+# evict enough quorum members to break the cluster.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# ServiceMonitor for the Prometheus Operator (requires its CRD).
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+  # Bearer token for scraping the auth-gated /metrics, e.g.
+  #   bearerTokenSecret: { name: my-secret, key: token }
+  bearerTokenSecret: {}
 
 # PrometheusRule (requires the Prometheus Operator CRD). When enabled, ships
 # alerting rules for leader loss/flapping, apply/replication lag, WAL fsync
