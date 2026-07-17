@@ -288,6 +288,12 @@ type Config struct {
 	DisableProposalForwarding bool
 	LearnerMaxOldLogIndex     uint64
 
+	// CheckQuorum makes a leader step down if it has not heard from a quorum of
+	// voters within an election timeout. This bounds how long a
+	// partitioned-minority leader retains leadership (and keeps failing writes)
+	// before a new leader on the majority side can take over.
+	CheckQuorum bool
+
 	InitialConfiguration Configuration
 
 	// StartAsLearner causes the node to start in StateLearner mode instead of
