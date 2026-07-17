@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raft-consensus/pkg/metrics"
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/metrics"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 	bolt "go.etcd.io/bbolt"
 )
 

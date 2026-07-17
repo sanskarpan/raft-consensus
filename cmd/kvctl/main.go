@@ -35,7 +35,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/raft-consensus/pkg/client"
+	"github.com/sanskarpan/raft-consensus/pkg/client"
 )
 
 func main() {

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 func writeSnapshot(t *testing.T, store *FileSnapshotStore, term, index uint64, cfg raft.Configuration) {

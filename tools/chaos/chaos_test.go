@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raft-consensus/pkg/client"
-	"github.com/raft-consensus/tools/testharness"
+	"github.com/sanskarpan/raft-consensus/pkg/client"
+	"github.com/sanskarpan/raft-consensus/tools/testharness"
 )
 
 // eventually polls cond every 50ms until it returns true or timeout elapses,

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // M15: a snapshot recorded as checksummed in its durable meta MUST be rejected

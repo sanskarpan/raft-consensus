@@ -9,9 +9,9 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/raft-consensus/pkg/raft"
-	"github.com/raft-consensus/pkg/transport"
-	proto "github.com/raft-consensus/proto"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/transport"
+	proto "github.com/sanskarpan/raft-consensus/proto"
 )
 
 // TestGrpcInstallSnapshotPreservesChunkOffsets verifies that the gRPC server

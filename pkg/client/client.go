@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raft-consensus/pkg/fsm"
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/fsm"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // ErrKeyNotFound is returned by GetKV/GetKVStale when the key does not exist

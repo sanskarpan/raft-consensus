@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raft-consensus/pkg/client"
-	"github.com/raft-consensus/tools/testharness"
+	"github.com/sanskarpan/raft-consensus/pkg/client"
+	"github.com/sanskarpan/raft-consensus/tools/testharness"
 )
 
 // projectRoot returns the absolute path to the repository root by walking up

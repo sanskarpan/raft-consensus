@@ -3,7 +3,7 @@ package storage
 import (
 	"fmt"
 
-	raft "github.com/raft-consensus/pkg/raft"
+	raft "github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 type LogVerifier struct {

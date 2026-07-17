@@ -377,7 +377,7 @@ kvctl --endpoints $EP status
 
 ## Go client library
 
-`import "github.com/raft-consensus/pkg/client"`
+`import "github.com/sanskarpan/raft-consensus/pkg/client"`
 
 ```go
 c := client.NewClient(

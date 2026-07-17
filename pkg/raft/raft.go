@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/raft-consensus/pkg/metrics"
-	"github.com/raft-consensus/pkg/tracing"
+	"github.com/sanskarpan/raft-consensus/pkg/metrics"
+	"github.com/sanskarpan/raft-consensus/pkg/tracing"
 	"go.uber.org/zap"
 )
 

@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // snapMetaExt is the extension of the JSON sidecar file that persists SnapshotMeta.

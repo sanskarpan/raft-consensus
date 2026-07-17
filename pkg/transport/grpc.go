@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raft-consensus/pkg/raft"
-	proto "github.com/raft-consensus/proto"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
+	proto "github.com/sanskarpan/raft-consensus/proto"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
