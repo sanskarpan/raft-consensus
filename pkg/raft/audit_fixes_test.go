@@ -94,7 +94,7 @@ func TestStartElectionWithExplicitPreVoteFlag(t *testing.T) {
 	r.configuration = threeConfig("a", "b", "c")
 	r.state = StateFollower
 	// alreadyPreVoted=false with PreVote on must route through pre-vote.
-	r.startElectionWith(false)
+	r.startElectionWith(false, false)
 	inPreVote := r.inPreVote
 	term := r.term
 	r.mu.Unlock()
@@ -113,7 +113,7 @@ func TestStartElectionWithExplicitPreVoteFlag(t *testing.T) {
 	r2.configuration = singleConfig("b")
 	r2.state = StateFollower
 	r2.inPreVote = false
-	r2.startElectionWith(true)
+	r2.startElectionWith(true, false)
 	state := r2.state
 	r2.mu.Unlock()
 	if state != StateLeader {
