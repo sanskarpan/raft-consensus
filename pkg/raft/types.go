@@ -454,6 +454,10 @@ type RequestVoteRequest struct {
 	LastLogIndex uint64
 	LastLogTerm  uint64
 	PreVote      bool
+	// LeaderTransfer marks a campaign started by a TimeoutNow leadership transfer.
+	// Recipients honor it even when they heard from a leader recently, bypassing
+	// the disruptive-server rejection (§4.2.3).
+	LeaderTransfer bool
 }
 
 type RequestVoteResponse struct {

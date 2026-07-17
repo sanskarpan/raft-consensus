@@ -659,18 +659,19 @@ func (r *raft) doLeadershipTransfer() {
 }
 
 func (r *raft) startElection() {
-	r.startElectionWith(false)
+	r.startElectionWith(false, false)
 }
 
 // startElectionWith runs a real election. alreadyPreVoted must be true when the
 // caller has just completed a successful pre-vote round; passing it explicitly
 // (L2) avoids relying on the shared r.inPreVote flag to decide whether to
 // recurse into startPreVote, which was racy across concurrent pre-vote replies.
-func (r *raft) startElectionWith(alreadyPreVoted bool) {
+func (r *raft) startElectionWith(alreadyPreVoted, leaderTransfer bool) {
 	// If pre-vote is enabled and we have NOT already gathered a pre-vote quorum,
 	// run the pre-vote phase first. startPreVote calls startElectionWith(true)
-	// once a quorum of pre-votes is gathered.
-	if r.config.PreVote && !alreadyPreVoted {
+	// once a quorum of pre-votes is gathered. Leadership-transfer campaigns skip
+	// pre-vote entirely (immediate election, as the target is already caught up).
+	if r.config.PreVote && !alreadyPreVoted && !leaderTransfer {
 		r.startPreVote()
 		return
 	}
@@ -711,11 +712,12 @@ func (r *raft) startElectionWith(alreadyPreVoted bool) {
 		}
 
 		req := &RequestVoteRequest{
-			Term:         r.term,
-			CandidateID:  r.localID,
-			LastLogIndex: lastIndex,
-			LastLogTerm:  lastTerm,
-			PreVote:      false,
+			Term:           r.term,
+			CandidateID:    r.localID,
+			LastLogIndex:   lastIndex,
+			LastLogTerm:    lastTerm,
+			PreVote:        false,
+			LeaderTransfer: leaderTransfer,
 		}
 
 		go r.sendVoteRequest(serverID, req)
@@ -740,7 +742,7 @@ func (r *raft) startPreVote() {
 
 	// Single-node cluster: skip to the real election immediately.
 	if r.configuration.QuorumSize() == 1 {
-		r.startElectionWith(true)
+		r.startElectionWith(true, false)
 		return
 	}
 
@@ -816,7 +818,7 @@ func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 		if r.hasVoteQuorum(r.preVotes) {
 			// Pre-vote quorum reached: run the real election. Pass the flag
 			// explicitly (L2) so we don't recurse back into startPreVote.
-			r.startElectionWith(true)
+			r.startElectionWith(true, false)
 		}
 	}
 }
@@ -2429,8 +2431,12 @@ func (r *raft) HandleTimeoutNowRPC() {
 		zap.String("id", r.localID.String()),
 	)
 
-	// Force the election timer to expire on the next tick.
-	r.electionTicks = 0
+	// Start an immediate real election marked as a leadership transfer: skip
+	// pre-vote (the target is already caught up) and set LeaderTransfer so peers
+	// bypass the disruptive-server rejection even though they just heard from the
+	// (transferring) leader.
+	r.electionTicks = r.randomElectionTickCount()
+	r.startElectionWith(true, true)
 }
 
 func (r *raft) Snapshot() error {
@@ -3024,6 +3030,22 @@ func (r *raft) handleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 
 	if req.Term < r.term {
 		resp.Reason = "stale term"
+		return resp
+	}
+
+	// Disruptive-server protection (Ongaro §4.2.3): if we have heard from a
+	// current leader within the last election timeout, reject a real RequestVote
+	// WITHOUT adopting its (higher) term — unless it is a leadership transfer,
+	// which is expected to disrupt. This stops a removed/partitioned server from
+	// inflating terms and triggering spurious elections against a healthy leader.
+	//
+	// Gated on CheckQuorum: the rejection is only safe when a leader that loses
+	// quorum steps down on its own (checkQuorum), which guarantees this guard
+	// cannot permanently block a legitimate election. Pre-vote covers the common
+	// case; this adds protection for non-pre-vote term bumps.
+	if r.config.CheckQuorum && !req.LeaderTransfer && r.electionTicks > 0 && r.leaderID != "" {
+		resp.Reason = "recently heard from leader (disruptive-server protection)"
+		metrics.RecordRejection("vote")
 		return resp
 	}
 

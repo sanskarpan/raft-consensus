@@ -2255,11 +2255,12 @@ func (h *raftHandlerWrapper) HandleRequestVote(req *transport.RequestVoteReq) *t
 	}
 
 	raftReq := &raft.RequestVoteRequest{
-		Term:         req.Term,
-		CandidateID:  raft.ServerID(req.CandidateID),
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-		PreVote:      req.PreVote,
+		Term:           req.Term,
+		CandidateID:    raft.ServerID(req.CandidateID),
+		LastLogIndex:   req.LastLogIndex,
+		LastLogTerm:    req.LastLogTerm,
+		PreVote:        req.PreVote,
+		LeaderTransfer: req.LeaderTransfer,
 	}
 
 	raftResp := h.raftNode.(interface {
@@ -2350,11 +2351,12 @@ func (g *grpcHandlerWrapper) HandleAppendEntries(req *proto.AppendEntriesRequest
 
 func (g *grpcHandlerWrapper) HandleRequestVote(req *proto.RequestVoteRequest) *proto.RequestVoteResponse {
 	tcpReq := &transport.RequestVoteReq{
-		Term:         req.Term,
-		CandidateID:  req.CandidateId,
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-		PreVote:      req.PreVote,
+		Term:           req.Term,
+		CandidateID:    req.CandidateId,
+		LastLogIndex:   req.LastLogIndex,
+		LastLogTerm:    req.LastLogTerm,
+		PreVote:        req.PreVote,
+		LeaderTransfer: req.LeaderTransfer,
 	}
 	r := g.raftWrapper.HandleRequestVote(tcpReq)
 	return &proto.RequestVoteResponse{

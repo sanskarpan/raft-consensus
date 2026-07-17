@@ -1095,20 +1095,29 @@ func TestTimeoutNowForcesElection(t *testing.T) {
 	}
 	defer r.Shutdown()
 
+	r.mu.RLock()
+	startTerm := r.term
+	r.mu.RUnlock()
+
 	r.mu.Lock()
 	r.state = StateFollower
 	r.electionTicks = 100 // set very high so no natural election
 	r.mu.Unlock()
 
-	// Call HandleTimeoutNowRPC - should force immediate election by zeroing ticks.
+	// HandleTimeoutNowRPC starts an immediate (real) election rather than merely
+	// arming the timer: the node becomes a candidate and bumps its term at once.
 	r.HandleTimeoutNowRPC()
 
 	r.mu.RLock()
-	ticks := r.electionTicks
+	state := r.state
+	term := r.term
 	r.mu.RUnlock()
 
-	if ticks != 0 {
-		t.Errorf("expected electionTicks=0 after TimeoutNow, got %d", ticks)
+	if state != StateCandidate {
+		t.Errorf("expected StateCandidate after TimeoutNow, got %s", state)
+	}
+	if term <= startTerm {
+		t.Errorf("expected term to advance past %d after TimeoutNow, got %d", startTerm, term)
 	}
 }
 
