@@ -59,9 +59,10 @@ bench: ## Run benchmarks
 # ---- lint / static analysis --------------------------------------------
 .PHONY: lint
 lint: ## Run golangci-lint and staticcheck
-	@command -v golangci-lint >/dev/null 2>&1 || { \
-		echo "installing golangci-lint..."; \
-		$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8; }
+	@# .golangci.yml is schema v2; require golangci-lint v2 (module path has /v2).
+	@golangci-lint version 2>/dev/null | grep -q 'version 2' || { \
+		echo "installing golangci-lint v2..."; \
+		$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2; }
 	golangci-lint run
 	@command -v staticcheck >/dev/null 2>&1 || { \
 		echo "installing staticcheck..."; \
