@@ -11,8 +11,10 @@ data:
     election_tick: {{ .Values.config.electionTick }}
     heartbeat_tick: {{ .Values.config.heartbeatTick }}
     admin_token: "{{ .Values.config.adminToken }}"
+    allow_no_auth: {{ .Values.config.allowNoAuth }}
     cluster:
     {{- range $i := until (.Values.replicaCount | int) }}
       - id: {{ $.Release.Name }}-raft-{{ $i }}
         address: {{ $.Release.Name }}-raft-{{ $i }}.{{ $.Release.Name }}-raft-headless:{{ $.Values.service.raftPort }}
+        http_address: {{ $.Release.Name }}-raft-{{ $i }}.{{ $.Release.Name }}-raft-headless:{{ $.Values.service.httpPort }}
     {{- end }}

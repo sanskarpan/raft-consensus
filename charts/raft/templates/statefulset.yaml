@@ -7,6 +7,9 @@ metadata:
 spec:
   serviceName: {{ .Release.Name }}-raft-headless
   replicas: {{ .Values.replicaCount }}
+  # Parallel so all pods start together and can form quorum; OrderedReady
+  # deadlocks because /ready is gated on a leader (which needs a quorum).
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: {{ .Release.Name }}-raft
@@ -15,6 +18,12 @@ spec:
       labels:
         app: {{ .Release.Name }}-raft
     spec:
+      # distroless runs as uid 65532 (nonroot); fsGroup makes the mounted
+      # PVC group-writable so the process can create its data dir.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
       containers:
         - name: raftd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
