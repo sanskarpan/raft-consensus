@@ -12,6 +12,7 @@ data:
     heartbeat_tick: {{ .Values.config.heartbeatTick }}
     admin_token: "{{ .Values.config.adminToken }}"
     allow_no_auth: {{ .Values.config.allowNoAuth }}
+    check_quorum: {{ .Values.config.checkQuorum }}
     cluster:
     {{- range $i := until (.Values.replicaCount | int) }}
       - id: {{ $.Release.Name }}-raft-{{ $i }}

@@ -495,12 +495,13 @@ type Future interface {
 }
 
 type ApplyFuture struct {
-	data   []byte
-	err    error
-	index  uint64
-	term   uint64
-	result []byte
-	ch     chan struct{}
+	data    []byte
+	err     error
+	index   uint64
+	term    uint64
+	result  []byte
+	ch      chan struct{}
+	created time.Time // proposal time, for commit-latency measurement
 }
 
 func (a *ApplyFuture) Error() error   { return a.err }

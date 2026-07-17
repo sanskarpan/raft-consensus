@@ -1,0 +1,77 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ .Release.Name }}-raft
+  labels:
+    app: {{ .Release.Name }}-raft
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: raft.rules
+      rules:
+        - alert: RaftNoLeader
+          expr: max(raft_leader_id) == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Raft cluster has no leader"
+            description: "No node has reported a known leader for over 1 minute; the cluster cannot serve writes."
+
+        - alert: RaftLeaderFlapping
+          expr: sum(increase(raft_leader_changes_total[10m])) > 6
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Raft leadership is unstable"
+            description: "More than 6 leader changes observed across the cluster in 10m (flapping)."
+
+        - alert: RaftApplyLagHigh
+          expr: max(raft_apply_lag) > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Raft apply lag is high"
+            description: "commitIndex - appliedIndex has exceeded 1000 for 5m; the state machine is falling behind."
+
+        - alert: RaftReplicationLagHigh
+          expr: max(raft_replication_lag) > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A follower is lagging in replication"
+            description: "A follower's replication lag has exceeded 1000 entries for 5m."
+
+        - alert: RaftWalFsyncSlow
+          expr: histogram_quantile(0.99, sum(rate(raft_wal_fsync_seconds_bucket[5m])) by (le)) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "WAL fsync p99 is slow"
+            description: "p99 WAL fsync latency has exceeded 100ms for 5m; disk may be a bottleneck."
+
+        - alert: RaftCommitLatencyHigh
+          expr: histogram_quantile(0.99, sum(rate(raft_proposal_commit_latency_seconds_bucket[5m])) by (le)) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Proposal commit latency p99 is high"
+            description: "p99 propose→commit latency has exceeded 1s for 5m."
+
+        - alert: RaftHighRejectionRate
+          expr: sum(rate(raft_rejections_total[5m])) > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Elevated Raft RPC/request rejection rate"
+            description: "The cluster is rejecting more than 5 requests/s (votes, append-entries, not-leader) over 5m."
+{{- end }}
