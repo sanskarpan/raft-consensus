@@ -2,6 +2,7 @@ node_id: node2
 listen_addr: :8003
 http_addr: :8004
 data_dir: /data
+allow_no_auth: true
 election_tick: 50
 heartbeat_tick: 1
 cluster:
