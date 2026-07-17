@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // clusterInfoJSON returns a JSON-encoded ClusterInfo with the given leader

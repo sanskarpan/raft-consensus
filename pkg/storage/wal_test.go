@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 func tempDir(t *testing.T) string {

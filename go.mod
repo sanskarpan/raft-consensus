@@ -1,4 +1,4 @@
-module github.com/raft-consensus
+module github.com/sanskarpan/raft-consensus
 
 go 1.25.0
 

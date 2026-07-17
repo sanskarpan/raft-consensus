@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raft-consensus/pkg/transport"
+	"github.com/sanskarpan/raft-consensus/pkg/transport"
 	"go.uber.org/zap"
 )
 

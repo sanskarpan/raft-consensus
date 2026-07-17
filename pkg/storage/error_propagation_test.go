@@ -3,7 +3,7 @@ package storage
 import (
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // M16: snapshot sink Cancel must surface a Close failure instead of silently

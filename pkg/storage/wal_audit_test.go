@@ -8,7 +8,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // H-C2: after a segment rotation the WAL directory must be fsync'd so the newly

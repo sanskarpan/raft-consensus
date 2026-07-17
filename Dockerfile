@@ -22,7 +22,7 @@ RUN go mod download
 COPY . .
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
-    -ldflags="-s -w -X github.com/raft-consensus/pkg/version.Version=${VERSION}" \
+    -ldflags="-s -w -X github.com/sanskarpan/raft-consensus/pkg/version.Version=${VERSION}" \
     -o /raftd ./cmd/raftd \
  && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /kvctl ./cmd/kvctl
 

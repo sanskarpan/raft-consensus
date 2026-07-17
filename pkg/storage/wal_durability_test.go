@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // C1: Append must fsync the segment to disk before returning, otherwise a

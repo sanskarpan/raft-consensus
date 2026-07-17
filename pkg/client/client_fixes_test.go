@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // clusterHandler writes a minimal leader ClusterInfo for /admin/cluster.

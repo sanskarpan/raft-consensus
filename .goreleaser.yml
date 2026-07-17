@@ -19,9 +19,9 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/raft-consensus/pkg/version.Version={{ .Version }}
-      - -X github.com/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
-      - -X github.com/raft-consensus/pkg/version.BuildDate={{ .Date }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.Version={{ .Version }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.BuildDate={{ .Date }}
     goos:
       - linux
       - darwin
@@ -38,9 +38,9 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
-      - -X github.com/raft-consensus/pkg/version.Version={{ .Version }}
-      - -X github.com/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
-      - -X github.com/raft-consensus/pkg/version.BuildDate={{ .Date }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.Version={{ .Version }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.GitCommit={{ .ShortCommit }}
+      - -X github.com/sanskarpan/raft-consensus/pkg/version.BuildDate={{ .Date }}
     goos:
       - linux
       - darwin

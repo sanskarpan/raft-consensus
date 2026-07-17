@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // C11: When RequireTLS is set and no TLS config is available, dialing a peer

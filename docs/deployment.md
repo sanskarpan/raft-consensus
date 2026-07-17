@@ -42,7 +42,7 @@ go build -o raftd ./cmd/raftd
 go build -o kvctl ./cmd/kvctl
 # with version metadata:
 go build -trimpath \
-  -ldflags="-s -w -X github.com/raft-consensus/pkg/version.Version=v1.0.0" \
+  -ldflags="-s -w -X github.com/sanskarpan/raft-consensus/pkg/version.Version=v1.0.0" \
   -o raftd ./cmd/raftd
 ```
 

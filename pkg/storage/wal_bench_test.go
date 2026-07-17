@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/raft-consensus/pkg/raft"
+	"github.com/sanskarpan/raft-consensus/pkg/raft"
 )
 
 // M-P5: encodeRecord must allocate a single buffer (the result), so ~1 alloc/op.
