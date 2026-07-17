@@ -10,22 +10,46 @@ TiKV) and state-of-the-art KV stores (etcd, Consul, TiKV, FoundationDB).
 
 **Legend** — Impact: **H**igh / **M**edium / **L**ow (operational or user value).
 Effort: **S**mall (hours–days) / **M**edium (days–weeks) / **L**arge (weeks+).
+Status: ✅ shipped · 🔲 open (tracked as a GitHub issue).
 
 ---
 
-## ⚠️ Verify-first items (correctness-adjacent)
+## ✅ Progress log
 
-These surfaced during the enhancement audit but touch correctness or are dead
-code. They should be **investigated before the feature work** below.
+Items resolved since this catalog was written (each shipped as an issue-linked,
+CI-green PR merged to `main`):
 
-| Item | Why it matters | Where |
-|---|---|---|
-| **Multi-chunk InstallSnapshot reassembly** | The leader streams snapshots in 1 MiB chunks with `Offset`/`Done`, but the receiver path (`restoreSnapshotData`) appears to create a sink on the final `Done` and write only that chunk's `req.Data`, ignoring `Offset`. If so, any snapshot **> 1 MiB** restores partially. The gRPC *server* handler does loop over the stream, so behavior may differ by transport — **must be traced end-to-end and covered by a >1 MiB snapshot test.** | `pkg/raft/raft.go` `handleInstallSnapshot`/`restoreSnapshotData`; `pkg/transport/grpc.go` client `InstallSnapshot` |
-| **Dead nightly chaos/soak job** | The chaos/soak job lives in `release.yml` gated `if: github.event_name=='schedule'`, but `release.yml` only triggers on `push: tags v*` — so it **never runs**. The infra intent exists but is mis-wired. Move it onto the `ci.yml` cron. | `.github/workflows/release.yml`, `.github/workflows/ci.yml` |
-| **Dead metric: InstallSnapshot latency** | `RecordInstallSnapshotLatency` / `InstallSnapshotLatencyHistogram` are defined but never called — snapshot-transfer latency is silently unrecorded. | `pkg/metrics/raft.go`, `pkg/raft/raft.go` |
-| **Dead UI metric reference** | The dashboard reads `raft_snapshot_size_bytes`, but the server exports no such metric (dead card). Either export it or remove the card. | `pkg/metrics/raft.go`; `ui/src/components/MetricsDashboard.tsx` |
-| **Module path vs. import path mismatch** | `go.mod` is `github.com/raft-consensus` but README/docs tell users to `go get github.com/sanskarpan/raft-consensus` and `import github.com/raft-consensus/pkg/client`. The advertised library is currently **un-importable**; pick one canonical path everywhere. | `go.mod`, `README.md`, `docs/api.md` |
-| **Vote-grant persistence variant** | Confirm the vote-*grant* path in `handleRequestVote` persists term/votedFor with the error-checked call (not the best-effort `...Logged` variant used on step-down paths). A lost grant write could allow a double-vote after crash-restart. | `pkg/raft/raft.go` `handleRequestVote` |
+| Item | PR / Issue |
+|---|---|
+| Multi-chunk InstallSnapshot reassembly (**bug** — >1 MiB snapshots restored from only the last chunk) | #194 / #193 |
+| Vote-grant durability (**bug** — vote reported granted before durable persist) | #196 / #195 |
+| Dead nightly chaos/soak job → moved to `ci.yml` cron | #196 |
+| Dead metrics wired (`RecordInstallSnapshotLatency`, `raft_snapshot_size_bytes`) | #196 |
+| Module path renamed → `github.com/sanskarpan/raft-consensus` (now `go`-gettable) | #197 |
+| CheckQuorum — leader steps down on lost quorum | #224 / #198 |
+| Disruptive-server vote rejection (§4.2.3, gated on CheckQuorum) | #225 / #199 |
+| Go/Process Prometheus collectors | already satisfied by the default registry (#210 closed) |
+| `raft_leader_changes_total` + `raft_proposal_commit_latency_seconds` | #226 / #211 |
+| Grafana dashboard JSON + PrometheusRule alerts (+ `checkQuorum` Helm wiring) | #226 / #212 |
+
+The remaining items below are tracked as open GitHub issues (labels `enhancement`
++ `area/*`).
+
+---
+
+## ⚠️ Verify-first items — ALL RESOLVED ✅
+
+These surfaced during the audit as correctness-adjacent / dead code and have all
+been investigated and fixed (see the progress log above):
+
+| Item | Resolution |
+|---|---|
+| Multi-chunk InstallSnapshot reassembly | ✅ **Confirmed real bug**; receiver now reassembles Offset-ordered chunks; gRPC server preserves per-chunk offset. Regression tests added. |
+| Dead nightly chaos/soak job | ✅ Moved to `ci.yml` (daily cron); now runs. |
+| Dead metric: InstallSnapshot latency | ✅ Wired on the send path. |
+| Dead UI metric reference (`raft_snapshot_size_bytes`) | ✅ Metric now exported (send + restore paths). |
+| Module path vs. import path mismatch | ✅ Module renamed to match the repo; all imports/ldflags/docs updated. |
+| Vote-grant persistence variant | ✅ **Confirmed real bug**; grant now uses the error-checked persist and denies the vote on failure. |
 
 ---
 
@@ -67,8 +91,8 @@ fatal-halt on storage/FSM panic, log compaction.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| CheckQuorum (step down on lost quorum) | H | M | An isolated leader stays `Leader` indefinitely, delaying failover. Step down if < quorum followers acked within an election timeout. | `tickLeader`, `heartbeatAcks` |
-| Disruptive-server vote rejection (real path) | H | S | The real-vote path lacks the "reject RequestVote if a leader was heard recently" rule (Ongaro §4.2.3); only pre-vote guards it. Enables term inflation by a removed/partitioned node. | `handleRequestVote` |
+| ✅ CheckQuorum (step down on lost quorum) | H | M | **Shipped (#198).** Leader steps down if < quorum voters acked within an election timeout. Opt-in via `Config.CheckQuorum`. | `tickLeader`, `heartbeatAcks` |
+| ✅ Disruptive-server vote rejection (real path) | H | S | **Shipped (#199).** §4.2.3 guard gated on CheckQuorum; bypassed by a `LeaderTransfer` flag. | `handleRequestVote` |
 | True inflight/flow-control window | M | M | `MaxInflight` only sizes the pending-future cap; actual AppendEntries has no per-follower unacked-entry cap, so a fast leader can flood a slow follower. | `replicateOnce`, `nextIndex`/`matchIndex` |
 | AppendEntries pipelining | M | M | Replication is strictly request→response→next; no multiple in-flight batches per follower, capping throughput at batch/RTT. | `replicateTo`/`replicateOnce` |
 | Honor `MaxSizePerMsg` in batching | M | S | Batching is by entry count (100), ignoring byte size — large entries make oversized RPCs; tiny entries under-fill. | `replicateOnce` |
@@ -103,7 +127,7 @@ bbolt StableStore, log consistency verifier, WAL fsync metric.
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
 | Group-commit / batched fsync | H | M | `Append` fsyncs under the global write lock, serializing every concurrent proposal into its own fsync. Coalesce waiters → one fsync per batch. | `Append`, `fsyncCurrentLocked` |
-| Receiver-side chunk reassembly | H | M | See verify-first: multi-chunk snapshots may restore only the last chunk. | `restoreSnapshotData` |
+| ✅ Receiver-side chunk reassembly | H | M | **Shipped (#194)** — was a real bug; receiver now reassembles Offset-ordered chunks. | `restoreSnapshotData` |
 | Snapshot compression (gzip/zstd) | H | M | Snapshots written raw; FSM state is highly compressible — cuts disk + InstallSnapshot transfer. | `fileSnapshotSink.Write`/`Close` |
 | WAL segment preallocation (`fallocate`) | H | M | Segments grow record-by-record; preallocate to avoid fragmentation, cut fsync-path metadata updates, fail early on ENOSPC. | `createSegment`/`rotateSegment` |
 | crc32c / xxhash checksums | M | S | CRC32/IEEE has no hardware acceleration; Castagnoli (crc32c) uses the CPU CRC instruction (~5–10×). | WAL + snapshot checksum sites |
@@ -218,14 +242,14 @@ React dashboard, ops docs, Helm probes.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Register Go & Process collectors | H | S | `/metrics` exposes zero runtime stats (goroutines/GC/heap/fds/CPU) — goroutine leaks + GC pauses invisible. | `metrics`, `/metrics` path |
-| `raft_leader_changes_total` | H | S | The canonical leader-instability SLI (etcd `leader_changes_seen_total`); only `elections_total` exists. | `metrics`, becomeLeader/step-down |
-| Commit latency histogram (propose→commit) | H | M | The end-to-end write latency users care about isn't recorded. | Apply path + commit advance |
+| ✅ Register Go & Process collectors | H | S | **Already satisfied (#210 closed)** — the default registry already exports `go_*`/`process_*`. | `metrics`, `/metrics` path |
+| ✅ `raft_leader_changes_total` | H | S | **Shipped (#211).** Incremented on becomeLeader + observed-leader-change. | `metrics`, becomeLeader/leader-learn |
+| ✅ Commit latency histogram (propose→commit) | H | M | **Shipped (#211)** as `raft_proposal_commit_latency_seconds`. | Apply path + commit advance |
 | Broaden write-path distributed tracing | H | M | The internal Raft path (Apply→WAL→replicate→commit→apply) isn't traced; handler spans aren't linked to replication. | Apply/replicate/apply, WAL |
-| Grafana dashboard JSON | H | M | No dashboard artifact; ship a versioned one. | new `docs/`/`charts/` file |
-| Prometheus alerting rules (PrometheusRule) | H | S | `docs/operations.md` has prose alerts but no machine-readable rules. | new chart template |
-| Wire the dead InstallSnapshot latency metric | M | S | Defined but never called. | `metrics`, `raft.go` |
-| Export snapshot-size / metadata metric | M | S | UI reads `raft_snapshot_size_bytes` which doesn't exist. | `metrics`, `raft.go` |
+| ✅ Grafana dashboard JSON | H | M | **Shipped (#212)** — `docs/grafana-dashboard.json`. | `docs/grafana-dashboard.json` |
+| ✅ Prometheus alerting rules (PrometheusRule) | H | S | **Shipped (#212)** — opt-in chart `PrometheusRule`. | `charts/raft/templates/prometheusrule.yaml` |
+| ✅ Wire the dead InstallSnapshot latency metric | M | S | **Shipped (#196).** | `metrics`, `raft.go` |
+| ✅ Export snapshot-size metric | M | S | **Shipped (#196)** — `raft_snapshot_size_bytes`. | `metrics`, `raft.go` |
 | Proposal queue depth / in-flight gauge | M | S | Leading indicator before apply-lag grows. | `metrics`, `raft.go` |
 | Entries-applied/committed counters | M | S | Only gauges exist; counters give clean throughput graphs across restarts. | `metrics`, `raft.go` |
 | Log-size / compaction metrics | M | M | No last/first index, entry count, or last-compacted index — disk-fill root cause invisible. | `metrics`, `wal.go` |
