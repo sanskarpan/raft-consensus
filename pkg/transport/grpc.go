@@ -1084,15 +1084,17 @@ func (h *grpcServerHandler) InstallSnapshot(stream proto.RaftService_InstallSnap
 		return stream.SendAndClose(resp)
 	}
 
-	// Build a single logical request carrying the reassembled payload. Use the
-	// metadata from the first chunk (Term/LeaderId/LastIncluded*), the full data,
-	// offset 0, and Done reflecting whether the transfer completed.
+	// Build a single logical request carrying the payload accumulated on this
+	// stream. Preserve first.Offset (NOT a hardcoded 0): the current client sends
+	// one chunk per stream, so the raft handler reassembles the Offset-ordered
+	// chunks across RPCs. A future client that streams all chunks on one stream
+	// yields first.Offset==0 with the full data, which the handler also accepts.
 	req := &proto.InstallSnapshotRequest{
 		Term:              first.Term,
 		LeaderId:          first.LeaderId,
 		LastIncludedIndex: first.LastIncludedIndex,
 		LastIncludedTerm:  first.LastIncludedTerm,
-		Offset:            0,
+		Offset:            first.Offset,
 		Data:              data,
 		Done:              done,
 	}

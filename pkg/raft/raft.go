@@ -111,6 +111,13 @@ type raft struct {
 	snapshotTicker *time.Ticker
 	snapshotIndex  uint64
 
+	// snapReasm reassembles the Offset-ordered chunks of an incoming
+	// InstallSnapshot transfer. The leader sends a snapshot larger than
+	// snapshotChunkSize as a sequence of chunks (one RPC each, Done only on the
+	// last), so the receiver must accumulate them before restoring the FSM.
+	// Guarded by r.mu (all writes happen inside handleInstallSnapshot).
+	snapReasm snapshotReassembly
+
 	// proposalCh carries client Apply() requests into the run() goroutine.
 	proposalCh chan *proposalFuture
 
@@ -1133,6 +1140,25 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 // snapshotChunkSize bounds how much snapshot data is carried per InstallSnapshot
 // RPC when streaming to a lagging follower (C-A1).
 const snapshotChunkSize = 1 << 20 // 1 MiB
+
+// maxReassembledSnapshotBytes bounds the receiver-side reassembly buffer so a
+// buggy or malicious (but authenticated) leader cannot exhaust memory by
+// streaming an unbounded snapshot. The transports enforce their own caps too;
+// this is a defense-in-depth ceiling at the consensus layer.
+const maxReassembledSnapshotBytes = 1 << 30 // 1 GiB
+
+// snapshotReassembly accumulates the Offset-ordered chunks of a single
+// InstallSnapshot transfer keyed by its LastIncludedIndex. A chunk at Offset 0
+// starts (or restarts) a transfer; subsequent chunks must be contiguous.
+type snapshotReassembly struct {
+	index uint64 // LastIncludedIndex of the in-progress transfer (0 = none)
+	buf   []byte
+}
+
+func (s *snapshotReassembly) reset() {
+	s.index = 0
+	s.buf = nil
+}
 
 // sendSnapshotTo streams the latest local snapshot to a follower whose required
 // log entry has been compacted away (C-A1). It reads the newest snapshot from
@@ -3008,7 +3034,42 @@ func (r *raft) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 	r.leaderID = req.LeaderID
 	r.electionTicks = r.randomElectionTickCount()
 
+	// Reassemble Offset-ordered chunks across the per-chunk InstallSnapshot RPCs
+	// (H9): the leader streams a snapshot larger than snapshotChunkSize as a
+	// sequence of chunks, Done only on the last. Accumulate here and restore the
+	// full payload once Done arrives.
+	if req.Offset == 0 {
+		// Start (or restart) the transfer.
+		r.snapReasm.index = req.LastIncludedIndex
+		r.snapReasm.buf = append(r.snapReasm.buf[:0], req.Data...)
+	} else if r.snapReasm.index == req.LastIncludedIndex &&
+		req.Offset == uint64(len(r.snapReasm.buf)) {
+		// Contiguous continuation of the in-progress transfer.
+		r.snapReasm.buf = append(r.snapReasm.buf, req.Data...)
+	} else {
+		// Out-of-order/mismatched chunk (a lost chunk, or a different snapshot):
+		// drop the partial buffer and wait for the leader to restart at Offset 0.
+		r.logger.Warn("discarding out-of-order snapshot chunk",
+			zap.Uint64("offset", req.Offset),
+			zap.Uint64("have", uint64(len(r.snapReasm.buf))),
+			zap.Uint64("index", req.LastIncludedIndex))
+		r.snapReasm.reset()
+		return resp
+	}
+
+	if len(r.snapReasm.buf) > maxReassembledSnapshotBytes {
+		r.logger.Error("snapshot exceeds reassembly cap; aborting transfer",
+			zap.Int("bytes", len(r.snapReasm.buf)),
+			zap.Uint64("index", req.LastIncludedIndex))
+		r.snapReasm.reset()
+		return resp
+	}
+
 	if req.Done {
+		// The reassembled payload is what we restore, not this final chunk alone.
+		fullData := r.snapReasm.buf
+		r.snapReasm.reset()
+
 		// C4: never move state backward on a stale/duplicate snapshot. If we
 		// already have this index committed, ignore it (but ack success so the
 		// leader stops retrying).
@@ -3017,6 +3078,7 @@ func (r *raft) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 			return resp
 		}
 
+		req.Data = fullData
 		if err := r.restoreSnapshotData(req); err != nil {
 			r.logger.Error("failed to restore snapshot", zap.Error(err))
 			return resp
