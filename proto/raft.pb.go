@@ -399,14 +399,18 @@ func (x *LogEntry) GetData() []byte {
 }
 
 type RequestVoteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
-	LastLogIndex  uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastLogTerm   uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
-	PreVote       bool                   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Term         uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId  string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	LastLogIndex uint64                 `protobuf:"varint,3,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastLogTerm  uint64                 `protobuf:"varint,4,opt,name=last_log_term,json=lastLogTerm,proto3" json:"last_log_term,omitempty"`
+	PreVote      bool                   `protobuf:"varint,5,opt,name=pre_vote,json=preVote,proto3" json:"pre_vote,omitempty"`
+	// leader_transfer marks a campaign started by a TimeoutNow leadership
+	// transfer; recipients must honor it even if they heard from a leader
+	// recently (bypasses the disruptive-server rejection).
+	LeaderTransfer bool `protobuf:"varint,6,opt,name=leader_transfer,json=leaderTransfer,proto3" json:"leader_transfer,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *RequestVoteRequest) Reset() {
@@ -470,6 +474,13 @@ func (x *RequestVoteRequest) GetLastLogTerm() uint64 {
 func (x *RequestVoteRequest) GetPreVote() bool {
 	if x != nil {
 		return x.PreVote
+	}
+	return false
+}
+
+func (x *RequestVoteRequest) GetLeaderTransfer() bool {
+	if x != nil {
+		return x.LeaderTransfer
 	}
 	return false
 }
@@ -1822,13 +1833,14 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x14\n" +
 	"\x05index\x18\x02 \x01(\x04R\x05index\x12#\n" +
 	"\x04type\x18\x03 \x01(\x0e2\x0f.raft.EntryTypeR\x04type\x12\x12\n" +
-	"\x04data\x18\x04 \x01(\fR\x04data\"\xb0\x01\n" +
+	"\x04data\x18\x04 \x01(\fR\x04data\"\xd9\x01\n" +
 	"\x12RequestVoteRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12$\n" +
 	"\x0elast_log_index\x18\x03 \x01(\x04R\flastLogIndex\x12\"\n" +
 	"\rlast_log_term\x18\x04 \x01(\x04R\vlastLogTerm\x12\x19\n" +
-	"\bpre_vote\x18\x05 \x01(\bR\apreVote\"q\n" +
+	"\bpre_vote\x18\x05 \x01(\bR\apreVote\x12'\n" +
+	"\x0fleader_transfer\x18\x06 \x01(\bR\x0eleaderTransfer\"q\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
 	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\x12#\n" +

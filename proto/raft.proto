@@ -48,6 +48,10 @@ message RequestVoteRequest {
     uint64 last_log_index = 3;
     uint64 last_log_term = 4;
     bool pre_vote = 5;
+    // leader_transfer marks a campaign started by a TimeoutNow leadership
+    // transfer; recipients must honor it even if they heard from a leader
+    // recently (bypasses the disruptive-server rejection).
+    bool leader_transfer = 6;
 }
 
 message RequestVoteResponse {
