@@ -1498,6 +1498,12 @@ func (s *Server) ensureLeader(w http.ResponseWriter, r *http.Request, path strin
 		json.NewEncoder(w).Encode(map[string]string{"error": "no leader elected"})
 		return fmt.Errorf("no leader")
 	}
+	// Tell the client the leader's address so it can route future writes there
+	// directly (X-Raft-Leader-Address). Best-effort: only when a usable address
+	// is configured for the leader.
+	if addr := s.getMemberAddress(string(leader)); addr != "" {
+		w.Header().Set("X-Raft-Leader-Address", addr)
+	}
 	if string(leader) == s.config.NodeID {
 		return nil // this node is the leader
 	}
@@ -1720,12 +1726,88 @@ func (s *Server) handleV1KV(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		s.handleV1Get(w, r, key)
 	case http.MethodPut, http.MethodPost:
+		if r.URL.Query().Get("op") == "incr" {
+			s.handleV1Incr(w, r, key)
+			return
+		}
 		s.handleV1Put(w, r, key)
 	case http.MethodDelete:
 		s.handleV1Delete(w, r, key)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// handleV1Incr atomically adds a signed delta to an integer-valued key and
+// returns the updated KeyValue. POST /v1/kv/{key}?op=incr with body {"delta": N}.
+func (s *Server) handleV1Incr(w http.ResponseWriter, r *http.Request, key string) {
+	if s.draining.Load() {
+		s.writeDrainingResponse(w)
+		return
+	}
+	// Pass only the path; forwardToLeader re-appends r.URL.RawQuery (?op=incr),
+	// so embedding the query here would double it and break dispatch on the leader.
+	if err := s.ensureLeader(w, r, "/v1/kv/"+key); err != nil {
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.config.MaxRequestBodyBytes)
+	var body struct {
+		Delta int64 `json:"delta"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.writeGenericError(w, http.StatusBadRequest, "invalid JSON body (expected {\"delta\": <int>})", err)
+		return
+	}
+	if err := validateKeyValue(key, ""); err != nil {
+		s.writeGenericError(w, http.StatusBadRequest, err.Error(), nil)
+		return
+	}
+
+	clientID := r.Header.Get("X-Client-ID")
+	seqNum, ok := parseSeqNum(w, s, r)
+	if !ok {
+		return
+	}
+
+	deltaStr := strconv.FormatInt(body.Delta, 10)
+	var data []byte
+	var err error
+	if clientID != "" && seqNum > 0 {
+		data, err = fsm.EncodeCommandWithID("incr", key, deltaStr, clientID, seqNum)
+	} else {
+		data, err = fsm.EncodeCommand("incr", key, deltaStr)
+	}
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	result, err := s.raftNode.Apply(ctx, data)
+	if err != nil {
+		metrics.RecordProposal("error")
+		s.recordApplyRejection(err)
+		s.writeError(w, err)
+		return
+	}
+	metrics.RecordProposal("ok")
+
+	// An FSM-level rejection (non-integer value/delta, overflow) surfaces as a
+	// KvResult error, not a transport error.
+	if kvres, derr := fsm.DecodeResult(result); derr == nil && kvres.Error != "" {
+		s.writeGenericError(w, http.StatusBadRequest, kvres.Error, nil)
+		return
+	}
+	kv, err := fsm.DecodeKeyValueResult(result)
+	if err != nil {
+		s.writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	writeJSON(w, kv)
 }
 
 // handleV1Get serves GET /v1/kv/{key}.
