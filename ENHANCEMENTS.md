@@ -135,7 +135,7 @@ bbolt StableStore, log consistency verifier, WAL fsync metric.
 |---|---|---|---|---|
 | Group-commit / batched fsync | H | M | `Append` fsyncs under the global write lock, serializing every concurrent proposal into its own fsync. Coalesce waiters → one fsync per batch. | `Append`, `fsyncCurrentLocked` |
 | ✅ Receiver-side chunk reassembly | H | M | **Shipped (#194)** — was a real bug; receiver now reassembles Offset-ordered chunks. | `restoreSnapshotData` |
-| Snapshot compression (gzip/zstd) | H | M | Snapshots written raw; FSM state is highly compressible — cuts disk + InstallSnapshot transfer. | `fileSnapshotSink.Write`/`Close` |
+| ✅ Snapshot compression (gzip) | H | M | **Shipped (#202)** — opt-in `snapshot_compression`; gzip at rest, recorded in sidecar, Reader decompresses transparently; backward compatible. | `snapshot.go` |
 | WAL segment preallocation (`fallocate`) | H | M | Segments grow record-by-record; preallocate to avoid fragmentation, cut fsync-path metadata updates, fail early on ENOSPC. | `createSegment`/`rotateSegment` |
 | crc32c / xxhash checksums | M | S | CRC32/IEEE has no hardware acceleration; Castagnoli (crc32c) uses the CPU CRC instruction (~5–10×). | WAL + snapshot checksum sites |
 | Storage metrics beyond fsync | M | S | No metrics for WAL bytes, segment rotations, batch size, snapshot bytes/duration, compaction counts, fsync errors. | `wal.go`, `snapshot.go`, `metrics` |
