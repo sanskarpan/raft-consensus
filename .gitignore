@@ -42,3 +42,4 @@ scripts/certs/generated/
 *.db
 *.wal
 /lincheck
+/kvclient
