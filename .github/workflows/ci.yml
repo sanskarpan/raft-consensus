@@ -62,6 +62,16 @@ jobs:
           name: coverage
           path: coverage.out
 
+      # Upload to Codecov for per-PR coverage + delta reporting. Non-blocking:
+      # requires CODECOV_TOKEN to be set (private repo); skipped/soft otherwise.
+      - name: Upload coverage to Codecov
+        if: matrix.go-version == '1.26.5'
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -149,3 +159,13 @@ jobs:
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzReadRecordAtBounded$' -fuzztime=60s
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzVerifySnapChecksum$'  -fuzztime=60s
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzWALRecovery$'         -fuzztime=60s
+      - name: Benchmarks (benchstat-formatted, for trend tracking)
+        run: |
+          go install golang.org/x/perf/cmd/benchstat@latest
+          go test -run='^$' -bench=. -benchmem -benchtime=50x -count=6 ./pkg/fsm/ ./pkg/storage/ | tee bench.txt
+          benchstat bench.txt || true
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmarks
+          path: bench.txt
