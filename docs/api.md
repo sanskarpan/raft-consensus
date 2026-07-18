@@ -40,15 +40,20 @@ Send the token as an HTTP header:
 Authorization: Bearer <token>
 ```
 
-Roles come from config (`admin_token` → `write`; `admin_tokens` map → `read` or
-`write`). `write` implies `read`.
+Roles come from config. The legacy single `admin_token` gets the `admin` role;
+entries in the `admin_tokens` map are assigned `read`, `write`, or `admin`. The
+hierarchy is **`admin` > `write` > `read`** — `admin` implies `write` implies
+`read`. Data writes (`/command`, `PUT/POST/DELETE /v1/kv`, `/v1/txn`) require
+`write`; **membership and snapshot operations** (`/admin/members`,
+`/admin/snapshot`) require `admin`. An `admin_tokens` entry with an unknown role
+is rejected at startup.
 
 | Behavior | Condition |
 |----------|-----------|
-| Request allowed with `write` role | `allow_no_auth: true` and no tokens configured (dev). |
+| Request allowed with full (`admin`) access | `allow_no_auth: true` and no tokens configured (dev). |
 | All requests rejected (401) | No tokens configured and `allow_no_auth` unset. |
 | 401 Unauthorized | Missing/unknown token. |
-| 403 Forbidden | Valid `read` token used on a `write` endpoint. |
+| 403 Forbidden | Token role below the endpoint's required role (e.g. `write` token on `/admin/members`). |
 
 `/health` and `/ready` are always unauthenticated.
 
@@ -66,12 +71,12 @@ Roles come from config (`admin_token` → `write`; `admin_tokens` map → `read`
 | GET | `/v1/status` | read | Extended status + revision. |
 | POST/PUT | `/command` | write | Legacy raw FSM command apply. |
 | GET | `/admin/cluster` | read | Raft configuration + role/term. |
-| POST | `/admin/snapshot` | write | Trigger a snapshot. |
-| GET/POST | `/admin/members` | read (GET) / write (POST) | List / add voting member. |
-| DELETE/POST | `/admin/members/{id}[/promote|/demote]` | write | Remove / promote / demote. |
+| POST | `/admin/snapshot` | admin | Trigger a snapshot. |
+| GET/POST | `/admin/members` | admin | List / add voting member. |
+| DELETE/POST | `/admin/members/{id}[/promote|/demote]` | admin | Remove / promote / demote. |
 
-> The membership routes are registered under `requireRole("write", …)`, so a valid
-> `write` token is required even for the `GET /admin/members` listing;
+> The membership and snapshot routes are registered under `requireRole("admin", …)`,
+> so an `admin` token is required (a `write` token gets `403`);
 > `GET /admin/cluster` only requires authentication (any valid token).
 
 ## Health and status
@@ -286,7 +291,7 @@ curl -X POST localhost:8002/admin/snapshot -H "Authorization: Bearer $T"
 
 ## Membership API
 
-All membership mutations require the `write` role and must be sent to the **leader**
+All membership mutations require the `admin` role and must be sent to the **leader**
 (a follower returns `503 {"error":"not leader"}`). Raft allows only one outstanding
 configuration change at a time.
 

@@ -459,6 +459,13 @@ func loadConfig(path string) (*Config, error) {
 		config.MaxWatchConnectionsPerIP = defaultMaxWatchConnsPerIP
 	}
 
+	// Validate RBAC roles so a typo can't silently grant no access (rank 0).
+	for tok, role := range config.AdminTokens {
+		if roleRank(role) == 0 {
+			return nil, fmt.Errorf("admin_tokens: token %q has invalid role %q (want read|write|admin)", tok, role)
+		}
+	}
+
 	return &config, nil
 }
 
@@ -912,7 +919,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	// C10: /command applies arbitrary FSM writes and MUST require the write role.
 	mux.HandleFunc("/command", instrument("command", s.requireRole("write", s.rateLimitMiddleware(s.handleCommand))))
 	mux.HandleFunc("/admin/cluster", instrument("admin_cluster", s.authMiddleware(s.handleCluster)))
-	mux.HandleFunc("/admin/snapshot", instrument("admin_snapshot", s.requireRole("write", s.handleSnapshot)))
+	mux.HandleFunc("/admin/snapshot", instrument("admin_snapshot", s.requireRole("admin", s.handleSnapshot)))
 	// M-O3: /metrics leaks topology/term/leader. Gate it behind the read role
 	// whenever any admin token is configured (or metrics_auth is set), so prod
 	// deployments require auth while token-less dev stays open.
@@ -924,8 +931,8 @@ func (s *Server) buildMux() *http.ServeMux {
 	// POST   /admin/members/{id}/promote — promote learner → voter
 	// POST   /admin/members/{id}/demote  — demote voter → learner
 	// POST   /admin/learners           — add a non-voting learner
-	mux.HandleFunc("/admin/members", instrument("admin_members", s.requireRole("write", s.handleAdminMembers)))
-	mux.HandleFunc("/admin/members/", instrument("admin_member_by_id", s.requireRole("write", s.handleAdminMemberByID)))
+	mux.HandleFunc("/admin/members", instrument("admin_members", s.requireRole("admin", s.handleAdminMembers)))
+	mux.HandleFunc("/admin/members/", instrument("admin_member_by_id", s.requireRole("admin", s.handleAdminMemberByID)))
 
 	// v1 KV API routes.
 	// /v1/kv/{key} — GET (linearizable/stale), PUT, DELETE
@@ -1144,7 +1151,8 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// mode), in which case the caller is granted the write role.
 		if s.config.AdminToken == "" && len(s.config.AdminTokens) == 0 {
 			if s.config.AllowNoAuth {
-				ctx := context.WithValue(r.Context(), roleContextKey{}, "write")
+				// No-auth dev mode grants full access (admin implies write+read).
+				ctx := context.WithValue(r.Context(), roleContextKey{}, "admin")
 				next(w, r.WithContext(ctx))
 				return
 			}
@@ -1166,8 +1174,10 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		// so an attacker cannot recover a valid token byte-by-byte via timing.
 		role := ""
 		if s.config.AdminToken != "" && constantTimeEqual(token, s.config.AdminToken) {
-			// Legacy single token always gets "write" role.
-			role = "write"
+			// The legacy single admin_token is the cluster's admin credential and
+			// gets the "admin" role (implies write+read), preserving its ability to
+			// perform membership/snapshot operations.
+			role = "admin"
 		} else if s.config.AdminTokens != nil {
 			// Constant-time scan: compare against every configured token so the
 			// runtime does not depend on which (if any) token matched.
@@ -1190,15 +1200,33 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// roleRank orders the RBAC roles: admin > write > read. An unknown/empty role
+// ranks 0 (no access). A caller satisfies a required role when its rank is >=
+// the required rank, so admin implies write+read and write implies read.
+func roleRank(role string) int {
+	switch role {
+	case "admin":
+		return 3
+	case "write":
+		return 2
+	case "read":
+		return 1
+	default:
+		return 0
+	}
+}
+
 // requireRole wraps authMiddleware and additionally enforces that the
 // authenticated caller has at least the specified role.
-// Supported roles: "read", "write" (write implies read).
+// Supported roles: "read", "write", "admin" (admin implies write implies read).
+// Membership and snapshot operations require "admin"; data writes require
+// "write".
 func (s *Server) requireRole(role string, next http.HandlerFunc) http.HandlerFunc {
 	return s.authMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		userRole, _ := r.Context().Value(roleContextKey{}).(string)
-		if role == "write" && userRole != "write" {
+		if roleRank(userRole) < roleRank(role) {
 			w.WriteHeader(http.StatusForbidden)
-			json.NewEncoder(w).Encode(map[string]string{"error": "write role required"})
+			json.NewEncoder(w).Encode(map[string]string{"error": role + " role required"})
 			return
 		}
 		next(w, r)
