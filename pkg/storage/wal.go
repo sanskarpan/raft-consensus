@@ -67,6 +67,16 @@ type WAL struct {
 	// for verifying that Append surfaces fsync failures instead of falsely
 	// reporting durability (C1).
 	failSync atomic.Bool
+
+	// --- group commit (#201) ---
+	// writeSeq is incremented (under w.mu, after the records are written) once
+	// per Append batch. groupSync uses it to know which writes an fsync covers,
+	// so concurrent Appends coalesce into a single fsync instead of one each.
+	writeSeq  atomic.Uint64
+	syncMu    sync.Mutex
+	syncCond  *sync.Cond // broadcast when an fsync completes
+	syncedSeq uint64     // highest writeSeq durably fsynced (under syncMu)
+	syncing   bool       // an fsync is in progress (under syncMu)
 }
 
 type segment struct {
@@ -131,6 +141,7 @@ func NewWAL(path string, opts *WALOptions) (*WAL, error) {
 		index: newLogIndex(),
 		meta:  meta,
 	}
+	wal.syncCond = sync.NewCond(&wal.syncMu)
 
 	if err := wal.openSegments(); err != nil {
 		wal.Close()
@@ -354,32 +365,72 @@ func (w *WAL) Append(entries []*raft.LogEntry) error {
 	}
 
 	w.mu.Lock()
-	defer w.mu.Unlock()
-
 	for _, entry := range entries {
 		if err := w.appendEntry(entry); err != nil {
+			w.mu.Unlock()
 			return err
 		}
 	}
+	// Assign this batch a write sequence AFTER its records are written, then
+	// release w.mu so concurrent Appends can write their records while we fsync.
+	mySeq := w.writeSeq.Add(1)
+	w.mu.Unlock()
 
-	// C1: fsync the batch to stable storage before returning so that a
-	// committed entry cannot be lost on power failure. rotateSegment already
-	// fsyncs a segment it rotates away from; this covers the final segment.
-	return w.fsyncCurrentLocked()
+	// C1 + #201: ensure the batch is durably fsynced before returning. Concurrent
+	// Appends coalesce into a shared fsync (group commit) rather than one each.
+	return w.groupSync(mySeq)
 }
 
-// fsyncCurrentLocked forces the current segment's data to durable storage.
-// Caller must hold w.mu.
-func (w *WAL) fsyncCurrentLocked() error {
+// groupSync returns only once an fsync durably covering writeSeq >= seq has
+// completed. Concurrent callers coalesce: while one goroutine performs the
+// fsync, others wait; a single fsync satisfies every waiter whose write it
+// covers, so N concurrent Appends can share far fewer than N fsyncs.
+func (w *WAL) groupSync(seq uint64) error {
+	w.syncMu.Lock()
+	for {
+		if w.syncedSeq >= seq {
+			w.syncMu.Unlock()
+			return nil // our write is already durable
+		}
+		if !w.syncing {
+			break // no fsync in progress — become the syncer
+		}
+		w.syncCond.Wait() // an fsync is running; it may cover us
+	}
+
+	w.syncing = true
+	target := w.writeSeq.Load() // this fsync will cover everything written so far
+	w.syncMu.Unlock()
+
+	err := w.fsyncCurrent()
+
+	w.syncMu.Lock()
+	if err == nil && target > w.syncedSeq {
+		w.syncedSeq = target
+	}
+	w.syncing = false
+	w.syncCond.Broadcast()
+	w.syncMu.Unlock()
+	return err
+}
+
+// fsyncCurrent fsyncs the current segment without holding w.mu (it briefly
+// RLocks to read currentSegment, then syncs under the segment's own lock). Older
+// segments were already fsynced by rotateSegment, so syncing the current segment
+// makes all outstanding writes durable.
+func (w *WAL) fsyncCurrent() error {
 	if w.failSync.Load() {
 		return errors.New("wal: simulated fsync failure")
 	}
-	if w.currentSegment != nil {
-		w.currentSegment.mu.Lock()
+	w.mu.RLock()
+	seg := w.currentSegment
+	w.mu.RUnlock()
+	if seg != nil {
+		seg.mu.Lock()
 		t0 := time.Now()
-		err := w.currentSegment.file.Sync()
+		err := seg.file.Sync()
 		metrics.RecordWALFsync(time.Since(t0).Seconds())
-		w.currentSegment.mu.Unlock()
+		seg.mu.Unlock()
 		if err != nil {
 			return err
 		}

@@ -131,7 +131,7 @@ bbolt StableStore, log consistency verifier, WAL fsync metric.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Group-commit / batched fsync | H | M | `Append` fsyncs under the global write lock, serializing every concurrent proposal into its own fsync. Coalesce waiters → one fsync per batch. | `Append`, `fsyncCurrentLocked` |
+| ✅ Group-commit / batched fsync | H | M | **Shipped (#201)** — concurrent WAL syncs coalesce into one fsync (writeSeq + syncCond); durability preserved. | `Append`, `groupSync` |
 | ✅ Receiver-side chunk reassembly | H | M | **Shipped (#194)** — was a real bug; receiver now reassembles Offset-ordered chunks. | `restoreSnapshotData` |
 | ✅ Snapshot compression (gzip) | H | M | **Shipped (#202)** — opt-in `snapshot_compression`; gzip at rest, recorded in sidecar, Reader decompresses transparently; backward compatible. | `snapshot.go` |
 | WAL segment preallocation (`fallocate`) | H | M | Segments grow record-by-record; preallocate to avoid fragmentation, cut fsync-path metadata updates, fail early on ENOSPC. | `createSegment`/`rotateSegment` |
