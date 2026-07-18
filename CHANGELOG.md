@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Release now builds, pushes (GHCR, multi-arch), and cosign-signs the container image with provenance + SBOM
 - Golden-file tests for the WAL record + command byte formats; Codecov upload + nightly benchmark/benchstat run
 - Go native fuzz targets for the WAL, snapshot, and command parsers (seed corpus in CI, nightly fuzz run)
 - Package doc comments for all `pkg/*`, an `examples/kvclient` program, and godoc examples (pkg.go.dev discoverability)

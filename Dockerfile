@@ -11,7 +11,9 @@
 # `docker buildx imagetools inspect golang:1.26.5-alpine`) and is intentionally
 # left as a specific minor-version tag here rather than a guessed digest.
 # Dependabot's docker ecosystem (see .github/dependabot.yml) keeps this current.
-FROM golang:1.26.5-alpine AS builder
+# Run the builder on the native BUILDPLATFORM and cross-compile to the requested
+# TARGETOS/TARGETARCH, so multi-arch (amd64+arm64) images build fast without QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
 WORKDIR /app
 
 # Download dependencies first (better layer caching)
@@ -21,10 +23,13 @@ RUN go mod download
 # Copy source and build
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
+# TARGETOS/TARGETARCH are provided automatically by buildkit per target platform.
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
     -ldflags="-s -w -X github.com/sanskarpan/raft-consensus/pkg/version.Version=${VERSION}" \
     -o /raftd ./cmd/raftd \
- && CGO_ENABLED=0 GOOS=linux go build -trimpath -o /kvctl ./cmd/kvctl
+ && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -o /kvctl ./cmd/kvctl
 
 # Pre-create the data directory. A named/anonymous volume mounted at /data
 # inherits this directory's ownership on first creation, so the distroless
