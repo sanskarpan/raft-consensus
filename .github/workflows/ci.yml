@@ -143,3 +143,9 @@ jobs:
           cache: true
       - name: Run chaos tests (no -short flag)
         run: go test -race -timeout 300s -run "TestAT|TestChaos|TestPartition" ./pkg/raft/
+      - name: Fuzz on-disk parsers (short)
+        run: |
+          go test ./pkg/fsm/     -run='^$' -fuzz='^FuzzDecodeKVCommand$'    -fuzztime=60s
+          go test ./pkg/storage/ -run='^$' -fuzz='^FuzzReadRecordAtBounded$' -fuzztime=60s
+          go test ./pkg/storage/ -run='^$' -fuzz='^FuzzVerifySnapChecksum$'  -fuzztime=60s
+          go test ./pkg/storage/ -run='^$' -fuzz='^FuzzWALRecovery$'         -fuzztime=60s

@@ -326,7 +326,7 @@ SBOM, Dependabot, goroutine-leak assertion, seeded fault selection.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Go native fuzzing for on-disk parsers | H | M | Three hand-rolled parsers over untrusted bytes have zero fuzz coverage (`nextRecord`, `decodeKVCommand`, `verifysnapChecksum`). | storage + fsm parsers |
+| ✅ Go native fuzzing for on-disk parsers | H | M | **Shipped (#218)** — FuzzDecodeKVCommand, FuzzReadRecordAtBounded, FuzzVerifySnapChecksum, FuzzWALRecovery; seed corpus in CI + nightly fuzz run. No panics found (500k+ execs). | fsm/storage parsers |
 | Golden-file format tests | H | S | No `testdata/*.golden`; on-disk formats are only round-trip-tested, so silent drift breaks cross-version compat undetected. | storage + fsm |
 | Fix the dead nightly soak/chaos job | H | S | See verify-first — the job never runs. | workflows |
 | Deterministic simulation (DES) harness | H | L | No virtual clock/scheduler; cluster tests use wall-clock + sleeps (flaky). A seeded DES gives bit-reproducible runs (FDB model). | new sim package |
