@@ -33,6 +33,7 @@ func min(a, b uint64) uint64 {
 type proposalFuture struct {
 	data   []byte
 	future *ApplyFuture
+	ctx    context.Context // caller's trace context, for write-path spans (#213)
 }
 
 type raft struct {
@@ -1542,6 +1543,13 @@ func (r *raft) handleProposal(batch []*proposalFuture) {
 
 	for i, p := range accepted {
 		r.pendingFutures[entries[i].Index] = p.future
+		// #213: start a write-path span (propose→applied) as a child of the
+		// caller's trace context, ended when the entry is applied. This makes a
+		// client write's trace span the internal WAL-append→commit→apply latency.
+		if p.ctx != nil {
+			_, span := tracing.StartSpan(p.ctx, "raft", "raft.commit_apply")
+			p.future.span = span
+		}
 	}
 
 	lastEntryIndex := entries[len(entries)-1].Index
@@ -1660,7 +1668,7 @@ func (r *raft) applyCommitted() {
 			if !f.created.IsZero() {
 				metrics.RecordProposalCommitLatency(time.Since(f.created).Seconds())
 			}
-			f.respond(applyErr, entry.Index, entry.Term, result)
+			f.respond(applyErr, entry.Index, entry.Term, result) // ends the #213 span
 			delete(r.pendingFutures, entry.Index)
 		}
 		r.mu.Unlock()
@@ -1861,7 +1869,7 @@ func (r *raft) stepDownIfNotVoter() {
 func (r *raft) failPendingFutures() {
 	for idx, f := range r.pendingFutures {
 		if idx > r.commitIndex {
-			f.respond(ErrLeadershipLost, 0, 0, nil)
+			f.respond(ErrLeadershipLost, 0, 0, nil) // ends the #213 span
 			delete(r.pendingFutures, idx)
 		}
 	}
@@ -2003,6 +2011,7 @@ func (r *raft) Apply(ctx context.Context, data []byte) ([]byte, error) {
 	proposal := &proposalFuture{
 		data:   data,
 		future: future,
+		ctx:    ctx,
 	}
 
 	select {
