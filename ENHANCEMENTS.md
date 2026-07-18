@@ -171,7 +171,7 @@ constant-time, RBAC), rate limiting, CORS deny-by-default, request-ID propagatio
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Message compression (gzip/zstd) | H | S | No compressor registered; log batches + 512 MiB snapshots cross the wire uncompressed. | gRPC opts; TCP send/recv |
+| ✅ Message compression (gzip) | H | S | **Shipped (#203)** — opt-in `grpc_compression`; server always registers gzip so compressed/uncompressed peers interoperate. | gRPC opts |
 | Streaming/chunked InstallSnapshot client | H | M | The gRPC client sends the whole snapshot as one `stream.Send` frame (buffered fully in memory); chunk it. | `GrpcTransport.InstallSnapshot` |
 | TLS certificate rotation without restart | H | M | Certs load once into immutable `tls.Config`; rotation requires a full restart (drops quorum). Use `GetCertificate` callbacks + reload. | `NewGrpcTransport*`, `SetTLS`, TCP TLS |
 | ✅ Separate `admin` RBAC role | M | M | **Shipped (#205).** Hierarchy admin>write>read; membership+snapshot require admin; legacy token = admin (backward compatible); invalid roles rejected at startup. | `requireRole`, admin handlers |
