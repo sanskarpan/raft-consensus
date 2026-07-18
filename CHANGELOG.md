@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Package doc comments for all `pkg/*`, an `examples/kvclient` program, and godoc examples (pkg.go.dev discoverability)
 - RBAC `admin` role (admin>write>read); membership/snapshot ops now require `admin` (legacy `admin_token` = admin)
 - Range pagination: `?limit=&start_after=` with `X-Next-Cursor`/`X-Has-More` headers, `client.RangePage`, and `kvctl range --limit`
 - Atomic counter: `incr` FSM op, `POST /v1/kv/{key}?op=incr`, `client.Increment`, and `kvctl incr`

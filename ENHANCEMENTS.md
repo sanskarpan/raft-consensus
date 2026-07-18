@@ -380,9 +380,9 @@ chaos/lincheck/testharness, CHANGELOG/CONTRIBUTING/SECURITY, benchmarks.
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
 | Fix module/import path mismatch | H | S | The advertised library is currently un-importable (see verify-first). | `go.mod`, README, docs |
-| Package-level `doc.go` comments | H | S | No `// Package …` in any `pkg/*`; pkg.go.dev renders these as the landing page. | `pkg/*/` |
-| `examples/` directory | H | M | No runnable examples; single-node embed, 3-node launcher, watch consumer, txn demo cut onboarding cost. | new `examples/` |
-| Runnable godoc `Example` functions | M | M | Zero `func Example*`; they render on pkg.go.dev and are compile-checked. | `pkg/client`, `pkg/raft` |
+| ✅ Package-level `doc.go` comments | H | S | **Shipped (#221)** for all pkg/*. | `pkg/*/doc.go` |
+| ✅ `examples/` directory | H | M | **Shipped (#221)** — runnable `examples/kvclient` + godoc Examples. | `examples/` |
+| ✅ Runnable godoc `Example` functions | M | M | **Shipped (#221)** in `pkg/client`. | `pkg/client/example_test.go` |
 | Publish stable client library surface | H | M | `pkg/client` has a clean API but is undocumented/un-versioned as a lib. | `pkg/client` |
 | API stability policy + `internal/` boundary | M | M | Nothing marks public vs internal packages for semver. | `docs/versioning.md`, `pkg/` |
 | Automate CHANGELOG/release notes | M | S | Hand-maintained; adopt release-please/git-cliff. | CHANGELOG, goreleaser |
