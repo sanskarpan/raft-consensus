@@ -38,9 +38,7 @@ CI-green PR merged to `main`):
 | Range pagination — `limit`/`start_after` + cursor headers (e2e-verified) | #230 / #206 |
 | e2e cluster port-collision fix (test hardening) | #231 |
 
-**Status (2026-07-18):** 11 roadmap issues resolved + all 6 verify-first items
-(2 were real consensus bugs). **16 enhancement issues remain open** (tracked
-below with labels `enhancement` + `area/*`). `main` is green; 0 open bugs.
+**Status (2026-07-18):** 18 roadmap issues resolved + all 6 verify-first items. This session shipped: admin RBAC (#205), package docs+examples (#221), fuzzing (#218), golden/codecov/benchstat (#219), image publish+sign (#217), gRPC compression (#203), snapshot compression (#202). **9 enhancement issues remain open** (the larger perf/feature/infra items). `main` is green; 0 open bugs.
 
 ---
 
