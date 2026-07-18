@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Write-path distributed tracing: a client write now emits a raft.commit_apply span spanning propose->commit->apply
 - Opt-in gzip snapshot compression at rest (snapshot_compression)
 - Opt-in gzip compression for inter-node gRPC RPCs (grpc_compression)
 - Release now builds, pushes (GHCR, multi-arch), and cosign-signs the container image with provenance + SBOM

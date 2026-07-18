@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -501,7 +503,8 @@ type ApplyFuture struct {
 	term    uint64
 	result  []byte
 	ch      chan struct{}
-	created time.Time // proposal time, for commit-latency measurement
+	created time.Time  // proposal time, for commit-latency measurement
+	span    trace.Span // write-path span (propose→applied); nil when untraced (#213)
 }
 
 func (a *ApplyFuture) Error() error   { return a.err }
@@ -519,6 +522,14 @@ func (a *ApplyFuture) respond(err error, index, term uint64, result []byte) {
 	a.index = index
 	a.term = term
 	a.result = result
+	// #213: end the write-path span (if any) on every resolution path.
+	if a.span != nil {
+		if err != nil {
+			a.span.RecordError(err)
+		}
+		a.span.End()
+		a.span = nil
+	}
 	close(a.ch)
 }
 
