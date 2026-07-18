@@ -72,6 +72,9 @@ type Config struct {
 
 	// Transport selects the Raft peer transport: "tcp" (default) or "grpc".
 	Transport string `yaml:"transport"`
+	// GRPCCompression gzip-compresses inter-node gRPC RPCs (AppendEntries,
+	// InstallSnapshot). Interoperates with uncompressed peers.
+	GRPCCompression bool `yaml:"grpc_compression"`
 	// TLS fields for gRPC mTLS (all three must be set together).
 	TLSCert string `yaml:"tls_cert"` // path to server certificate
 	TLSKey  string `yaml:"tls_key"`  // path to server private key
@@ -667,6 +670,9 @@ func (s *Server) initRaft() error {
 		// dialed in plaintext.
 		if s.config.RequireTLS {
 			gt.SetRequireTLS(true)
+		}
+		if s.config.GRPCCompression {
+			gt.SetCompression(true)
 		}
 
 		grpcWrapper := &grpcHandlerWrapper{raftWrapper: wrapper}

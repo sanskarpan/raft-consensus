@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/encoding/gzip" // registers the gzip compressor
 	"google.golang.org/grpc/keepalive"
 	grpcpeer "google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -173,6 +174,11 @@ type GrpcTransport struct {
 	// (M-R7). 0 means the corresponding default.
 	appendEntriesTimeout time.Duration
 	snapshotTimeout      time.Duration
+	// compression, when set, gzip-compresses outbound RPCs (AppendEntries,
+	// InstallSnapshot). The server always registers the gzip codec (blank import
+	// of encoding/gzip) so it decompresses regardless, making mixed compressed/
+	// uncompressed peers interoperable.
+	compression bool
 }
 
 // ErrTLSRequired is returned when RequireTLS is set but no TLS config is
@@ -241,6 +247,14 @@ func (t *GrpcTransport) SetMaxSnapshotBytes(n int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.maxSnapshotBytes = n
+}
+
+// SetCompression enables gzip compression on outbound RPCs. Must be set before
+// AddPeer (it is applied to each peer's dial options).
+func (t *GrpcTransport) SetCompression(v bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.compression = v
 }
 
 func (t *GrpcTransport) snapshotBytesCap() int64 {
@@ -731,10 +745,14 @@ func (t *GrpcTransport) AddPeer(id raft.ServerID, addr raft.ServerAddress) error
 	if msgSize <= 0 {
 		msgSize = defaultGrpcMaxMsgSize
 	}
-	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(
+	callOpts := []grpc.CallOption{
 		grpc.MaxCallRecvMsgSize(msgSize),
 		grpc.MaxCallSendMsgSize(msgSize),
-	))
+	}
+	if t.compression {
+		callOpts = append(callOpts, grpc.UseCompressor(gzip.Name))
+	}
+	dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(callOpts...))
 
 	conns := make([]*grpc.ClientConn, defaultConnPoolSize)
 	for i := 0; i < defaultConnPoolSize; i++ {
