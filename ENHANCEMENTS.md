@@ -294,7 +294,7 @@ runbooks, cert-gen script, docker-compose, version stamping.
 | Membership reconciliation on reschedule | H | M | Nothing reconciles Raft config with running pods after PVC loss / recreation. | sidecar/init container |
 | Scheduled backup to S3/GCS | H | M | Backup is manual `cp -r`; add a CronJob/built-in scheduler with retention. | new `cronjob-backup.yaml` |
 | Restore automation / DR bootstrap | H | M | Cluster restore is a manual multi-step procedure; add `kvctl restore` + init-container pull. | `kvctl`, chart |
-| Container image publishing + signing | M | S | CI builds with `push: false`; goreleaser ships only archives. Add multi-arch push + cosign + provenance. | `.goreleaser.yml`, release.yml |
+| ✅ Container image publishing + signing | M | S | **Shipped (#217)** — release.yml builds+pushes a multi-arch (amd64/arm64) image to GHCR with provenance+SBOM and cosign keyless signing; Dockerfile cross-compiles via TARGETARCH. | `release.yml`, `Dockerfile` |
 | ✅ ServiceMonitor / PodMonitor | M | S | **Shipped (#215)** — opt-in `servicemonitor.yaml` with bearer-token support. | `servicemonitor.yaml` |
 | NetworkPolicy | M | S | No default-deny; peer port should only accept sibling-pod traffic. | new `networkpolicy.yaml` |
 | ✅ Secret-based tokens | M | S | **Shipped (#215)** — `admin_token` now sourced from a Secret via `$ADMIN_TOKEN` (chart-managed or `existingSecret`); no plaintext in the ConfigMap. (TLS-in-chart still open.) | `configmap.yaml`, `secret.yaml` |
