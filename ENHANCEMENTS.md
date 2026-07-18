@@ -31,9 +31,16 @@ CI-green PR merged to `main`):
 | Go/Process Prometheus collectors | already satisfied by the default registry (#210 closed) |
 | `raft_leader_changes_total` + `raft_proposal_commit_latency_seconds` | #226 / #211 |
 | Grafana dashboard JSON + PrometheusRule alerts (+ `checkQuorum` Helm wiring) | #226 / #212 |
+| PodDisruptionBudget + pod anti-affinity/topology-spread + grace period | #228 / #214 |
+| ServiceMonitor + Secret-based admin token (no plaintext in ConfigMap) | #228 / #215 |
+| Atomic counter — `incr` op + API + client + `kvctl` (e2e-verified) | #229 / #208 |
+| Client leader-aware routing for v2 writes (`X-Raft-Leader-Address`) | #229 / #209 |
+| Range pagination — `limit`/`start_after` + cursor headers (e2e-verified) | #230 / #206 |
+| e2e cluster port-collision fix (test hardening) | #231 |
 
-The remaining items below are tracked as open GitHub issues (labels `enhancement`
-+ `area/*`).
+**Status (2026-07-18):** 11 roadmap issues resolved + all 6 verify-first items
+(2 were real consensus bugs). **16 enhancement issues remain open** (tracked
+below with labels `enhancement` + `area/*`). `main` is green; 0 open bugs.
 
 ---
 
