@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"compress/gzip"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -43,6 +44,21 @@ type FileSnapshotStore struct {
 	// flag is absent (legacy snapshot with no sidecar) verification is skipped
 	// only for genuinely legacy files.
 	checksummed map[string]bool
+
+	// compression is the store's setting for NEWLY created snapshots (gzip when
+	// true). snapCompression records the on-disk compression per existing
+	// snapshot ID (from the sidecar) so Open can decompress correctly.
+	compression     bool
+	snapCompression map[string]string
+}
+
+// SetCompression enables gzip compression for snapshots created after this call.
+// Existing snapshots are read using their recorded compression, so it is safe to
+// toggle at any time.
+func (s *FileSnapshotStore) SetCompression(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compression = v
 }
 
 // sidecarMeta is the storage-local JSON shape persisted in the .meta sidecar.
@@ -56,9 +72,12 @@ type sidecarMeta struct {
 	ID            string             `json:"ID"`
 	Version       uint64             `json:"Version"`
 	Checksummed   bool               `json:"Checksummed"`
+	// Compression records how the snapshot payload is compressed on disk
+	// ("" = none, "gzip"). Empty for legacy snapshots.
+	Compression string `json:"Compression,omitempty"`
 }
 
-func toSidecarMeta(m *raft.SnapshotMeta, checksummed bool) *sidecarMeta {
+func toSidecarMeta(m *raft.SnapshotMeta, checksummed bool, compression string) *sidecarMeta {
 	return &sidecarMeta{
 		Index:         m.Index,
 		Term:          m.Term,
@@ -66,8 +85,11 @@ func toSidecarMeta(m *raft.SnapshotMeta, checksummed bool) *sidecarMeta {
 		ID:            m.ID,
 		Version:       m.Version,
 		Checksummed:   checksummed,
+		Compression:   compression,
 	}
 }
+
+const snapCompressionGzip = "gzip"
 
 func (s *sidecarMeta) toSnapshotMeta() *raft.SnapshotMeta {
 	return &raft.SnapshotMeta{
@@ -111,17 +133,19 @@ func (s *FileSnapshotStore) loadSnapshots() error {
 
 	var snapshots []*raft.SnapshotMeta
 	checksummed := make(map[string]bool)
+	compression := make(map[string]string)
 	for _, name := range files {
 		if !strings.HasSuffix(name, snapshotExt) {
 			continue
 		}
 
-		meta, ck, err := s.readSnapshotMeta(name)
+		meta, ck, comp, err := s.readSnapshotMeta(name)
 		if err != nil {
 			continue
 		}
 		snapshots = append(snapshots, meta)
 		checksummed[meta.ID] = ck
+		compression[meta.ID] = comp
 	}
 
 	sort.Slice(snapshots, func(i, j int) bool {
@@ -130,6 +154,7 @@ func (s *FileSnapshotStore) loadSnapshots() error {
 
 	s.snapshots = snapshots
 	s.checksummed = checksummed
+	s.snapCompression = compression
 	return nil
 }
 
@@ -139,7 +164,7 @@ func (s *FileSnapshotStore) loadSnapshots() error {
 // a valid sidecar authoritatively records Checksummed. If no sidecar exists
 // (genuinely legacy snapshot) it falls back to parsing term and index from the
 // filename ({term}-{index}.snap) with an empty Configuration and checksummed=false.
-func (s *FileSnapshotStore) readSnapshotMeta(name string) (*raft.SnapshotMeta, bool, error) {
+func (s *FileSnapshotStore) readSnapshotMeta(name string) (*raft.SnapshotMeta, bool, string, error) {
 	id := strings.TrimSuffix(name, snapshotExt)
 
 	// --- try sidecar first ---
@@ -150,7 +175,7 @@ func (s *FileSnapshotStore) readSnapshotMeta(name string) (*raft.SnapshotMeta, b
 		if jsonErr := json.Unmarshal(data, &sm); jsonErr == nil {
 			m := sm.toSnapshotMeta()
 			m.ID = id
-			return m, sm.Checksummed, nil
+			return m, sm.Checksummed, sm.Compression, nil
 		}
 	}
 
@@ -169,11 +194,11 @@ func (s *FileSnapshotStore) readSnapshotMeta(name string) (*raft.SnapshotMeta, b
 	// Verify the .snap file is readable (fail fast on corrupt/missing file).
 	f, err := os.Open(filepath.Join(s.path, snapshotDir, name))
 	if err != nil {
-		return nil, false, err
+		return nil, false, "", err
 	}
 	f.Close()
 
-	return meta, false, nil
+	return meta, false, "", nil
 }
 
 func (s *FileSnapshotStore) Create(version raft.SnapshotVersion, index, term uint64, configuration raft.Configuration) (raft.SnapshotSink, error) {
@@ -195,6 +220,7 @@ func (s *FileSnapshotStore) Create(version raft.SnapshotVersion, index, term uin
 		return nil, err
 	}
 
+	hasher := crc32.NewIEEE()
 	sink := &fileSnapshotSink{
 		file:    file,
 		id:      id,
@@ -207,21 +233,38 @@ func (s *FileSnapshotStore) Create(version raft.SnapshotVersion, index, term uin
 			Version:       uint64(version),
 		},
 		store:  s,
-		hasher: crc32.NewIEEE(),
+		hasher: hasher,
+	}
+	// The CRC footer must cover the exact ON-DISK bytes, so hash whatever lands
+	// in the file (compressed bytes when gzip is enabled).
+	tee := io.MultiWriter(file, hasher)
+	if s.compression {
+		sink.gz = gzip.NewWriter(tee)
+		sink.w = sink.gz
+	} else {
+		sink.w = tee
 	}
 
 	return sink, nil
 }
 
 func (s *fileSnapshotSink) Write(p []byte) (int, error) {
-	n, err := s.file.Write(p)
-	if n > 0 {
-		_, _ = s.hasher.Write(p[:n]) // hash.Hash.Write is documented never to error
-	}
-	return n, err
+	// s.w is file+hasher (or gzip over it); it writes p in full, hashing the
+	// resulting on-disk bytes for the CRC footer.
+	return s.w.Write(p)
 }
 
 func (s *fileSnapshotSink) Close() error {
+	// Flush any buffered compressed data to the file+hasher before the footer.
+	compression := ""
+	if s.gz != nil {
+		if err := s.gz.Close(); err != nil {
+			s.file.Close()
+			return fmt.Errorf("snapshot: close gzip: %w", err)
+		}
+		compression = snapCompressionGzip
+	}
+
 	// Append 8-byte footer: [SNAP magic (4)] [CRC32/IEEE (4 big-endian)]
 	var footer [snapFooterSize]byte
 	copy(footer[:4], snapFooterMagic[:])
@@ -250,7 +293,7 @@ func (s *fileSnapshotSink) Close() error {
 	// checksummed; record that fact durably so Open can require and verify the
 	// footer (M15) rather than silently skipping when the trailing bytes fail
 	// to match the magic (e.g. footer truncated by a torn write).
-	sidecarData, err := json.Marshal(toSidecarMeta(s.meta, true))
+	sidecarData, err := json.Marshal(toSidecarMeta(s.meta, true, compression))
 	if err != nil {
 		return fmt.Errorf("snapshot: marshal meta: %w", err)
 	}
@@ -280,6 +323,10 @@ func (s *fileSnapshotSink) Close() error {
 		s.store.checksummed = make(map[string]bool)
 	}
 	s.store.checksummed[s.meta.ID] = true
+	if s.store.snapCompression == nil {
+		s.store.snapCompression = make(map[string]string)
+	}
+	s.store.snapCompression[s.meta.ID] = compression
 	// M10: keep the list sorted newest-first so pruneLocked (which deletes from
 	// the tail) removes the OLDEST snapshot, never a newer one.
 	sort.Slice(s.store.snapshots, func(i, j int) bool {
@@ -378,9 +425,10 @@ func (s *FileSnapshotStore) Open(id string) (raft.Snapshot, *raft.SnapshotMeta, 
 	}
 
 	return &fileSnapshot{
-		file:     file,
-		meta:     meta,
-		dataSize: dataSize, // 0 means legacy (full file is data)
+		file:        file,
+		meta:        meta,
+		dataSize:    dataSize, // 0 means legacy (full file is data)
+		compression: s.snapCompression[id],
 	}, meta, nil
 }
 
@@ -510,12 +558,17 @@ type fileSnapshotSink struct {
 		Write([]byte) (int, error)
 		Sum32() uint32
 	}
+	// w is the writer the caller's bytes flow into: either the raw
+	// file+hasher tee, or a gzip.Writer over it. gz is non-nil when compressed.
+	w  io.Writer
+	gz *gzip.Writer
 }
 
 type fileSnapshot struct {
-	file     *os.File
-	meta     *raft.SnapshotMeta
-	dataSize int64 // 0 = legacy (whole file is data); >0 = data bytes before footer
+	file        *os.File
+	meta        *raft.SnapshotMeta
+	dataSize    int64  // 0 = legacy (whole file is data); >0 = data bytes before footer
+	compression string // "" = none, "gzip"
 }
 
 func (s *fileSnapshot) Index() uint64 {
@@ -527,12 +580,50 @@ func (s *fileSnapshot) Term() uint64 {
 }
 
 func (s *fileSnapshot) Reader() io.ReadCloser {
+	// The on-disk data portion (excluding the CRC32 footer when present).
+	var raw io.Reader = s.file
 	if s.dataSize > 0 {
-		// Return only the data portion, excluding the CRC32 footer.
+		raw = io.LimitReader(s.file, s.dataSize)
+	}
+	if s.compression == snapCompressionGzip {
+		gz, err := gzip.NewReader(raw)
+		if err != nil {
+			// Surface the error on the first Read rather than returning nil.
+			return errReadCloser{err: err, c: s.file}
+		}
+		return gzipReadCloser{gz: gz, f: s.file}
+	}
+	if s.dataSize > 0 {
 		return struct {
 			io.Reader
 			io.Closer
-		}{io.LimitReader(s.file, s.dataSize), s.file}
+		}{raw, s.file}
 	}
 	return s.file
 }
+
+// gzipReadCloser decompresses the snapshot payload and closes both the gzip
+// reader and the underlying file.
+type gzipReadCloser struct {
+	gz *gzip.Reader
+	f  *os.File
+}
+
+func (g gzipReadCloser) Read(p []byte) (int, error) { return g.gz.Read(p) }
+func (g gzipReadCloser) Close() error {
+	gerr := g.gz.Close()
+	ferr := g.f.Close()
+	if gerr != nil {
+		return gerr
+	}
+	return ferr
+}
+
+// errReadCloser returns err on every Read but still closes the file.
+type errReadCloser struct {
+	err error
+	c   io.Closer
+}
+
+func (e errReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errReadCloser) Close() error             { return e.c.Close() }

@@ -75,6 +75,9 @@ type Config struct {
 	// GRPCCompression gzip-compresses inter-node gRPC RPCs (AppendEntries,
 	// InstallSnapshot). Interoperates with uncompressed peers.
 	GRPCCompression bool `yaml:"grpc_compression"`
+	// SnapshotCompression gzip-compresses snapshots on disk. Existing snapshots
+	// are read using their recorded compression, so it is safe to toggle.
+	SnapshotCompression bool `yaml:"snapshot_compression"`
 	// TLS fields for gRPC mTLS (all three must be set together).
 	TLSCert string `yaml:"tls_cert"` // path to server certificate
 	TLSKey  string `yaml:"tls_key"`  // path to server private key
@@ -609,6 +612,9 @@ func (s *Server) initRaft() error {
 	snapshot, err := storage.NewFileSnapshotStore(nodeDir, 2)
 	if err != nil {
 		return err
+	}
+	if s.config.SnapshotCompression {
+		snapshot.SetCompression(true)
 	}
 
 	var servers []raft.Server
