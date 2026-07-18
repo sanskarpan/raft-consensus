@@ -174,7 +174,7 @@ constant-time, RBAC), rate limiting, CORS deny-by-default, request-ID propagatio
 | Message compression (gzip/zstd) | H | S | No compressor registered; log batches + 512 MiB snapshots cross the wire uncompressed. | gRPC opts; TCP send/recv |
 | Streaming/chunked InstallSnapshot client | H | M | The gRPC client sends the whole snapshot as one `stream.Send` frame (buffered fully in memory); chunk it. | `GrpcTransport.InstallSnapshot` |
 | TLS certificate rotation without restart | H | M | Certs load once into immutable `tls.Config`; rotation requires a full restart (drops quorum). Use `GetCertificate` callbacks + reload. | `NewGrpcTransport*`, `SetTLS`, TCP TLS |
-| Separate `admin` RBAC role | M | M | Only read/write; a `write` token can add/remove servers. Split membership/snapshot ops into an `admin` scope. | `requireRole`, admin handlers |
+| ✅ Separate `admin` RBAC role | M | M | **Shipped (#205).** Hierarchy admin>write>read; membership+snapshot require admin; legacy token = admin (backward compatible); invalid roles rejected at startup. | `requireRole`, admin handlers |
 | OTel trace propagation over transport | M | M | Neither transport injects/extracts trace context; traces break at every inter-node hop. | gRPC StatsHandler; TCP message struct |
 | gRPC health service | M | S | No `grpc_health_v1`; peers/LBs/k8s can't gRPC-probe the Raft port. | `NewGrpcTransport*` |
 | Per-peer inbound rate limiting | M | M | No per-peer RPC rate limit; a misbehaving peer can flood AppendEntries. | auth interceptors; TCP serve |

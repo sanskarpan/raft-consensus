@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- RBAC `admin` role (admin>write>read); membership/snapshot ops now require `admin` (legacy `admin_token` = admin)
 - Range pagination: `?limit=&start_after=` with `X-Next-Cursor`/`X-Has-More` headers, `client.RangePage`, and `kvctl range --limit`
 - Atomic counter: `incr` FSM op, `POST /v1/kv/{key}?op=incr`, `client.Increment`, and `kvctl incr`
 - Client v2 writes now prefer the leader (`X-Raft-Leader-Address` hint + last-known-leader routing)
