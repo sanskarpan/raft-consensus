@@ -333,6 +333,7 @@ type Server struct {
 	config          *Config
 	raftNode        raft.Raft
 	raftTransport   raft.Transport    // kept so Shutdown can send TimeoutNow
+	reloadTLS       func() error      // #204: reload TLS certs on SIGHUP (nil if no TLS)
 	kv              *fsm.KVStore      // direct FSM reference for stale reads and watches
 	watchMgr        *fsm.WatchManager // SSE event fan-out
 	watchCtxCancel  context.CancelFunc
@@ -393,8 +394,21 @@ func main() {
 	logger.Info("server started", zap.String("node_id", config.NodeID))
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	<-sigCh
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	for sig := range sigCh {
+		if sig == syscall.SIGHUP {
+			// #204: reload rotated TLS certificates without restarting.
+			if server.reloadTLS != nil {
+				if err := server.reloadTLS(); err != nil {
+					logger.Error("TLS reload failed", zap.Error(err))
+				} else {
+					logger.Info("TLS certificates reloaded (SIGHUP)")
+				}
+			}
+			continue
+		}
+		break // SIGINT / SIGTERM
+	}
 
 	logger.Info("shutting down server")
 	server.Shutdown()
@@ -666,6 +680,11 @@ func (s *Server) initRaft() error {
 				return fmt.Errorf("grpc: read CA cert: %w", caErr)
 			}
 			gt, err = transport.NewGrpcTransport(s.config.ListenAddr, s.logger, cert, ca)
+			if err == nil {
+				// #204: register cert paths so a SIGHUP can rotate them at runtime.
+				gt.SetCertPaths(s.config.TLSCert, s.config.TLSKey, s.config.TLSCert, s.config.TLSKey)
+				s.reloadTLS = gt.ReloadTLS
+			}
 		} else {
 			gt, err = transport.NewGrpcTransportInsecure(s.config.ListenAddr, s.logger)
 		}
