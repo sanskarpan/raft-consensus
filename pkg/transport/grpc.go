@@ -179,6 +179,11 @@ type GrpcTransport struct {
 	// of encoding/gzip) so it decompresses regardless, making mixed compressed/
 	// uncompressed peers interoperable.
 	compression bool
+
+	// serverReloader / clientReloader back the TLS GetCertificate callbacks so
+	// certs can be rotated on disk and reloaded via ReloadTLS without restart (#204).
+	serverReloader *certReloader
+	clientReloader *certReloader
 }
 
 // ErrTLSRequired is returned when RequireTLS is set but no TLS config is
@@ -480,9 +485,12 @@ func NewGrpcTransport(listenAddr string, logger *zap.Logger, cert tls.Certificat
 	// C11: harden the TLS-configured path. Pin TLS 1.3 as the floor on the
 	// server config and default to mutual TLS (RequireAndVerifyClientCert) when
 	// a CA pool is available so an unauthenticated peer cannot connect.
+	// Reloader-backed certs so ReloadTLS can rotate them (#204). The keypair is
+	// shared for the server and client identities of this node.
+	reloader := newStaticCertReloader(cert)
 	serverTLS := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
+		GetCertificate: reloader.getCertificate,
+		MinVersion:     tls.VersionTLS13,
 	}
 
 	// Build a dedicated client-side dial config that verifies the server
@@ -490,8 +498,8 @@ func NewGrpcTransport(listenAddr string, logger *zap.Logger, cert tls.Certificat
 	// ServerName lets verification succeed against certs whose SANs cover
 	// localhost / *.raft.local / 127.0.0.1.
 	clientTLS := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
+		GetClientCertificate: reloader.getClientCertificate,
+		MinVersion:           tls.VersionTLS13,
 		// ServerName is derived per-peer at dial time (serverNameFor), so an
 		// explicit value is not hardcoded here (C11).
 	}
@@ -507,6 +515,8 @@ func NewGrpcTransport(listenAddr string, logger *zap.Logger, cert tls.Certificat
 	creds := credentials.NewTLS(serverTLS)
 	t.tlsConfig = serverTLS
 	t.clientTLSConfig = clientTLS
+	t.serverReloader = reloader
+	t.clientReloader = reloader
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
@@ -637,8 +647,8 @@ func (t *GrpcTransport) SetTLS(cfg *GRPCTLSConfig) error {
 		}
 	}
 
-	// Load server certificate and key.
-	serverCert, err := tls.LoadX509KeyPair(cfg.ServerCert, cfg.ServerKey)
+	// Load the server keypair through a reloader so ReloadTLS can rotate it (#204).
+	serverReloader, err := newCertReloader(cfg.ServerCert, cfg.ServerKey)
 	if err != nil {
 		return fmt.Errorf("grpc: failed to load server cert/key: %w", err)
 	}
@@ -657,10 +667,10 @@ func (t *GrpcTransport) SetTLS(cfg *GRPCTLSConfig) error {
 	// whenever a CA pool is present (MutualTLS forces it too). A caller can only
 	// weaken this by supplying no CA, which the constructor requires here.
 	serverTLS := &tls.Config{
-		Certificates: []tls.Certificate{serverCert},
-		ClientCAs:    caPool,
-		MinVersion:   tls.VersionTLS13,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		GetCertificate: serverReloader.getCertificate,
+		ClientCAs:      caPool,
+		MinVersion:     tls.VersionTLS13,
+		ClientAuth:     tls.RequireAndVerifyClientCert,
 	}
 	_ = cfg.MutualTLS // mTLS is now the default when a CA pool is present.
 
@@ -672,18 +682,57 @@ func (t *GrpcTransport) SetTLS(cfg *GRPCTLSConfig) error {
 		MinVersion: tls.VersionTLS13,
 		// ServerName derived per-peer at dial time (serverNameFor) (C11).
 	}
-	if cfg.ClientCert != "" && cfg.ClientKey != "" {
-		clientCert, err := tls.LoadX509KeyPair(cfg.ClientCert, cfg.ClientKey)
-		if err != nil {
-			return fmt.Errorf("grpc: failed to load client cert/key: %w", err)
-		}
-		clientTLS.Certificates = []tls.Certificate{clientCert}
+	clientReloader, err := newCertReloader(cfg.ClientCert, cfg.ClientKey)
+	if err != nil {
+		return fmt.Errorf("grpc: failed to load client cert/key: %w", err)
+	}
+	if clientReloader != nil {
+		clientTLS.GetClientCertificate = clientReloader.getClientCertificate
 	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.tlsConfig = serverTLS
 	t.clientTLSConfig = clientTLS
+	t.serverReloader = serverReloader
+	t.clientReloader = clientReloader
+	return nil
+}
+
+// SetCertPaths configures file paths for the node's keypair so ReloadTLS can
+// pick up rotated certs. Used with NewGrpcTransport (which receives an
+// already-loaded cert but not its paths). serverCert==clientCert is the common
+// single-identity case.
+func (t *GrpcTransport) SetCertPaths(serverCert, serverKey, clientCert, clientKey string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.serverReloader != nil {
+		t.serverReloader.setPaths(serverCert, serverKey)
+	}
+	if t.clientReloader != nil && t.clientReloader != t.serverReloader {
+		t.clientReloader.setPaths(clientCert, clientKey)
+	}
+}
+
+// ReloadTLS re-reads the server (and client, if configured) TLS keypairs from
+// disk and atomically swaps them in. New handshakes use the rotated certs;
+// existing connections are unaffected. Safe to call from a SIGHUP handler (#204).
+func (t *GrpcTransport) ReloadTLS() error {
+	t.mu.RLock()
+	sr, cr := t.serverReloader, t.clientReloader
+	t.mu.RUnlock()
+	if sr == nil {
+		return nil // TLS not configured via SetTLS
+	}
+	if err := sr.reload(); err != nil {
+		return fmt.Errorf("grpc: reload server cert: %w", err)
+	}
+	if cr != nil {
+		if err := cr.reload(); err != nil {
+			return fmt.Errorf("grpc: reload client cert: %w", err)
+		}
+	}
+	t.logger.Info("TLS certificates reloaded")
 	return nil
 }
 
