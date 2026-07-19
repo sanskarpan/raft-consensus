@@ -1,6 +1,8 @@
 package fsm
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -720,28 +722,182 @@ func (k *KVStore) evictDedupIfNeeded() {
 	}
 }
 
+// snapStreamMagic tags the streaming binary snapshot format (#223). It is
+// deliberately not '{' (JSON) or '[' (legacy array) so Restore can distinguish
+// it from the older JSON snapshots by peeking the first byte.
+const snapStreamMagic = 0x02
+
 func (k *KVStore) Snapshot() (raft.Snapshot, error) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 
-	snap := kvSnapshotData{
-		Revision:   k.revision,
-		Index:      k.index,
-		Data:       make(map[string]*KeyValue, len(k.data)),
-		DedupTable: make(map[string]dedupEntry, len(k.dedupTable)),
-	}
+	// Clone the state under the read lock (consistency), but do NOT marshal it
+	// into a single []byte here (#223): the clone is stream-encoded on demand by
+	// Reader(), avoiding a second full-size copy and reflection-based json.Marshal.
+	data := make(map[string]*KeyValue, len(k.data))
 	for key, kv := range k.data {
-		snap.Data[key] = kvClone(kv)
+		data[key] = kvClone(kv)
 	}
+	dedup := make(map[string]dedupEntry, len(k.dedupTable))
 	for clientID, entry := range k.dedupTable {
-		snap.DedupTable[clientID] = entry
+		dedup[clientID] = entry
 	}
+	return &kvSnapshot{revision: k.revision, index: k.index, data: data, dedup: dedup}, nil
+}
 
-	data, err := json.Marshal(snap)
-	if err != nil {
-		return nil, err
+// writeSnapshotStream serializes the FSM state to w in a compact, length-prefixed
+// binary form, record by record (no full-size intermediate buffer).
+func writeSnapshotStream(w io.Writer, revision int64, index uint64, data map[string]*KeyValue, dedup map[string]dedupEntry) error {
+	bw := bufio.NewWriter(w)
+	var scratch [binary.MaxVarintLen64]byte
+	putUvarint := func(v uint64) error {
+		n := binary.PutUvarint(scratch[:], v)
+		_, err := bw.Write(scratch[:n])
+		return err
 	}
-	return &kvSnapshot{data: data, index: k.index}, nil
+	putVarint := func(v int64) error {
+		n := binary.PutVarint(scratch[:], v)
+		_, err := bw.Write(scratch[:n])
+		return err
+	}
+	putStr := func(s string) error {
+		if err := putUvarint(uint64(len(s))); err != nil {
+			return err
+		}
+		_, err := bw.WriteString(s)
+		return err
+	}
+	if err := bw.WriteByte(snapStreamMagic); err != nil {
+		return err
+	}
+	if err := putUvarint(1); err != nil { // format version
+		return err
+	}
+	if err := putVarint(revision); err != nil {
+		return err
+	}
+	if err := putUvarint(index); err != nil {
+		return err
+	}
+	if err := putUvarint(uint64(len(data))); err != nil {
+		return err
+	}
+	for key, kv := range data {
+		if err := putStr(key); err != nil {
+			return err
+		}
+		if err := putStr(kv.Value); err != nil {
+			return err
+		}
+		if err := putVarint(kv.CreateRevision); err != nil {
+			return err
+		}
+		if err := putVarint(kv.ModRevision); err != nil {
+			return err
+		}
+		if err := putVarint(kv.Version); err != nil {
+			return err
+		}
+	}
+	if err := putUvarint(uint64(len(dedup))); err != nil {
+		return err
+	}
+	for clientID, e := range dedup {
+		if err := putStr(clientID); err != nil {
+			return err
+		}
+		if err := putUvarint(e.SeqNum); err != nil {
+			return err
+		}
+		if err := putUvarint(uint64(len(e.Result))); err != nil {
+			return err
+		}
+		if _, err := bw.Write(e.Result); err != nil {
+			return err
+		}
+		if err := putUvarint(e.Order); err != nil {
+			return err
+		}
+	}
+	return bw.Flush()
+}
+
+// readSnapshotStream decodes the binary snapshot written by writeSnapshotStream.
+// The magic byte has already been consumed by the caller.
+func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, data map[string]*KeyValue, dedup map[string]dedupEntry, err error) {
+	readStr := func() (string, error) {
+		n, e := binary.ReadUvarint(br)
+		if e != nil {
+			return "", e
+		}
+		buf := make([]byte, n)
+		if _, e := io.ReadFull(br, buf); e != nil {
+			return "", e
+		}
+		return string(buf), nil
+	}
+	if _, err = binary.ReadUvarint(br); err != nil { // version
+		return
+	}
+	if revision, err = binary.ReadVarint(br); err != nil {
+		return
+	}
+	if index, err = binary.ReadUvarint(br); err != nil {
+		return
+	}
+	var n uint64
+	if n, err = binary.ReadUvarint(br); err != nil {
+		return
+	}
+	data = make(map[string]*KeyValue, n)
+	for i := uint64(0); i < n; i++ {
+		var key, val string
+		if key, err = readStr(); err != nil {
+			return
+		}
+		if val, err = readStr(); err != nil {
+			return
+		}
+		kv := &KeyValue{Key: key, Value: val}
+		if kv.CreateRevision, err = binary.ReadVarint(br); err != nil {
+			return
+		}
+		if kv.ModRevision, err = binary.ReadVarint(br); err != nil {
+			return
+		}
+		if kv.Version, err = binary.ReadVarint(br); err != nil {
+			return
+		}
+		data[key] = kv
+	}
+	var dn uint64
+	if dn, err = binary.ReadUvarint(br); err != nil {
+		return
+	}
+	dedup = make(map[string]dedupEntry, dn)
+	for i := uint64(0); i < dn; i++ {
+		var clientID string
+		if clientID, err = readStr(); err != nil {
+			return
+		}
+		var e dedupEntry
+		if e.SeqNum, err = binary.ReadUvarint(br); err != nil {
+			return
+		}
+		var rl uint64
+		if rl, err = binary.ReadUvarint(br); err != nil {
+			return
+		}
+		e.Result = make([]byte, rl)
+		if _, err = io.ReadFull(br, e.Result); err != nil {
+			return
+		}
+		if e.Order, err = binary.ReadUvarint(br); err != nil {
+			return
+		}
+		dedup[clientID] = e
+	}
+	return
 }
 
 func (k *KVStore) Restore(reader io.Reader) error {
@@ -764,7 +920,25 @@ func (k *KVStore) Restore(reader io.Reader) error {
 	// out-of-order relative to the restored state.
 	k.drainEventCh()
 
-	// Try new versioned format first.
+	// New streaming binary format (#223): identified by the magic first byte.
+	if len(data) > 0 && data[0] == snapStreamMagic {
+		br := bufio.NewReader(bytes.NewReader(data[1:]))
+		rev, idx, d, dd, derr := readSnapshotStream(br)
+		if derr != nil {
+			return derr
+		}
+		k.data = d
+		k.revision = rev
+		k.index = idx
+		if dd != nil {
+			k.dedupTable = dd
+		} else {
+			k.dedupTable = make(map[string]dedupEntry)
+		}
+		return nil
+	}
+
+	// Try the older versioned JSON format (backward compatible).
 	var snap kvSnapshotData
 	if err := json.Unmarshal(data, &snap); err == nil && snap.Data != nil {
 		k.data = snap.Data
@@ -793,31 +967,25 @@ func (k *KVStore) Restore(reader io.Reader) error {
 }
 
 type kvSnapshot struct {
-	data  []byte
-	index uint64
+	revision int64
+	index    uint64
+	data     map[string]*KeyValue
+	dedup    map[string]dedupEntry
 }
 
 func (s *kvSnapshot) Index() uint64 { return s.index }
 func (s *kvSnapshot) Term() uint64  { return 0 }
+
+// Reader streams the snapshot's binary encoding on demand via an io.Pipe, so the
+// snapshot store consumes it record-by-record without materializing the whole
+// serialized payload in memory (#223).
 func (s *kvSnapshot) Reader() io.ReadCloser {
-	return &kvReader{data: s.data}
+	pr, pw := io.Pipe()
+	go func() {
+		pw.CloseWithError(writeSnapshotStream(pw, s.revision, s.index, s.data, s.dedup))
+	}()
+	return pr
 }
-
-type kvReader struct {
-	data []byte
-	pos  int
-}
-
-func (r *kvReader) Read(p []byte) (n int, err error) {
-	if r.pos >= len(r.data) {
-		return 0, io.EOF
-	}
-	n = copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
-}
-
-func (r *kvReader) Close() error { return nil }
 
 // ---------------------------------------------------------------------------
 // Command encoding helpers (public API, backward compatible)
