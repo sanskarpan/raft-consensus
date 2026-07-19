@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Streaming FSM snapshot: binary encode/decode via io.Pipe, avoiding the full-map JSON clone (backward compatible)
 - TLS certificate rotation without restart: SIGHUP reloads gRPC certs via GetCertificate-backed reloader
 - WAL group commit: concurrent Append fsyncs coalesce into one, preserving per-batch durability
 - Write-path distributed tracing: a client write now emits a raft.commit_apply span spanning propose->commit->apply
