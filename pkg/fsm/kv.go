@@ -1034,14 +1034,14 @@ func (k *KVStore) Restore(reader io.Reader) error {
 	// New streaming binary format (#223): identified by the magic first byte.
 	if len(data) > 0 && data[0] == snapStreamMagic {
 		br := bufio.NewReader(bytes.NewReader(data[1:]))
-		rev, idx, applyTs, d, dd, derr := readSnapshotStream(br)
+		rev, idx, applyTS, d, dd, derr := readSnapshotStream(br)
 		if derr != nil {
 			return derr
 		}
 		k.data = d
 		k.revision = rev
 		k.index = idx
-		k.applyTimeMs = applyTs // #207: restore virtual clock
+		k.applyTimeMs = applyTS // #207: restore virtual clock
 		if dd != nil {
 			k.dedupTable = dd
 		} else {
@@ -1245,16 +1245,16 @@ func EncodeTick(leaderTimestampMs int64) []byte {
 }
 
 // EncodeCommandWithTTL encodes a kvCommand with TTL fields for write ops that
-// should expire (#207). leaderTsMs is the leader's Unix-millisecond timestamp
+// should expire (#207). leaderTSMs is the leader's Unix-millisecond timestamp
 // at proposal time; ttlSeconds is the desired lifetime in seconds.
-func EncodeCommandWithTTL(op, key, value, clientID string, seqNum uint64, leaderTsMs, ttlSeconds int64) ([]byte, error) {
+func EncodeCommandWithTTL(op, key, value, clientID string, seqNum uint64, leaderTSMs, ttlSeconds int64) ([]byte, error) {
 	return encodeKVCommand(kvCommand{
 		Op:                op,
 		Key:               key,
 		Value:             value,
 		ClientID:          clientID,
 		SeqNum:            seqNum,
-		LeaderTimestampMs: leaderTsMs,
+		LeaderTimestampMs: leaderTSMs,
 		TTLSeconds:        ttlSeconds,
 	}), nil
 }

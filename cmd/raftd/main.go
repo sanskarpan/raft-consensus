@@ -2027,8 +2027,8 @@ func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string)
 	// #207: encode TTL when requested; stamp LeaderTimestampMs at proposal time.
 	var data []byte
 	if ttlSeconds > 0 {
-		leaderTsMs := time.Now().UnixMilli()
-		data, err = fsm.EncodeCommandWithTTL("put", key, value, clientID, seqNum, leaderTsMs, ttlSeconds)
+		leaderTSMs := time.Now().UnixMilli()
+		data, err = fsm.EncodeCommandWithTTL("put", key, value, clientID, seqNum, leaderTSMs, ttlSeconds)
 	} else if clientID != "" && seqNum > 0 {
 		data, err = fsm.EncodeCommandWithID("put", key, value, clientID, seqNum)
 	} else {

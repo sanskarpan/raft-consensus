@@ -226,7 +226,7 @@ func TestTTLE2ENonTTLKeyUnaffected(t *testing.T) {
 		t.Fatalf("Put: %v", err)
 	}
 
-	// Put a short-lived neighbour so ticks definitely fire.
+	// Put a short-lived neighbor so ticks definitely fire.
 	if _, err := c.PutWithTTL("ttl/short", "gone", 1); err != nil {
 		t.Fatalf("PutWithTTL: %v", err)
 	}
