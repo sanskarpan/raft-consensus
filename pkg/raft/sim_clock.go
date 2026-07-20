@@ -70,7 +70,7 @@ func (c *simClock) Advance(d time.Duration) {
 				break
 			}
 			// Non-blocking send: if the channel is full, drop the tick (matches
-			// real time.Ticker behaviour which also drops ticks on a slow reader).
+			// real time.Ticker behavior which also drops ticks on a slow reader).
 			select {
 			case w.tk.ch <- t:
 			default:
