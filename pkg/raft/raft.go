@@ -116,10 +116,17 @@ type raft struct {
 	// electionTicks counts ticks without hearing from a leader (followers/candidates).
 	electionTicks int
 
-	ticker *time.Ticker
-	stopCh chan struct{}
+	// clock is the injectable time source. Defaults to realClock (wall clock).
+	// Set from Config.Clock in newRaft(); simulation tests inject a simClock.
+	clock Clock
+	// newTicker is the injectable ticker factory. Defaults to newRealTicker.
+	// Set from Config.NewTicker in newRaft(); simulation tests inject simClock.NewTicker.
+	newTicker func(d time.Duration) Ticker
 
-	snapshotTicker *time.Ticker
+	ticker         Ticker
+	stopCh         chan struct{}
+
+	snapshotTicker Ticker
 	snapshotIndex  uint64
 
 	// snapReasm reassembles the Offset-ordered chunks of an incoming
@@ -294,6 +301,19 @@ func newRaft(config *Config, localID ServerID, log LogStore, stable StableStore,
 
 	r.applyWaitCh = make(chan struct{})
 
+	// Initialize injectable clock and ticker factory from config; fall back to
+	// real-wall-clock implementations when not set (production path).
+	if config.Clock != nil {
+		r.clock = config.Clock
+	} else {
+		r.clock = realClock{}
+	}
+	if config.NewTicker != nil {
+		r.newTicker = config.NewTicker
+	} else {
+		r.newTicker = newRealTicker
+	}
+
 	if transport != nil {
 		transport.SetLocalID(localID)
 	}
@@ -346,13 +366,13 @@ func (r *raft) Start() error {
 	}
 	r.leaderID = ""
 	r.electionTicks = r.randomElectionTickCount()
-	r.ticker = time.NewTicker(r.heartbeatInterval())
+	r.ticker = r.newTicker(r.heartbeatInterval())
 	r.stopCh = make(chan struct{})
 	r.doneCh = make(chan struct{})
 	r.fatalErr = nil
 
 	if r.config.SnapshotInterval > 0 {
-		r.snapshotTicker = time.NewTicker(r.config.SnapshotInterval)
+		r.snapshotTicker = r.newTicker(r.config.SnapshotInterval)
 		r.snapshotIndex = r.lastIndex
 	}
 
@@ -465,12 +485,12 @@ func (r *raft) run() {
 
 	var snapshotCh <-chan time.Time
 	if r.snapshotTicker != nil {
-		snapshotCh = r.snapshotTicker.C
+		snapshotCh = r.snapshotTicker.C()
 	}
 
 	for {
 		select {
-		case <-r.ticker.C:
+		case <-r.ticker.C():
 			r.tick()
 
 		case proposal := <-r.proposalCh:
@@ -573,7 +593,7 @@ func (r *raft) checkQuorum() {
 		return // single-voter cluster always has quorum with itself
 	}
 
-	cutoff := time.Now().Add(-r.electionTimeout())
+	cutoff := r.clock.Now().Add(-r.electionTimeout())
 	count := 1 // self
 	for id, ackTime := range r.heartbeatAcks {
 		if ackTime.After(cutoff) && r.configuration.IsVoter(id) {
@@ -627,7 +647,7 @@ func (r *raft) doLeadershipTransfer() {
 	// M1: give up with a timeout if leadership has not changed in time. We are
 	// still leader here (called from tickLeader), so if the deadline has passed
 	// the target never took over — report failure rather than false success.
-	if lt.sent && !lt.deadline.IsZero() && time.Now().After(lt.deadline) {
+	if lt.sent && !lt.deadline.IsZero() && r.clock.Now().After(lt.deadline) {
 		r.logger.Warn("leadership transfer: timed out waiting for target to take over",
 			zap.String("target", lt.target.String()),
 		)
@@ -673,7 +693,7 @@ func (r *raft) doLeadershipTransfer() {
 			zap.String("target", target.String()),
 		)
 		lt.sent = true
-		lt.deadline = time.Now().Add(r.electionTimeout())
+		lt.deadline = r.clock.Now().Add(r.electionTimeout())
 		go func() {
 			// M-C1: bounded, cancel-on-shutdown context.
 			ctx, cancel := r.rpcContext()
@@ -797,9 +817,9 @@ func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 	ctx, cancel := r.rpcContext()
 	defer cancel()
 	spanCtx, span := tracing.SpanRequestVote(ctx, serverID.String(), req.Term)
-	start := time.Now()
+	start := r.clock.Now()
 	resp, err := r.transport.RequestVote(spanCtx, serverID, req)
-	metrics.RecordRequestVoteLatency(time.Since(start).Seconds())
+	metrics.RecordRequestVoteLatency(r.clock.Now().Sub(start).Seconds())
 	if err != nil {
 		tracing.RecordError(span, err)
 	}
@@ -853,9 +873,9 @@ func (r *raft) sendVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 	ctx, cancel := r.rpcContext()
 	defer cancel()
 	spanCtx, span := tracing.SpanRequestVote(ctx, serverID.String(), req.Term)
-	start := time.Now()
+	start := r.clock.Now()
 	resp, err := r.transport.RequestVote(spanCtx, serverID, req)
-	metrics.RecordRequestVoteLatency(time.Since(start).Seconds())
+	metrics.RecordRequestVoteLatency(r.clock.Now().Sub(start).Seconds())
 	if err != nil {
 		tracing.RecordError(span, err)
 	}
@@ -1177,9 +1197,9 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 	spanCtx, span := tracing.SpanAppendEntries(ctx, serverID.String(), reqTerm, len(entries))
 
 	// C-O1: measure AppendEntries RPC latency and count sends by outcome.
-	start := time.Now()
+	start := r.clock.Now()
 	resp, err := r.transport.AppendEntries(spanCtx, serverID, req)
-	metrics.RecordAppendEntriesLatency(serverID.String(), time.Since(start).Seconds())
+	metrics.RecordAppendEntriesLatency(serverID.String(), r.clock.Now().Sub(start).Seconds())
 	if err != nil {
 		metrics.RecordAppendEntriesSent(serverID.String(), false)
 		tracing.RecordError(span, err)
@@ -1236,7 +1256,7 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 
 	if resp.Success {
 		// Record the ack time for leader-lease / ReadIndex.
-		r.heartbeatAcks[serverID] = time.Now()
+		r.heartbeatAcks[serverID] = r.clock.Now()
 
 		if len(entries) > 0 {
 			if lastSentIdx > r.matchIndex[serverID] {
@@ -1367,7 +1387,7 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 	spanCtx, span := tracing.SpanSnapshot(ctx, serverID.String(), lastIncludedIndex)
 	defer span.End()
 
-	snapStart := time.Now()
+	snapStart := r.clock.Now()
 
 	buf := make([]byte, snapshotChunkSize)
 	var offset uint64
@@ -1428,7 +1448,7 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 
 	// Success: the follower now holds state through lastIncludedIndex.
 	// offset is the total bytes streamed (the snapshot size).
-	metrics.RecordInstallSnapshotLatency(time.Since(snapStart).Seconds())
+	metrics.RecordInstallSnapshotLatency(r.clock.Now().Sub(snapStart).Seconds())
 	metrics.RecordSnapshotSize(int(offset))
 
 	r.mu.Lock()
@@ -1437,7 +1457,7 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 			r.matchIndex[serverID] = lastIncludedIndex
 		}
 		r.nextIndex[serverID] = r.matchIndex[serverID] + 1
-		r.heartbeatAcks[serverID] = time.Now()
+		r.heartbeatAcks[serverID] = r.clock.Now()
 		if r.lastIndex >= r.matchIndex[serverID] {
 			metrics.RecordReplicationLag(serverID.String(), r.lastIndex-r.matchIndex[serverID])
 		}
@@ -1740,9 +1760,9 @@ func (r *raft) applyCommitted() {
 						}
 					}()
 					// C-O1: record FSM apply latency around the Apply call.
-					start := time.Now()
+					start := r.clock.Now()
 					result, applyErr = r.fsm.Apply(entry.Data)
-					metrics.RecordFSMApplyLatency(time.Since(start).Seconds())
+					metrics.RecordFSMApplyLatency(r.clock.Now().Sub(start).Seconds())
 				}()
 			}
 		case EntryConfiguration:
@@ -1772,7 +1792,7 @@ func (r *raft) applyCommitted() {
 
 		if f, ok := r.pendingFutures[entry.Index]; ok {
 			if !f.created.IsZero() {
-				metrics.RecordProposalCommitLatency(time.Since(f.created).Seconds())
+				metrics.RecordProposalCommitLatency(r.clock.Now().Sub(f.created).Seconds())
 			}
 			f.respond(applyErr, entry.Index, entry.Term, result) // ends the #213 span
 			delete(r.pendingFutures, entry.Index)
@@ -2047,7 +2067,7 @@ func (r *raft) ReadIndex(ctx context.Context) (uint64, error) {
 
 	// Reference instant on the leader's monotonic clock; only acks recorded
 	// strictly after this point count as confirmation for this read.
-	start := time.Now()
+	start := r.clock.Now()
 
 	// Nudge an immediate heartbeat round so confirmation arrives within ~one
 	// heartbeat interval rather than waiting for the next periodic tick.
@@ -2115,7 +2135,7 @@ func (r *raft) Apply(ctx context.Context, data []byte) ([]byte, error) {
 	future := &ApplyFuture{
 		ch:      make(chan struct{}),
 		data:    data,
-		created: time.Now(),
+		created: r.clock.Now(),
 	}
 
 	proposal := &proposalFuture{
