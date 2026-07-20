@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- TTL/lease-based key expiry (#207): deterministic apply-time monotonic clock (`applyTimeMs`) advanced only by leader-stamped committed commands; backward-compatible binary codec extension (`LeaderTimestampMs`+`TTLSeconds`); committed `tick` op for eager sweep with sorted deterministic deletion; snapshot v2 format preserves `applyTimeMs`+`ExpiresAtMs` across restart; leader tick loop proposes ticks at configurable `ttl_tick_interval` (default 1s); HTTP `ttl_seconds` JSON field; `client.PutWithTTL`; `kvctl put --ttl N`; 19-test unit suite + 4-test E2E suite covering replica consistency, watch delete events, and leader failover
 - Streaming FSM snapshot: binary encode/decode via io.Pipe, avoiding the full-map JSON clone (backward compatible)
 - TLS certificate rotation without restart: SIGHUP reloads gRPC certs via GetCertificate-backed reloader
 - WAL group commit: concurrent Append fsyncs coalesce into one, preserving per-batch durability

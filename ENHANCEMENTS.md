@@ -37,8 +37,20 @@ CI-green PR merged to `main`):
 | Client leader-aware routing for v2 writes (`X-Raft-Leader-Address`) | #229 / #209 |
 | Range pagination — `limit`/`start_after` + cursor headers (e2e-verified) | #230 / #206 |
 | e2e cluster port-collision fix (test hardening) | #231 |
+| Group-commit / batched fsync (WAL) | #232 / #201 |
+| Snapshot compression (gzip) | #232 / #202 |
+| gRPC message compression (gzip) | #232 / #203 |
+| TLS cert rotation without restart | #233 / #204 |
+| Write-path distributed tracing (OTEL) | #234 / #213 |
+| Streaming FSM snapshot (io.Pipe, no full-buffer) | #235 / #223 |
+| Admin RBAC — separate 'admin' role | #236 / #205 |
+| Package docs + examples/ dir | #237 / #221 |
+| Go native fuzzing for on-disk parsers | #238 / #218 |
+| Golden-file tests + codecov + benchstat | #239 / #219 |
+| Publish + sign container images in CI/CD | #240 / #217 |
+| TTL/lease-based key expiry (deterministic apply-time clock, binary codec, tick sweep, E2E) | — / #207 |
 
-**Status (2026-07-18):** 18 roadmap issues resolved + all 6 verify-first items. This session shipped: admin RBAC (#205), package docs+examples (#221), fuzzing (#218), golden/codecov/benchstat (#219), image publish+sign (#217), gRPC compression (#203), snapshot compression (#202). **9 enhancement issues remain open** (the larger perf/feature/infra items). `main` is green; 0 open bugs.
+**Status (2026-07-20):** 31 roadmap issues resolved + all 6 verify-first items. EPIC #207 (TTL/lease expiry) complete: deterministic apply-time clock, backward-compat binary codec, committed tick sweep, snapshot versioning, leader tick loop, HTTP/client/kvctl TTL API, 4-test E2E suite. **8 enhancement EPICs remain open.** `main` is green; 0 open bugs.
 
 ---
 
@@ -209,7 +221,7 @@ limits, kvctl put/get/delete/range/txn/watch/status.
 |---|---|---|---|---|
 | ✅ Range pagination (limit/cursor) | H | M | **Shipped (#206).** `RangePage` + `?limit=&start_after=` with `X-Next-Cursor`/`X-Has-More` headers + `client.RangePage` + `kvctl range --limit`; e2e-verified. | `KVStore.RangePage`, `serveRange` |
 | `[key, range_end)` intervals | H | M | Range is prefix-only; etcd's core primitive is a half-open key interval (prefix is a special case). | `Range`, `evalCompare` |
-| TTL / lease-based key expiry | H | L | No TTL/lease anywhere — table-stakes for leader election / service registration. Needs deterministic apply-time ticks. | `KeyValue`, `Apply`; lease ops |
+| ✅ TTL / lease-based key expiry | H | L | **Shipped (#207).** Deterministic apply-time clock (`applyTimeMs`), backward-compat binary codec (`LeaderTimestampMs`+`TTLSeconds`), committed `tick` op sweeps expired keys, snapshot v2 format, leader tick loop (200ms–1s), HTTP `ttl_seconds`, `client.PutWithTTL`, `kvctl put --ttl`; 4-test E2E suite (replica consistency, watch delete, leader failover). | `KeyValue`, `Apply`, `leaderTickLoop`, `pkg/client`, `kvctl` |
 | MVCC historical reads (read at revision) | H | L | Revision metadata exists but only the latest version is stored; no time-travel reads (etcd's defining feature). | `KVStore.data`, `Get`, `Range` |
 | ✅ Atomic counter / increment op | M | S | **Shipped (#208).** FSM `incr` op + `POST /v1/kv/{key}?op=incr` + `client.Increment` + `kvctl incr`; e2e-verified (concurrent clients, no lost updates). | `Apply` switch |
 | ✅ Client leader-routing for v2 writes | M | S | **Shipped (#209).** `Put`/`DeleteKV`/`Txn`/`Increment` prefer the leader via `writeAddrs()` + `X-Raft-Leader-Address` convergence; e2e-verified. | client `Put`/`DeleteKV`/`Txn` |

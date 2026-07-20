@@ -598,6 +598,7 @@ type KVPair struct {
 	CreateRevision int64  `json:"create_revision"`
 	ModRevision    int64  `json:"mod_revision"`
 	Version        int64  `json:"version"`
+	ExpiresAtMs    int64  `json:"expires_at_ms,omitempty"` // #207: zero means no expiry
 }
 
 // TxnCompare is a single condition in a client transaction.
@@ -668,18 +669,24 @@ func WithRevision(rev int64) WatchOption {
 // Retries up to v2RetryMax times with exponential backoff.
 // The seqNum is generated once so all retries carry the same idempotency key.
 func (c *Client) Put(key, value string) (*KVPair, error) {
+	return c.PutWithTTL(key, value, 0)
+}
+
+// PutWithTTL sets key to value with an optional TTL (#207).
+// ttlSeconds == 0 means no expiry (behaves identically to Put).
+func (c *Client) PutWithTTL(key, value string, ttlSeconds int64) (*KVPair, error) {
 	seq := c.nextSeqNum()
 	var result *KVPair
 	err := c.doWithRetry(func() error {
 		for _, addr := range c.writeAddrs() {
 			rawURL := fmt.Sprintf("http://%s/v1/kv/%s", addr, url.PathEscape(key))
-			kv, err := c.doPutKV(rawURL, []byte(value), seq)
+			kv, err := c.doPutKV(rawURL, []byte(value), seq, ttlSeconds)
 			if err == nil {
 				result = kv
 				return nil
 			}
 		}
-		return fmt.Errorf("Put: all nodes failed")
+		return fmt.Errorf("PutWithTTL: all nodes failed")
 	})
 	return result, err
 }
@@ -1034,15 +1041,33 @@ func (c *Client) streamSSE(
 // Internal HTTP helpers for v2 API
 // ---------------------------------------------------------------------------
 
-func (c *Client) doPutKV(rawURL string, body []byte, seqNum uint64) (*KVPair, error) {
+func (c *Client) doPutKV(rawURL string, rawValue []byte, seqNum uint64, ttlSeconds int64) (*KVPair, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
+
+	var body []byte
+	var contentType string
+	if ttlSeconds > 0 {
+		// #207: wrap in JSON to carry ttl_seconds.
+		envelope := struct {
+			Value      string `json:"value"`
+			TTLSeconds int64  `json:"ttl_seconds"`
+		}{Value: string(rawValue), TTLSeconds: ttlSeconds}
+		var err error
+		if body, err = json.Marshal(envelope); err != nil {
+			return nil, err
+		}
+		contentType = "application/json"
+	} else {
+		body = rawValue
+		contentType = "text/plain"
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, rawURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set(headerClientID, c.clientID)
 	req.Header.Set(headerSeqNum, fmt.Sprintf("%d", seqNum))
 

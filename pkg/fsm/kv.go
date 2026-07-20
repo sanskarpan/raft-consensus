@@ -35,7 +35,8 @@ type KeyValue struct {
 	Value          string `json:"value"`
 	CreateRevision int64  `json:"create_revision"`
 	ModRevision    int64  `json:"mod_revision"`
-	Version        int64  `json:"version"` // number of modifications to this key
+	Version        int64  `json:"version"`      // number of modifications to this key
+	ExpiresAtMs    int64  `json:"expires_at_ms,omitempty"` // Unix ms; 0 = no expiry (#207)
 }
 
 // Event represents a single change notification emitted after a committed Apply.
@@ -104,6 +105,12 @@ type KVStore struct {
 	// This prevents double-application when a client retries after a network
 	// failure where the command committed but the response was lost.
 	dedupTable map[string]dedupEntry
+
+	// applyTimeMs is the FSM's virtual monotonic clock (#207). It is advanced
+	// from LeaderTimestampMs on every command that carries one (tick + TTL puts).
+	// All replicas apply the same log entries in the same order, so this field
+	// is identical on every live replica. Never use time.Now() here.
+	applyTimeMs int64
 }
 
 // DroppedEvents returns the total number of event notifications that were
@@ -140,6 +147,15 @@ type kvCommand struct {
 	// Read-only ops (get, get_v2, list, range) do not set these fields.
 	ClientID string `json:"client_id,omitempty"`
 	SeqNum   uint64 `json:"seq_num,omitempty"`
+
+	// TTL fields (#207). LeaderTimestampMs is the leader's wall-clock time
+	// (Unix milliseconds) at proposal time, used to advance the FSM's
+	// deterministic virtual clock (applyTimeMs) identically on every replica.
+	// TTLSeconds > 0 causes the key to expire TTLSeconds after LeaderTimestampMs.
+	// Both fields are omitted (zero) for non-TTL commands and for JSON-encoded
+	// commands — the binary codec appends them only when non-zero.
+	LeaderTimestampMs int64 `json:"leader_timestamp_ms,omitempty"`
+	TTLSeconds        int64 `json:"ttl_seconds,omitempty"`
 }
 
 // dedupEntry caches the last applied result per client for idempotency.
@@ -172,6 +188,12 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 
 	k.index++
 
+	// #207: advance the FSM's virtual monotonic clock from the leader-stamped
+	// timestamp. This is monotonic: we never regress applyTimeMs.
+	if cmd.LeaderTimestampMs > k.applyTimeMs {
+		k.applyTimeMs = cmd.LeaderTimestampMs
+	}
+
 	// Idempotency deduplication: if we have seen this (clientID, seqNum) pair
 	// before, return the cached result without re-applying.
 	if cmd.ClientID != "" {
@@ -189,6 +211,15 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 
 	switch cmd.Op {
 	// ------------------------------------------------------------------
+	// #207: tick — advance virtual clock and sweep expired keys
+	// ------------------------------------------------------------------
+
+	case "tick":
+		// applyTimeMs already advanced above. Now sweep keys whose TTL has passed.
+		n := k.sweepExpiredLocked()
+		res, applyErr = json.Marshal(KvResult{Value: strconv.Itoa(n)})
+
+	// ------------------------------------------------------------------
 	// Legacy ops — preserved for 100 % backward compatibility
 	// ------------------------------------------------------------------
 
@@ -198,7 +229,7 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 			break
 		}
 		prev := k.data[cmd.Key]
-		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev)
+		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev, 0)
 		k.emitEvents([]Event{{
 			Type:     EventPut,
 			Key:      cmd.Key,
@@ -211,7 +242,7 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 
 	case "get":
 		kv := k.data[cmd.Key]
-		if kv == nil {
+		if kv == nil || !k.isLive(kv) {
 			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
 		} else {
 			res, applyErr = json.Marshal(KvResult{Value: kv.Value})
@@ -219,7 +250,7 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 
 	case "delete":
 		kv := k.data[cmd.Key]
-		if kv == nil {
+		if kv == nil || !k.isLive(kv) {
 			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
 		} else if k.revisionExhausted() {
 			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
@@ -240,8 +271,10 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 		// Iterate keys in sorted order so the Apply output is deterministic
 		// across replicas (a Go map iterates in random order). Mirrors "range".
 		keys := make([]string, 0, len(k.data))
-		for key := range k.data {
-			keys = append(keys, key)
+		for key, kv := range k.data {
+			if k.isLive(kv) {
+				keys = append(keys, key)
+			}
 		}
 		sort.Strings(keys)
 		values := make([]string, 0, len(keys))
@@ -259,8 +292,13 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
 			break
 		}
+		// #207: compute ExpiresAtMs from TTLSeconds + current applyTimeMs.
+		var expiresAt int64
+		if cmd.TTLSeconds > 0 {
+			expiresAt = k.applyTimeMs + cmd.TTLSeconds*1000
+		}
 		prev := k.data[cmd.Key]
-		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev)
+		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev, expiresAt)
 		k.emitEvents([]Event{{
 			Type:     EventPut,
 			Key:      cmd.Key,
@@ -279,7 +317,7 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 		// Linearizable: this op travels through the Raft log so the read
 		// is guaranteed to reflect all preceding committed writes.
 		kv := k.data[cmd.Key]
-		if kv == nil {
+		if kv == nil || !k.isLive(kv) {
 			res, applyErr = json.Marshal(KvResult{Error: "key not found"})
 		} else {
 			kvJSON, err := json.Marshal(kv)
@@ -290,10 +328,10 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 		}
 
 	case "range":
-		// Prefix scan — no mutation, no revision bump.
+		// Prefix scan — no mutation, no revision bump. #207: filter expired keys.
 		var kvs []*KeyValue
 		for key, kv := range k.data {
-			if strings.HasPrefix(key, cmd.Key) {
+			if strings.HasPrefix(key, cmd.Key) && k.isLive(kv) {
 				kvs = append(kvs, kvClone(kv))
 			}
 		}
@@ -320,18 +358,20 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 		}
 		prev := k.data[cmd.Key]
 		var cur int64
-		if prev != nil {
+		if prev != nil && k.isLive(prev) {
 			cur, derr = strconv.ParseInt(prev.Value, 10, 64)
 			if derr != nil {
 				res, applyErr = json.Marshal(KvResult{Error: "incr: existing value is not a base-10 int64"})
 				break
 			}
+		} else {
+			prev = nil // treat expired as absent
 		}
 		if (delta > 0 && cur > math.MaxInt64-delta) || (delta < 0 && cur < math.MinInt64-delta) {
 			res, applyErr = json.Marshal(KvResult{Error: "incr: int64 overflow"})
 			break
 		}
-		kv := k.applyPutLocked(cmd.Key, strconv.FormatInt(cur+delta, 10), prev)
+		kv := k.applyPutLocked(cmd.Key, strconv.FormatInt(cur+delta, 10), prev, 0)
 		k.emitEvents([]Event{{
 			Type:     EventPut,
 			Key:      cmd.Key,
@@ -380,8 +420,9 @@ func (k *KVStore) revisionExhausted() bool {
 }
 
 // applyPutLocked creates or updates a key. Caller must hold mu.Lock().
+// expiresAt is the absolute Unix-millisecond expiry time; 0 means no expiry (#207).
 // Returns the updated KeyValue (stored in k.data).
-func (k *KVStore) applyPutLocked(key, value string, prev *KeyValue) *KeyValue {
+func (k *KVStore) applyPutLocked(key, value string, prev *KeyValue, expiresAt int64) *KeyValue {
 	k.revision++
 	var cr, ver int64
 	if prev != nil {
@@ -397,9 +438,52 @@ func (k *KVStore) applyPutLocked(key, value string, prev *KeyValue) *KeyValue {
 		CreateRevision: cr,
 		ModRevision:    k.revision,
 		Version:        ver,
+		ExpiresAtMs:    expiresAt,
 	}
 	k.data[key] = kv
 	return kv
+}
+
+// isLive reports whether kv is present and not yet expired (#207). Caller must
+// hold at least mu.RLock(). The check is against the FSM's virtual clock
+// (applyTimeMs), which is identical on every replica, so expiry is deterministic.
+func (k *KVStore) isLive(kv *KeyValue) bool {
+	return kv.ExpiresAtMs == 0 || kv.ExpiresAtMs > k.applyTimeMs
+}
+
+// sweepExpiredLocked deletes all keys whose TTL has lapsed (ExpiresAtMs > 0
+// && ExpiresAtMs <= applyTimeMs) in deterministic sorted key order and emits
+// an EventDelete for each. Called only from the "tick" Apply path. Caller must
+// hold mu.Lock().
+func (k *KVStore) sweepExpiredLocked() int {
+	var expired []string
+	for key, kv := range k.data {
+		if kv.ExpiresAtMs > 0 && kv.ExpiresAtMs <= k.applyTimeMs {
+			expired = append(expired, key)
+		}
+	}
+	if len(expired) == 0 {
+		return 0
+	}
+	sort.Strings(expired) // deterministic deletion order across replicas
+	if k.revisionExhausted() {
+		return 0
+	}
+	k.revision++
+	sweepRev := k.revision
+	events := make([]Event, 0, len(expired))
+	for _, key := range expired {
+		prev := k.data[key]
+		delete(k.data, key)
+		events = append(events, Event{
+			Type:     EventDelete,
+			Key:      key,
+			PrevKV:   kvClone(prev),
+			Revision: sweepRev,
+		})
+	}
+	k.emitEvents(events)
+	return len(expired)
 }
 
 // applyTxnLocked evaluates and executes a transaction. Caller must hold mu.Lock().
@@ -695,9 +779,10 @@ type kvSnapshotData struct {
 	// It must be serialized and restored so Snapshot().Index() is correct after a
 	// Restore (H10): otherwise a restored FSM reports index 0 and the raft layer
 	// can mis-compute the snapshot/log boundary.
-	Index      uint64                `json:"index"`
-	Data       map[string]*KeyValue  `json:"data"`
-	DedupTable map[string]dedupEntry `json:"dedup_table,omitempty"`
+	Index       uint64                `json:"index"`
+	Data        map[string]*KeyValue  `json:"data"`
+	DedupTable  map[string]dedupEntry `json:"dedup_table,omitempty"`
+	ApplyTimeMs int64                 `json:"apply_time_ms,omitempty"` // #207 virtual clock
 }
 
 // evictDedupIfNeeded removes entries when dedupTable exceeds maxDedupEntries.
@@ -742,12 +827,20 @@ func (k *KVStore) Snapshot() (raft.Snapshot, error) {
 	for clientID, entry := range k.dedupTable {
 		dedup[clientID] = entry
 	}
-	return &kvSnapshot{revision: k.revision, index: k.index, data: data, dedup: dedup}, nil
+	return &kvSnapshot{
+		revision:    k.revision,
+		index:       k.index,
+		applyTimeMs: k.applyTimeMs,
+		data:        data,
+		dedup:       dedup,
+	}, nil
 }
 
 // writeSnapshotStream serializes the FSM state to w in a compact, length-prefixed
 // binary form, record by record (no full-size intermediate buffer).
-func writeSnapshotStream(w io.Writer, revision int64, index uint64, data map[string]*KeyValue, dedup map[string]dedupEntry) error {
+// Format version 2 adds applyTimeMs (#207) after index, and ExpiresAtMs after
+// each key's Version field. Readers check the version and skip absent fields.
+func writeSnapshotStream(w io.Writer, revision int64, index uint64, applyTimeMs int64, data map[string]*KeyValue, dedup map[string]dedupEntry) error {
 	bw := bufio.NewWriter(w)
 	var scratch [binary.MaxVarintLen64]byte
 	putUvarint := func(v uint64) error {
@@ -770,13 +863,16 @@ func writeSnapshotStream(w io.Writer, revision int64, index uint64, data map[str
 	if err := bw.WriteByte(snapStreamMagic); err != nil {
 		return err
 	}
-	if err := putUvarint(1); err != nil { // format version
+	if err := putUvarint(2); err != nil { // format version 2 (#207)
 		return err
 	}
 	if err := putVarint(revision); err != nil {
 		return err
 	}
 	if err := putUvarint(index); err != nil {
+		return err
+	}
+	if err := putVarint(applyTimeMs); err != nil { // v2: virtual clock (#207)
 		return err
 	}
 	if err := putUvarint(uint64(len(data))); err != nil {
@@ -796,6 +892,9 @@ func writeSnapshotStream(w io.Writer, revision int64, index uint64, data map[str
 			return err
 		}
 		if err := putVarint(kv.Version); err != nil {
+			return err
+		}
+		if err := putVarint(kv.ExpiresAtMs); err != nil { // v2: TTL expiry (#207)
 			return err
 		}
 	}
@@ -823,8 +922,9 @@ func writeSnapshotStream(w io.Writer, revision int64, index uint64, data map[str
 }
 
 // readSnapshotStream decodes the binary snapshot written by writeSnapshotStream.
-// The magic byte has already been consumed by the caller.
-func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, data map[string]*KeyValue, dedup map[string]dedupEntry, err error) {
+// The magic byte has already been consumed by the caller. Returns applyTimeMs
+// (#207) which is non-zero only in v2+ snapshots.
+func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, applyTimeMs int64, data map[string]*KeyValue, dedup map[string]dedupEntry, err error) {
 	readStr := func() (string, error) {
 		n, e := binary.ReadUvarint(br)
 		if e != nil {
@@ -836,7 +936,8 @@ func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, data ma
 		}
 		return string(buf), nil
 	}
-	if _, err = binary.ReadUvarint(br); err != nil { // version
+	var version uint64
+	if version, err = binary.ReadUvarint(br); err != nil { // format version
 		return
 	}
 	if revision, err = binary.ReadVarint(br); err != nil {
@@ -844,6 +945,11 @@ func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, data ma
 	}
 	if index, err = binary.ReadUvarint(br); err != nil {
 		return
+	}
+	if version >= 2 { // v2: virtual clock (#207)
+		if applyTimeMs, err = binary.ReadVarint(br); err != nil {
+			return
+		}
 	}
 	var n uint64
 	if n, err = binary.ReadUvarint(br); err != nil {
@@ -867,6 +973,11 @@ func readSnapshotStream(br *bufio.Reader) (revision int64, index uint64, data ma
 		}
 		if kv.Version, err = binary.ReadVarint(br); err != nil {
 			return
+		}
+		if version >= 2 { // v2: per-key TTL expiry (#207)
+			if kv.ExpiresAtMs, err = binary.ReadVarint(br); err != nil {
+				return
+			}
 		}
 		data[key] = kv
 	}
@@ -923,13 +1034,14 @@ func (k *KVStore) Restore(reader io.Reader) error {
 	// New streaming binary format (#223): identified by the magic first byte.
 	if len(data) > 0 && data[0] == snapStreamMagic {
 		br := bufio.NewReader(bytes.NewReader(data[1:]))
-		rev, idx, d, dd, derr := readSnapshotStream(br)
+		rev, idx, applyTS, d, dd, derr := readSnapshotStream(br)
 		if derr != nil {
 			return derr
 		}
 		k.data = d
 		k.revision = rev
 		k.index = idx
+		k.applyTimeMs = applyTS // #207: restore virtual clock
 		if dd != nil {
 			k.dedupTable = dd
 		} else {
@@ -944,6 +1056,7 @@ func (k *KVStore) Restore(reader io.Reader) error {
 		k.data = snap.Data
 		k.revision = snap.Revision
 		k.index = snap.Index
+		k.applyTimeMs = snap.ApplyTimeMs // #207: zero for old snapshots
 		if snap.DedupTable != nil {
 			k.dedupTable = snap.DedupTable
 		} else {
@@ -967,10 +1080,11 @@ func (k *KVStore) Restore(reader io.Reader) error {
 }
 
 type kvSnapshot struct {
-	revision int64
-	index    uint64
-	data     map[string]*KeyValue
-	dedup    map[string]dedupEntry
+	revision    int64
+	index       uint64
+	applyTimeMs int64 // #207: virtual clock snapshot
+	data        map[string]*KeyValue
+	dedup       map[string]dedupEntry
 }
 
 func (s *kvSnapshot) Index() uint64 { return s.index }
@@ -982,7 +1096,7 @@ func (s *kvSnapshot) Term() uint64  { return 0 }
 func (s *kvSnapshot) Reader() io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
-		pw.CloseWithError(writeSnapshotStream(pw, s.revision, s.index, s.data, s.dedup))
+		pw.CloseWithError(writeSnapshotStream(pw, s.revision, s.index, s.applyTimeMs, s.data, s.dedup))
 	}()
 	return pr
 }
@@ -1022,10 +1136,11 @@ func EncodeCommandWithID(op, key, value, clientID string, seqNum uint64) ([]byte
 const cmdBinaryMagic = 0x01
 
 // encodeKVCommand serializes a non-txn kvCommand into a compact, deterministic
-// binary form (M-P4): a magic byte, then length-prefixed op/key/value/clientID
-// and a uvarint seqNum. It is used for the hot put/get/delete path; txn commands
-// keep the JSON envelope (see EncodeTxn). The encoding is a pure function of the
-// command, so replicas produce byte-identical entries.
+// binary form (M-P4): a magic byte, then length-prefixed op/key/value/clientID,
+// a uvarint seqNum, and an optional TTL extension (#207) appended only when
+// LeaderTimestampMs or TTLSeconds is non-zero (zero-extend for old decoders that
+// stop reading after SeqNum — backward compatible). The encoding is a pure
+// function of the command so replicas produce byte-identical entries.
 func encodeKVCommand(cmd kvCommand) []byte {
 	// Txn commands are never routed here (EncodeTxn handles them); fall back to
 	// JSON defensively if a Txn is somehow present so nothing is silently lost.
@@ -1034,6 +1149,9 @@ func encodeKVCommand(cmd kvCommand) []byte {
 		return b
 	}
 	size := 1 + 5*4 + len(cmd.Op) + len(cmd.Key) + len(cmd.Value) + len(cmd.ClientID) + binary.MaxVarintLen64
+	if cmd.LeaderTimestampMs != 0 || cmd.TTLSeconds != 0 {
+		size += 2 * binary.MaxVarintLen64
+	}
 	buf := make([]byte, 0, size)
 	buf = append(buf, cmdBinaryMagic)
 	writeLenPrefixed := func(b []byte, s string) []byte {
@@ -1045,12 +1163,21 @@ func encodeKVCommand(cmd kvCommand) []byte {
 	buf = writeLenPrefixed(buf, cmd.Value)
 	buf = writeLenPrefixed(buf, cmd.ClientID)
 	buf = binary.AppendUvarint(buf, cmd.SeqNum)
+	// TTL extension (#207): appended only when present so old decoders (which
+	// stop after SeqNum) decode cleanly — their trailing-byte-ignoring behavior
+	// is load-bearing for rolling upgrades.
+	if cmd.LeaderTimestampMs != 0 || cmd.TTLSeconds != 0 {
+		buf = binary.AppendVarint(buf, cmd.LeaderTimestampMs)
+		buf = binary.AppendUvarint(buf, uint64(cmd.TTLSeconds))
+	}
 	return buf
 }
 
 // decodeKVCommand decodes a kvCommand from either the binary form (magic byte)
 // or the legacy/txn JSON form (starts with '{'), so it is backward-compatible
-// with entries written before M-P4 and with txn commands (M-P4).
+// with entries written before M-P4 and with txn commands (M-P4). The binary
+// decoder reads the optional TTL extension (#207) when remaining bytes exist
+// after SeqNum.
 func decodeKVCommand(data []byte) (kvCommand, error) {
 	var cmd kvCommand
 	if len(data) == 0 {
@@ -1093,7 +1220,43 @@ func decodeKVCommand(data []byte) (kvCommand, error) {
 		return cmd, fmt.Errorf("corrupt command: bad seqnum")
 	}
 	cmd.SeqNum = seq
+	b = b[m:]
+	// TTL extension (#207): present only when the encoder appended it.
+	if len(b) > 0 {
+		lts, m2 := binary.Varint(b)
+		if m2 <= 0 {
+			return cmd, fmt.Errorf("corrupt command: bad leader_timestamp_ms")
+		}
+		cmd.LeaderTimestampMs = lts
+		b = b[m2:]
+		ttl, m3 := binary.Uvarint(b)
+		if m3 <= 0 {
+			return cmd, fmt.Errorf("corrupt command: bad ttl_seconds")
+		}
+		cmd.TTLSeconds = int64(ttl)
+	}
 	return cmd, nil
+}
+
+// EncodeTick encodes a committed tick command that carries the leader's
+// wall-clock time and triggers a deterministic sweep of expired keys (#207).
+func EncodeTick(leaderTimestampMs int64) []byte {
+	return encodeKVCommand(kvCommand{Op: "tick", LeaderTimestampMs: leaderTimestampMs})
+}
+
+// EncodeCommandWithTTL encodes a kvCommand with TTL fields for write ops that
+// should expire (#207). leaderTSMs is the leader's Unix-millisecond timestamp
+// at proposal time; ttlSeconds is the desired lifetime in seconds.
+func EncodeCommandWithTTL(op, key, value, clientID string, seqNum uint64, leaderTSMs, ttlSeconds int64) ([]byte, error) {
+	return encodeKVCommand(kvCommand{
+		Op:                op,
+		Key:               key,
+		Value:             value,
+		ClientID:          clientID,
+		SeqNum:            seqNum,
+		LeaderTimestampMs: leaderTSMs,
+		TTLSeconds:        ttlSeconds,
+	}), nil
 }
 
 func EncodeSet(key, value string) ([]byte, error) { return EncodeCommand("set", key, value) }

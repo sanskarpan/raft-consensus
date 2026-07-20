@@ -48,6 +48,7 @@ func main() {
 	prefix := flag.Bool("prefix", false, "watch by prefix instead of exact key")
 	revision := flag.Int64("revision", 0, "start watch/history from this revision")
 	limit := flag.Int("limit", 0, "page size for range (auto-pages through all results when > 0)")
+	ttl := flag.Int64("ttl", 0, "TTL in seconds for put (0 = no expiry)")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -76,7 +77,7 @@ func main() {
 		if len(cmdArgs) < 2 {
 			fatalf("put requires <key> <value>\n")
 		}
-		runPut(c, cmdArgs[0], cmdArgs[1])
+		runPut(c, cmdArgs[0], cmdArgs[1], *ttl)
 
 	case "get":
 		if len(cmdArgs) < 1 {
@@ -135,7 +136,7 @@ Usage:
   kvctl [flags] <command> [args...]
 
 Commands:
-  put    <key> <value>     Set a key
+  put    <key> <value>     Set a key (--ttl=N sets TTL in seconds)
   incr   <key> <delta>     Atomically add delta (may be negative) to an integer key
   get    <key>             Get a key (linearizable by default; --stale for local FSM read)
   delete <key>             Delete a key
@@ -166,8 +167,8 @@ func prettyJSON(v interface{}) string {
 // Command implementations
 // ---------------------------------------------------------------------------
 
-func runPut(c *client.Client, key, value string) {
-	kv, err := c.Put(key, value)
+func runPut(c *client.Client, key, value string, ttlSeconds int64) {
+	kv, err := c.PutWithTTL(key, value, ttlSeconds)
 	if err != nil {
 		fatalf("put failed: %v\n", err)
 	}

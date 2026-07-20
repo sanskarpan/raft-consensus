@@ -26,6 +26,14 @@ func WithBinary(path string) HarnessOption {
 	}
 }
 
+// WithExtraConfig appends extra YAML lines (verbatim) to every node's config
+// file.  Use for feature-specific settings like ttl_tick_interval.
+func WithExtraConfig(yaml string) HarnessOption {
+	return func(h *Harness) {
+		h.extraConfig = yaml
+	}
+}
+
 // Harness manages a set of raftd processes for integration testing.
 type Harness struct {
 	mu    sync.Mutex
@@ -36,6 +44,7 @@ type Harness struct {
 	dir           string
 	basePort      int
 	binaryPath    string
+	extraConfig   string // appended verbatim to every node config (#207)
 }
 
 // Node represents a single raftd process in the test cluster.
@@ -359,6 +368,10 @@ rate_limit_rps: 100000
 per_ip_rate_limit_rps: 100000
 cluster:
 %s`, id, raftAddr, httpAddr, filepath.Join(h.dir, id, "data"), clusterLines)
+
+	if h.extraConfig != "" {
+		config += "\n" + h.extraConfig
+	}
 
 	return os.WriteFile(configPath, []byte(config), 0o600)
 }
