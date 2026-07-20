@@ -107,6 +107,11 @@ type Config struct {
 	// Example: "localhost:4317"
 	OtlpEndpoint string `yaml:"otlp_endpoint"`
 
+	// TTLTickInterval is how often the leader proposes a tick command to advance
+	// the FSM's virtual clock and sweep expired keys (#207). Default: 1s.
+	// Set to 0 to disable TTL expiry (no tick loop is started).
+	TTLTickInterval time.Duration `yaml:"ttl_tick_interval"`
+
 	// PerIPRateLimitRPS caps write requests per second per client IP.
 	// Zero uses the default of 50 RPS.
 	PerIPRateLimitRPS int `yaml:"per_ip_rate_limit_rps"`
@@ -338,6 +343,7 @@ type Server struct {
 	watchMgr        *fsm.WatchManager // SSE event fan-out
 	watchCtxCancel  context.CancelFunc
 	sweepCancel     context.CancelFunc // cancels sweepPerIPLimiters goroutine on shutdown
+	tickCancel      context.CancelFunc // cancels leaderTickLoop goroutine on shutdown (#207)
 	limiter         *writeLimiter      // global token-bucket rate limiter
 	perIPLimiters   sync.Map           // map[string]*writeLimiter — per client-IP limiters
 	watchCount      int64              // current number of open /v1/watch SSE streams (atomic)
@@ -996,10 +1002,43 @@ func (s *Server) metricsHandler() http.HandlerFunc {
 	return s.handleMetrics
 }
 
+// leaderTickLoop periodically proposes a committed tick command (#207) so the
+// FSM's virtual clock advances even when no client writes are occurring, which
+// triggers sweeps of expired TTL keys on all replicas. Only the leader proposes
+// ticks; followers detect leadership via State() and skip. The loop exits when
+// ctx is canceled (Shutdown).
+func (s *Server) leaderTickLoop(ctx context.Context) {
+	interval := s.config.TTLTickInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if s.raftNode.State() != raft.StateLeader {
+				continue
+			}
+			cmd := fsm.EncodeTick(time.Now().UnixMilli())
+			tCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			_, _ = s.raftNode.Apply(tCtx, cmd) // best-effort; log errors if needed
+			cancel()
+		}
+	}
+}
+
 func (s *Server) Start() error {
 	if err := s.raftNode.Start(); err != nil {
 		return err
 	}
+
+	// #207: start the leader tick loop so TTL sweeps happen even without writes.
+	tickCtx, tickCancel := context.WithCancel(context.Background())
+	s.tickCancel = tickCancel
+	go s.leaderTickLoop(tickCtx)
 
 	// Validate HTTPS config: both cert and key must be set together.
 	if (s.config.HTTPSCert != "") != (s.config.HTTPSKey != "") {
@@ -1081,6 +1120,11 @@ func (s *Server) Shutdown() {
 	// Stop the per-IP limiter sweep goroutine.
 	if s.sweepCancel != nil {
 		s.sweepCancel()
+	}
+
+	// Stop the leader TTL tick loop (#207).
+	if s.tickCancel != nil {
+		s.tickCancel()
 	}
 
 	// Graceful leader transfer: hand off leadership before shutting down so
@@ -1948,15 +1992,24 @@ func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string)
 	// valid JSON. Only when Content-Type is application/json do we decode a
 	// {"value":"..."} envelope; otherwise the body is the raw value.
 	value := string(body)
+	var ttlSeconds int64
 	if isJSONContentType(r.Header.Get("Content-Type")) {
 		var jsonBody struct {
-			Value string `json:"value"`
+			Value      string `json:"value"`
+			TTLSeconds int64  `json:"ttl_seconds,omitempty"` // #207
 		}
 		if err := json.Unmarshal(body, &jsonBody); err != nil {
 			s.writeGenericError(w, http.StatusBadRequest, "invalid JSON body", err)
 			return
 		}
 		value = jsonBody.Value
+		ttlSeconds = jsonBody.TTLSeconds
+	}
+	// Also accept ?ttl_seconds=N query parameter (#207).
+	if qs := r.URL.Query().Get("ttl_seconds"); qs != "" && ttlSeconds == 0 {
+		if n, e := strconv.ParseInt(qs, 10, 64); e == nil && n > 0 {
+			ttlSeconds = n
+		}
 	}
 
 	// L8: enforce key/value size limits.
@@ -1971,8 +2024,12 @@ func (s *Server) handleV1Put(w http.ResponseWriter, r *http.Request, key string)
 		return
 	}
 
+	// #207: encode TTL when requested; stamp LeaderTimestampMs at proposal time.
 	var data []byte
-	if clientID != "" && seqNum > 0 {
+	if ttlSeconds > 0 {
+		leaderTsMs := time.Now().UnixMilli()
+		data, err = fsm.EncodeCommandWithTTL("put", key, value, clientID, seqNum, leaderTsMs, ttlSeconds)
+	} else if clientID != "" && seqNum > 0 {
 		data, err = fsm.EncodeCommandWithID("put", key, value, clientID, seqNum)
 	} else {
 		data, err = fsm.EncodeCommand("put", key, value)
