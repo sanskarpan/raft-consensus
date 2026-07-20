@@ -1057,7 +1057,7 @@ func (r *raft) replicateTo(serverID ServerID) {
 //
 // #200.3/#200.4: before sending, the inflight window is checked. In stateProbe
 // the window cap is effectively 1 (at most one batch in flight). In stateReplicate
-// the full MaxInflight cap is honoured. If the window is full we return false to
+// the full MaxInflight cap is honored. If the window is full we return false to
 // let the replicateTo loop yield until an ack arrives.
 func (r *raft) replicateOnce(serverID ServerID) bool {
 	r.mu.RLock()
@@ -1067,7 +1067,7 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 	}
 
 	// #200.3/#200.4: enforce the per-follower flow-control window.
-	// inflightWindows is initialised in becomeLeader() for every known follower.
+	// inflightWindows is initialized in becomeLeader() for every known follower.
 	// If the window is absent (e.g. during test set-up that bypasses becomeLeader)
 	// we skip flow-control for this iteration so replication still makes progress.
 	win := r.inflightWindows[serverID]
@@ -1125,7 +1125,7 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 		}
 	}
 
-	// #200.1: collect at most maxBatch entries, but also honour MaxSizePerMsg.
+	// #200.1: collect at most maxBatch entries, but also honor MaxSizePerMsg.
 	// At least one entry is always included to avoid starvation on oversized entries.
 	const maxBatch = 100
 	var entries []*LogEntry
