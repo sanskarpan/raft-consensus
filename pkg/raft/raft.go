@@ -95,6 +95,16 @@ type raft struct {
 	// heartbeat tick. Access is guarded by r.mu.
 	inflightReplication map[ServerID]bool
 
+	// inflightWindows tracks the per-follower flow-control window: how many
+	// AppendEntries batches have been sent but not yet acknowledged. Bounded by
+	// config.MaxInflight. Guarded by r.mu.
+	inflightWindows map[ServerID]*inflightWindow
+
+	// followerStates implements the Probe/Replicate state machine per follower.
+	// stateProbe: send one batch at a time (initial or after rejection).
+	// stateReplicate: pipeline up to MaxInflight batches. Guarded by r.mu.
+	followerStates map[ServerID]followerState
+
 	// heartbeatAcks records the last time each follower acknowledged an
 	// AppendEntries RPC at the current term.  Used to compute leader-lease
 	// validity for ReadIndex.
@@ -168,6 +178,18 @@ type raft struct {
 	applyWaitCh    chan struct{}
 	appliedForWait uint64
 }
+
+// followerState is the per-follower replication mode for pipelining (#200.4).
+type followerState uint8
+
+const (
+	// stateProbe means we send at most one batch in-flight at a time while
+	// discovering the follower's log position (initial state or after rejection).
+	stateProbe followerState = iota
+	// stateReplicate means we may pipeline up to MaxInflight batches before
+	// waiting for acknowledgement (entered after first successful replication).
+	stateReplicate
+)
 
 type leadershipTransfer struct {
 	target   ServerID
@@ -254,6 +276,8 @@ func newRaft(config *Config, localID ServerID, log LogStore, stable StableStore,
 		nextIndex:           make(map[ServerID]uint64),
 		matchIndex:          make(map[ServerID]uint64),
 		inflightReplication: make(map[ServerID]bool),
+		inflightWindows:     make(map[ServerID]*inflightWindow),
+		followerStates:      make(map[ServerID]followerState),
 		heartbeatAcks:       make(map[ServerID]time.Time),
 
 		proposalCh:       make(chan *proposalFuture, 256),
@@ -930,6 +954,8 @@ func (r *raft) becomeLeader() {
 	// (including learners so they receive log entries and can catch up).
 	r.nextIndex = make(map[ServerID]uint64)
 	r.matchIndex = make(map[ServerID]uint64)
+	r.inflightWindows = make(map[ServerID]*inflightWindow)
+	r.followerStates = make(map[ServerID]followerState)
 
 	allServers := r.configuration.Servers
 	if r.jointConfig != nil {
@@ -939,6 +965,8 @@ func (r *raft) becomeLeader() {
 		if server.ID != r.localID {
 			r.nextIndex[server.ID] = r.lastIndex + 1
 			r.matchIndex[server.ID] = 0
+			r.inflightWindows[server.ID] = newInflightWindow(r.config.MaxInflight)
+			r.followerStates[server.ID] = stateProbe
 		}
 	}
 
@@ -1025,12 +1053,32 @@ func (r *raft) replicateTo(serverID ServerID) {
 // again — i.e. the follower is still behind after a successful batch, a
 // rejection was recorded (retry from the backed-off nextIndex), or a snapshot
 // was streamed — and false when the follower is caught up, we are no longer the
-// leader for this request's term, or the RPC failed.
+// leader for this request's term, the RPC failed, or the inflight window is full.
+//
+// #200.3/#200.4: before sending, the inflight window is checked. In stateProbe
+// the window cap is effectively 1 (at most one batch in flight). In stateReplicate
+// the full MaxInflight cap is honoured. If the window is full we return false to
+// let the replicateTo loop yield until an ack arrives.
 func (r *raft) replicateOnce(serverID ServerID) bool {
 	r.mu.RLock()
 	if r.state != StateLeader {
 		r.mu.RUnlock()
 		return false
+	}
+
+	// #200.3/#200.4: enforce the per-follower flow-control window.
+	// inflightWindows is initialised in becomeLeader() for every known follower.
+	// If the window is absent (e.g. during test set-up that bypasses becomeLeader)
+	// we skip flow-control for this iteration so replication still makes progress.
+	win := r.inflightWindows[serverID]
+	if win != nil {
+		fstate := r.followerStates[serverID]
+		// In probe mode treat the window cap as 1 (one batch in-flight at a time).
+		windowFull := win.full() || (fstate == stateProbe && win.count() >= 1)
+		if windowFull {
+			r.mu.RUnlock()
+			return false
+		}
 	}
 
 	nextIdx, ok := r.nextIndex[serverID]
@@ -1045,6 +1093,13 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 	firstIdx, _ := r.log.FirstIndex()
 	if firstIdx > 0 && nextIdx < firstIdx {
 		r.mu.RUnlock()
+		// Reset the window on snapshot: we are starting fresh.
+		r.mu.Lock()
+		if w := r.inflightWindows[serverID]; w != nil {
+			w.reset()
+		}
+		r.followerStates[serverID] = stateProbe
+		r.mu.Unlock()
 		r.sendSnapshotTo(serverID)
 		return true // continue replicating post-snapshot entries
 	}
@@ -1059,20 +1114,35 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 			// C-A1: the prevLog entry itself was compacted; we cannot prove log
 			// consistency via AppendEntries. Fall back to a snapshot.
 			r.mu.RUnlock()
+			r.mu.Lock()
+			if w := r.inflightWindows[serverID]; w != nil {
+				w.reset()
+			}
+			r.followerStates[serverID] = stateProbe
+			r.mu.Unlock()
 			r.sendSnapshotTo(serverID)
 			return true
 		}
 	}
 
-	// Collect at most maxBatch entries.
+	// #200.1: collect at most maxBatch entries, but also honour MaxSizePerMsg.
+	// At least one entry is always included to avoid starvation on oversized entries.
 	const maxBatch = 100
 	var entries []*LogEntry
+	var totalBytes uint64
+	maxSize := r.config.MaxSizePerMsg
 	for idx := nextIdx; idx <= r.lastIndex && len(entries) < maxBatch; idx++ {
 		entry, err := r.log.Get(idx)
 		if err != nil {
 			break
 		}
+		entrySize := uint64(len(entry.Data))
+		// Always include the first entry (no starvation on large entries).
+		if len(entries) > 0 && totalBytes+entrySize > maxSize {
+			break
+		}
 		entries = append(entries, entry)
+		totalBytes += entrySize
 	}
 
 	// H2: capture the term this request is being sent under so that, after the
@@ -1086,6 +1156,18 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: r.commitIndex,
+	}
+
+	// #200.3: record this batch in the inflight window before releasing the lock.
+	// For heartbeats (no entries) we skip the window add since there is nothing
+	// to ack from a flow-control perspective. win may be nil for tests that
+	// bypass becomeLeader(); guard before calling methods on it.
+	var lastSentIdx uint64
+	if len(entries) > 0 {
+		lastSentIdx = entries[len(entries)-1].Index
+		if win != nil {
+			win.add(lastSentIdx)
+		}
 	}
 	r.mu.RUnlock()
 
@@ -1106,6 +1188,15 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 			zap.String("target", serverID.String()),
 			zap.Error(err),
 		)
+		// On transport error reset window so the next attempt starts clean.
+		if lastSentIdx > 0 {
+			r.mu.Lock()
+			if w := r.inflightWindows[serverID]; w != nil {
+				w.reset()
+			}
+			r.followerStates[serverID] = stateProbe
+			r.mu.Unlock()
+		}
 		return false // transport error: stop draining, retry on the next tick
 	}
 	metrics.RecordAppendEntriesSent(serverID.String(), resp.Success)
@@ -1148,11 +1239,20 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 		r.heartbeatAcks[serverID] = time.Now()
 
 		if len(entries) > 0 {
-			lastSent := entries[len(entries)-1].Index
-			if lastSent > r.matchIndex[serverID] {
-				r.matchIndex[serverID] = lastSent
+			if lastSentIdx > r.matchIndex[serverID] {
+				r.matchIndex[serverID] = lastSentIdx
 			}
 			r.nextIndex[serverID] = r.matchIndex[serverID] + 1
+
+			// #200.3: ack the window up to the acknowledged matchIndex.
+			if w := r.inflightWindows[serverID]; w != nil {
+				w.ack(r.matchIndex[serverID])
+			}
+
+			// #200.4: transition to stateReplicate on first successful ack.
+			if r.followerStates[serverID] == stateProbe {
+				r.followerStates[serverID] = stateReplicate
+			}
 		}
 		// C-O1: report replication lag (leader lastIndex - follower matchIndex).
 		if r.lastIndex >= r.matchIndex[serverID] {
@@ -1164,6 +1264,12 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 	} else {
 		// Follower rejected. Back off nextIndex, using the conflict term for a
 		// fast term-skip when available (M7), otherwise the conflict index hint.
+		// #200.3/#200.4: reset window and revert to probe mode on rejection.
+		if w := r.inflightWindows[serverID]; w != nil {
+			w.reset()
+		}
+		r.followerStates[serverID] = stateProbe
+
 		next := r.nextIndex[serverID]
 		if resp.ConflictTerm > 0 {
 			if last := r.lastIndexOfTerm(resp.ConflictTerm); last > 0 {
@@ -1730,6 +1836,8 @@ func (r *raft) applyConfigurationEntry(entry *LogEntry) {
 					if _, ok := r.nextIndex[server.ID]; !ok {
 						r.nextIndex[server.ID] = r.lastIndex + 1
 						r.matchIndex[server.ID] = 0
+						r.inflightWindows[server.ID] = newInflightWindow(r.config.MaxInflight)
+						r.followerStates[server.ID] = stateProbe
 					}
 				}
 			}
@@ -1823,6 +1931,8 @@ func (r *raft) applyConfigurationEntry(entry *LogEntry) {
 				if _, ok := r.nextIndex[server.ID]; !ok {
 					r.nextIndex[server.ID] = r.lastIndex + 1
 					r.matchIndex[server.ID] = 0
+					r.inflightWindows[server.ID] = newInflightWindow(r.config.MaxInflight)
+					r.followerStates[server.ID] = stateProbe
 				}
 			}
 		}
