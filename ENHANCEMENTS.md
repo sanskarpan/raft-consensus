@@ -110,9 +110,9 @@ fatal-halt on storage/FSM panic, log compaction.
 |---|---|---|---|---|
 | ✅ CheckQuorum (step down on lost quorum) | H | M | **Shipped (#198).** Leader steps down if < quorum voters acked within an election timeout. Opt-in via `Config.CheckQuorum`. | `tickLeader`, `heartbeatAcks` |
 | ✅ Disruptive-server vote rejection (real path) | H | S | **Shipped (#199).** §4.2.3 guard gated on CheckQuorum; bypassed by a `LeaderTransfer` flag. | `handleRequestVote` |
-| True inflight/flow-control window | M | M | `MaxInflight` only sizes the pending-future cap; actual AppendEntries has no per-follower unacked-entry cap, so a fast leader can flood a slow follower. | `replicateOnce`, `nextIndex`/`matchIndex` |
-| AppendEntries pipelining | M | M | Replication is strictly request→response→next; no multiple in-flight batches per follower, capping throughput at batch/RTT. | `replicateTo`/`replicateOnce` |
-| Honor `MaxSizePerMsg` in batching | M | S | Batching is by entry count (100), ignoring byte size — large entries make oversized RPCs; tiny entries under-fill. | `replicateOnce` |
+| ✅ True inflight/flow-control window | M | M | **Shipped (#200).** Per-follower `inflightWindow` ring-buffer (cap = `MaxInflight`); leader tracks unacked batches and pauses when window is full. | `inflight.go`, `replicateOnce`, `inflightWindows` |
+| ✅ AppendEntries pipelining | M | M | **Shipped (#200).** Probe/Replicate state machine per follower: starts in `stateProbe` (1 batch in-flight), transitions to `stateReplicate` (up to `MaxInflight`) on first ack; reverts to probe on rejection. | `followerStates`, `replicateOnce` |
+| ✅ Honor `MaxSizePerMsg` in batching | M | S | **Shipped (#200).** Entry-batching loop now accumulates byte sizes; breaks when adding the next entry would exceed `MaxSizePerMsg` (first entry always included to prevent starvation). | `replicateOnce` |
 | Proposal forwarding to leader | M | M | `DisableProposalForwarding` config exists but no forwarding is implemented; follower `Apply` always returns `ErrNotLeader`. | `Apply`; transport propose RPC |
 | Lease-based ReadIndex fast path | M | M | `ReadIndex` always costs a heartbeat round-trip; an opt-in clock-lease read serves with zero round-trips when clocks are trusted. | `ReadIndex` |
 | Batched/queued ReadIndex | M | M | Each `ReadIndex` triggers its own heartbeat; batch pending reads behind one confirmation round (etcd readIndexQueue). | `ReadIndex`, `triggerHeartbeat` |
