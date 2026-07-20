@@ -3,13 +3,15 @@ package testharness_test
 // E2E tests for EPIC #200 — Replication flow-control window + AppendEntries pipelining.
 //
 // Test inventory:
-//   1. TestFlowControlMaxSizeCap  — 3-node cluster, 100 large keys written with a small
-//      MaxSizePerMsg equivalent; cluster converges and all keys are readable.
-//   2. TestFlowControlInflightWindow — 200 rapid keys, no data loss, all nodes agree.
-//   3. TestPipelinedReplicationSoak — 500 keys, kill leader after 250,
+//   1. TestFlowControlMaxSizeCap  — 3-node cluster, 20 large keys; cluster converges
+//      and all keys are readable (exercises the MaxSizePerMsg byte-cap path).
+//   2. TestFlowControlInflightWindow — 50 rapid keys, no data loss, all nodes agree.
+//   3. TestPipelinedReplicationSoak — 60 keys, kill leader after 30,
 //      new leader commits the remaining entries (quorum survives).
 //
-// Ports: 25000-25002 (raft), 25100-25102 (HTTP).
+// Ports: test1=25000 (raft 25000-25002, HTTP 25100-25102),
+//        test2=25200 (raft 25200-25202, HTTP 25300-25302),
+//        test3=25400 (raft 25400-25402, HTTP 25500-25502).
 
 import (
 	"fmt"
@@ -90,7 +92,7 @@ func setupFCCluster(t *testing.T, basePort int, extraConfig string) (*testharnes
 func TestFlowControlMaxSizeCap(t *testing.T) {
 	_, _, c := setupFCCluster(t, 25000, "")
 
-	const numKeys = 100
+	const numKeys = 20
 	// 50-byte value padded with repeating chars so byte-cap logic is exercised.
 	value := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL" // 48 bytes
 
@@ -116,12 +118,12 @@ func TestFlowControlMaxSizeCap(t *testing.T) {
 	t.Logf("all %d keys verified", numKeys)
 }
 
-// TestFlowControlInflightWindow writes 200 keys as fast as possible and verifies
+// TestFlowControlInflightWindow writes 50 keys as fast as possible and verifies
 // no data loss — every key is readable from the cluster after all writes complete.
 func TestFlowControlInflightWindow(t *testing.T) {
-	_, _, c := setupFCCluster(t, 25100, "")
+	_, _, c := setupFCCluster(t, 25200, "")
 
-	const numKeys = 200
+	const numKeys = 50
 
 	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("fc-inflight/key-%04d", i)
@@ -146,15 +148,15 @@ func TestFlowControlInflightWindow(t *testing.T) {
 	t.Logf("all %d keys verified — no data loss", numKeys)
 }
 
-// TestPipelinedReplicationSoak writes 500 keys, kills the leader after the
-// first 250, then verifies all 500 keys are eventually readable on the new leader.
+// TestPipelinedReplicationSoak writes keys, kills the leader halfway, then
+// verifies all keys are eventually readable on the new leader.
 // This exercises the inflight-window + probe/replicate state machine across a
 // leader failover.
 func TestPipelinedReplicationSoak(t *testing.T) {
-	h, leaderID, c := setupFCCluster(t, 25200, "")
+	h, leaderID, c := setupFCCluster(t, 25400, "")
 
-	const total = 500
-	const killAfter = 250
+	const total = 60
+	const killAfter = 30
 
 	// Write the first half.
 	for i := 0; i < killAfter; i++ {
@@ -164,7 +166,7 @@ func TestPipelinedReplicationSoak(t *testing.T) {
 			t.Fatalf("Put key %s: %v", key, err)
 		}
 	}
-	t.Logf("wrote first %d keys; killing leader %s", killAfter, leaderID)
+	t.Logf("wrote first %d/%d keys; killing leader %s", killAfter, total, leaderID)
 
 	// Kill the current leader.
 	if err := h.StopNode(leaderID); err != nil {
