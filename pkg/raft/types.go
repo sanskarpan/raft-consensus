@@ -303,6 +303,15 @@ type Config struct {
 	// log replication from the leader.
 	StartAsLearner bool
 
+	// Clock overrides the wall clock used for time.Now() calls inside the raft
+	// core. nil → realClock (the real wall clock). Inject a simClock for
+	// deterministic simulation tests.
+	Clock Clock
+
+	// NewTicker overrides time.NewTicker. nil → newRealTicker.
+	// Inject a simClock.NewTicker for deterministic simulation tests.
+	NewTicker func(d time.Duration) Ticker
+
 	// lastWarning holds a non-fatal advisory produced by the most recent
 	// Validate call (L7). Exposed via LastValidateWarning.
 	lastWarning string

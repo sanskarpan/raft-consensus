@@ -49,8 +49,9 @@ CI-green PR merged to `main`):
 | Golden-file tests + codecov + benchstat | #239 / #219 |
 | Publish + sign container images in CI/CD | #240 / #217 |
 | TTL/lease-based key expiry (deterministic apply-time clock, binary codec, tick sweep, E2E) | — / #207 |
+| Deterministic Simulation (DES) harness (#220): Clock/Ticker interfaces + realClock pass-through; simClock/simTicker; simNetwork with partition/heal; 3 deterministic scenario tests | — / #220 |
 
-**Status (2026-07-20):** 31 roadmap issues resolved + all 6 verify-first items. EPIC #207 (TTL/lease expiry) complete: deterministic apply-time clock, backward-compat binary codec, committed tick sweep, snapshot versioning, leader tick loop, HTTP/client/kvctl TTL API, 4-test E2E suite. **8 enhancement EPICs remain open.** `main` is green; 0 open bugs.
+**Status (2026-07-20):** 32 roadmap issues resolved + all 6 verify-first items. EPIC #220 (DES harness) complete: injectable Clock/Ticker abstractions; simClock manually-advanceable deterministic clock; simNetwork deterministic in-process transport with bidirectional partition injection; 5 subtasks, 15 new tests covering election, partition recovery, and reproducibility. **7 enhancement EPICs remain open.** `main` is green; 0 open bugs.
 
 ---
 
