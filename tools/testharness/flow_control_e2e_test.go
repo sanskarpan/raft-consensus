@@ -179,11 +179,23 @@ func TestPipelinedReplicationSoak(t *testing.T) {
 	t.Logf("new leader elected: %s", newLeaderID)
 
 	// Write the second half to the surviving cluster.
+	// Retry each write for up to 30 s to tolerate the election settling period.
 	for i := killAfter; i < total; i++ {
 		key := fmt.Sprintf("fc-soak/key-%04d", i)
 		val := fmt.Sprintf("value-%04d", i)
-		if _, err := c.Put(key, val); err != nil {
-			t.Fatalf("Put key %s after leader failover: %v", key, err)
+		var lastErr error
+		writeDeadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(writeDeadline) {
+			if _, err := c.Put(key, val); err == nil {
+				lastErr = nil
+				break
+			} else {
+				lastErr = err
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if lastErr != nil {
+			t.Fatalf("Put key %s after leader failover (gave up after 30s): %v", key, lastErr)
 		}
 	}
 	t.Logf("wrote second %d keys; verifying all %d keys", total-killAfter, total)
