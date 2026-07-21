@@ -50,7 +50,7 @@ func main() {
 	revision := flag.Int64("revision", 0, "start watch/history from this revision")
 	limit := flag.Int("limit", 0, "page size for range (auto-pages through all results when > 0)")
 	ttl := flag.Int64("ttl", 0, "TTL in seconds for put (0 = no expiry)")
-	leader := flag.String("leader", "", "leader HTTP address for backup/restore (e.g. localhost:8002)")
+	leader := flag.String("leader", "", "leader HTTP address for backup/restore (e.g. localhost:8012)")
 
 	flag.Usage = usage
 	flag.Parse()

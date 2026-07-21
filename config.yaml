@@ -1,12 +1,12 @@
 node_id: node1
-listen_addr: :8001
+listen_addr: :8011
 data_dir: ./data
 election_tick: 10
 heartbeat_tick: 1
 cluster:
   - id: node1
-    address: localhost:8001
+    address: localhost:8011
   - id: node2
-    address: localhost:8002
+    address: localhost:8013
   - id: node3
-    address: localhost:8003
+    address: localhost:8015

@@ -21,7 +21,7 @@ import (
 	"github.com/anishathalye/porcupine"
 )
 
-var endpoints = []string{"localhost:8002", "localhost:8004", "localhost:8006"}
+var endpoints = []string{"localhost:8012", "localhost:8014", "localhost:8016"}
 var nodes = []string{"raft-node1", "raft-node2", "raft-node3"}
 var keys = []string{"lin-a", "lin-b", "lin-c"}
 
