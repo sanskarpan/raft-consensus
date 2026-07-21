@@ -41,7 +41,11 @@ func startMinIO(t *testing.T) (endpoint, accessKey, secretKey string, cleanup fu
 	host, _ := container.Host(ctx)
 	port, _ := container.MappedPort(ctx, "9000")
 	ep := fmt.Sprintf("%s:%s", host, port.Port())
-	cleanup = func() { container.Terminate(ctx) } //nolint:errcheck
+	cleanup = func() {
+		if err := container.Terminate(ctx); err != nil {
+			t.Logf("failed to terminate MinIO container: %v", err)
+		}
+	}
 	return ep, "minioadmin", "minioadmin", cleanup
 }
 

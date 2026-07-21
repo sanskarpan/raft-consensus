@@ -607,6 +607,7 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 			Region:    config.BackupMinIO.Region,
 			Prefix:    config.BackupMinIO.Prefix,
 			Compress:  config.BackupMinIO.Compress,
+			NodeID:    config.NodeID,
 		}, logger)
 		if uploaderErr != nil {
 			return nil, fmt.Errorf("MinIO uploader init: %w", uploaderErr)

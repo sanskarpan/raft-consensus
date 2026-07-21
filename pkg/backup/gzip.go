@@ -47,10 +47,15 @@ func (c *compressReader) Read(p []byte) (int, error) {
 }
 
 func (c *compressReader) Close() error {
-	// Drain errCh if background goroutine already finished; don't block.
-	select {
-	case <-c.errCh:
-	default:
+	// Signal the background goroutine to stop writing by closing the write end.
+	c.pw.CloseWithError(io.ErrClosedPipe)
+	// Wait for the goroutine to finish and collect its error.
+	bgErr := <-c.errCh
+	// Close the read end.
+	prErr := c.pr.Close()
+	// Return the background error only if it's not the expected "pipe closed" signal.
+	if bgErr != nil && bgErr != io.ErrClosedPipe {
+		return bgErr
 	}
-	return c.pr.Close()
+	return prErr
 }

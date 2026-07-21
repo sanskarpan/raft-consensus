@@ -27,6 +27,7 @@ type MinIOConfig struct {
 	Region    string // optional; used for AWS S3
 	Prefix    string // optional key prefix for all objects
 	Compress  bool   // gzip-compress uploads (recommended)
+	NodeID    string // optional; recorded in manifest for provenance
 	Retry     RetryConfig
 }
 
@@ -149,7 +150,10 @@ func (u *MinIOUploader) doUpload(ctx context.Context, name string, raw []byte) e
 		SHA256:     digest,
 		SizeBytes:  n,
 		Compressed: compressed,
+		NodeID:     u.cfg.NodeID,
 		CreatedAt:  time.Now().UnixMilli(),
+		// SnapshotIdx and SnapshotTerm are not available at Upload() time;
+		// callers that need provenance should set them on the Manifest directly.
 	}
 
 	// Upload data object. Pass exact size so MinIO doesn't need to buffer again.
@@ -201,15 +205,21 @@ func (u *MinIOUploader) doDownload(ctx context.Context, name string) (io.ReadClo
 	dataKey := u.objectKey(name)
 	manifestKey := dataKey + ".manifest.json"
 
-	// Fetch manifest.
-	mObj, err := u.client.GetObject(ctx, u.cfg.Bucket, manifestKey, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("GetObject manifest %q: %w", manifestKey, err)
-	}
-	manifestData, err := io.ReadAll(mObj)
-	mObj.Close()
-	if err != nil {
-		return nil, fmt.Errorf("reading manifest: %w", err)
+	// Fetch manifest with retry.
+	var manifestData []byte
+	if retryErr := u.cfg.Retry.Do(ctx, func() error {
+		mObj, err := u.client.GetObject(ctx, u.cfg.Bucket, manifestKey, minio.GetObjectOptions{})
+		if err != nil {
+			return fmt.Errorf("GetObject manifest %q: %w", manifestKey, err)
+		}
+		defer mObj.Close()
+		manifestData, err = io.ReadAll(mObj)
+		if err != nil {
+			return fmt.Errorf("reading manifest %q: %w", manifestKey, err)
+		}
+		return nil
+	}); retryErr != nil {
+		return nil, retryErr
 	}
 	var manifest Manifest
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {

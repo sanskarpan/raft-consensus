@@ -27,12 +27,18 @@ var (
 	})
 )
 
+func mustRegister(c prometheus.Collector) {
+	if err := prometheus.DefaultRegisterer.Register(c); err != nil {
+		if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
+			panic(err)
+		}
+	}
+}
+
 func init() {
-	prometheus.MustRegister(
-		uploadDuration,
-		uploadBytes,
-		uploadErrors,
-		downloadDuration,
-		restoreErrors,
-	)
+	mustRegister(uploadDuration)
+	mustRegister(uploadBytes)
+	mustRegister(uploadErrors)
+	mustRegister(downloadDuration)
+	mustRegister(restoreErrors)
 }

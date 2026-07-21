@@ -61,10 +61,10 @@ func (rc RetryConfig) Do(ctx context.Context, fn func() error) error {
 	wait := rc.initialWait()
 	maxW := rc.maxWait()
 	mult := rc.multiplier()
-	max := rc.maxAttempts()
+	maxAttempts := rc.maxAttempts()
 
 	var lastErr error
-	for attempt := 0; attempt < max; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -78,14 +78,16 @@ func (rc RetryConfig) Do(ctx context.Context, fn func() error) error {
 			return lastErr
 		}
 		// Last attempt: don't sleep, just return.
-		if attempt == max-1 {
+		if attempt == maxAttempts-1 {
 			break
 		}
 		// Wait with context cancellation support.
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(wait):
+		case <-timer.C:
 		}
 		// Advance backoff.
 		next := time.Duration(float64(wait) * mult)
