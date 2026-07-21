@@ -30,6 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -49,6 +50,7 @@ func main() {
 	revision := flag.Int64("revision", 0, "start watch/history from this revision")
 	limit := flag.Int("limit", 0, "page size for range (auto-pages through all results when > 0)")
 	ttl := flag.Int64("ttl", 0, "TTL in seconds for put (0 = no expiry)")
+	leader := flag.String("leader", "", "leader HTTP address for backup/restore (e.g. localhost:8002)")
 
 	flag.Usage = usage
 	flag.Parse()
@@ -124,6 +126,19 @@ func main() {
 	case "status":
 		runStatus(c)
 
+	case "backup":
+		dst := ""
+		if len(cmdArgs) >= 1 {
+			dst = cmdArgs[0]
+		}
+		runBackup(*leader, dst)
+
+	case "restore":
+		if len(cmdArgs) < 1 {
+			fatalf("restore requires <file>\n")
+		}
+		runRestore(*leader, cmdArgs[0])
+
 	default:
 		fatalf("unknown command %q\n", cmd)
 	}
@@ -144,6 +159,8 @@ Commands:
   txn    [file|-]          Execute a transaction from JSON file or stdin
   watch  <key>             Stream change events (--prefix for prefix watch, --revision=N to replay)
   status                   Print cluster status and revision
+  backup [output-file]     Download a snapshot from the leader (requires --leader)
+  restore <file>           Restore a snapshot to the leader (requires --leader)
 
 Flags:
 `)
@@ -312,4 +329,62 @@ func runStatus(c *client.Client) {
 		fatalf("status failed: %v\n", err)
 	}
 	fmt.Println(prettyJSON(info))
+}
+
+// runBackup downloads a snapshot from the leader and saves it to dst.
+// If dst is empty, a timestamped filename is generated automatically.
+func runBackup(leaderAddr, dst string) {
+	if leaderAddr == "" {
+		fatalf("backup requires --leader=<addr>\n")
+	}
+	if dst == "" {
+		dst = fmt.Sprintf("backup-%d.snap", time.Now().Unix())
+	}
+	hc := &http.Client{Timeout: 60 * time.Second}
+	resp, err := hc.Get(fmt.Sprintf("http://%s/admin/snapshot/download", leaderAddr))
+	if err != nil {
+		fatalf("backup GET failed: %v\n", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fatalf("backup: server returned %d: %s\n", resp.StatusCode, body)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		fatalf("create %s: %v\n", dst, err)
+	}
+	defer f.Close()
+	n, err := io.Copy(f, resp.Body)
+	if err != nil {
+		fatalf("write %s: %v\n", dst, err)
+	}
+	fmt.Printf("backup saved to %s (%d bytes)\n", dst, n)
+}
+
+// runRestore uploads a local snapshot file to the leader via PUT /admin/restore.
+func runRestore(leaderAddr, path string) {
+	if leaderAddr == "" {
+		fatalf("restore requires --leader=<addr>\n")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		fatalf("open %s: %v\n", path, err)
+	}
+	defer f.Close()
+	hc := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequest(http.MethodPut, fmt.Sprintf("http://%s/admin/restore", leaderAddr), f)
+	if err != nil {
+		fatalf("build request: %v\n", err)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		fatalf("restore PUT failed: %v\n", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		fatalf("restore: server returned %d: %s\n", resp.StatusCode, body)
+	}
+	fmt.Println("restore complete")
 }

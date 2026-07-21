@@ -1,0 +1,6 @@
+apiVersion: v2
+name: raft-cluster
+description: Helm chart for the Raft consensus cluster
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
