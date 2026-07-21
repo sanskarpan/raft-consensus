@@ -34,7 +34,7 @@ type GCSConfig struct {
 	Compress bool
 	// NodeID is recorded in the manifest sidecar for provenance.
 	NodeID string
-	// Retry controls upload/download retry behaviour.
+	// Retry controls upload/download retry behavior.
 	Retry RetryConfig
 
 	// TestEndpoint is an internal field used only by integration tests to redirect
