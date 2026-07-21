@@ -145,7 +145,7 @@ type Config struct {
 	// Leave empty to trust no proxy (use RemoteAddr always).
 	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs"`
 
-	// BackupUploader selects the snapshot backup backend: "noop" (default) | "minio" | "s3".
+	// BackupUploader selects the snapshot backup backend: "noop" (default) | "minio" | "s3" | "gcs".
 	// "s3" is an alias for "minio" — the same MinIO SDK works for AWS S3.
 	BackupUploader string `yaml:"backup_uploader"`
 
@@ -171,6 +171,14 @@ type Config struct {
 	// e.g. "cluster.local". All peers must present SVIDs from this trust
 	// domain for mTLS to succeed.
 	SpiffeTrustDomain string `yaml:"spiffe_trust_domain"`
+
+	// BackupGCS configures the Google Cloud Storage backup backend when BackupUploader is "gcs".
+	BackupGCS struct {
+		Bucket          string `yaml:"bucket"`
+		Prefix          string `yaml:"prefix"`
+		CredentialsFile string `yaml:"credentials_file"`
+		Compress        bool   `yaml:"compress"`
+	} `yaml:"backup_gcs"`
 }
 
 type ClusterMember struct {
@@ -638,6 +646,22 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 			zap.String("endpoint", config.BackupMinIO.Endpoint),
 			zap.String("bucket", config.BackupMinIO.Bucket),
 		)
+	case "gcs":
+		uploaderCtx, uploaderCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer uploaderCancel()
+		var uploaderErr error
+		s.uploader, uploaderErr = backup.NewGCSUploader(uploaderCtx, backup.GCSConfig{
+			Bucket:          config.BackupGCS.Bucket,
+			Prefix:          config.BackupGCS.Prefix,
+			CredentialsFile: config.BackupGCS.CredentialsFile,
+			Compress:        config.BackupGCS.Compress,
+			NodeID:          config.NodeID,
+		}, logger)
+		if uploaderErr != nil {
+			return nil, fmt.Errorf("GCS uploader init: %w", uploaderErr)
+		}
+		logger.Info("GCS backup uploader initialized",
+			zap.String("bucket", config.BackupGCS.Bucket))
 	default:
 		s.uploader = &backup.NoOpUploader{Logger: logger}
 	}
