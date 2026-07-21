@@ -771,7 +771,10 @@ func (t *GrpcTransport) AddPeer(id raft.ServerID, addr raft.ServerAddress) error
 		// Wire SAN verification so a cert that merely chains to the cluster CA
 		// but has the wrong node identity is rejected (M-TLS4). Only active when
 		// the allowed-member set is configured (implying mTLS + explicit authz).
+		// SessionTicketsDisabled prevents resumed sessions from bypassing
+		// VerifyPeerCertificate (gosec G123).
 		if string(id) != "" && len(t.allowedMembers) > 0 {
+			peerTLS.SessionTicketsDisabled = true
 			peerTLS.VerifyPeerCertificate = verifySANForNodeID(string(id))
 		}
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(peerTLS)))
