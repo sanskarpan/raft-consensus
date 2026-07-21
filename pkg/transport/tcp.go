@@ -162,6 +162,10 @@ type tcpTransport struct {
 	// certificate identities (CN or DNS SAN) may drive the transport over TLS
 	// (H-S1). Empty/nil disables the check so plaintext/dev keeps working.
 	allowedMembers map[string]struct{}
+	// binaryTransport controls whether to attempt binary-framing negotiation on
+	// new outbound connections. true by default (NewTCPTransport); set false to
+	// force JSON framing (e.g. for legacy peers or testing).
+	binaryTransport bool
 }
 
 // SetAllowedMembers configures the set of verified peer certificate identities
@@ -253,6 +257,11 @@ type peer struct {
 	mu     sync.Mutex
 	idle   []net.Conn // ready connections available for checkout
 	closed bool       // set by RemovePeer/Close; no further checkouts
+
+	// Binary-framing negotiation state. Negotiated once per peer (on the first
+	// new connection); subsequent connections reuse the agreed mode.
+	binaryNegotiated bool
+	useBinary        bool
 }
 
 // checkoutConn returns a ready connection for an exchange, dialing a fresh one
@@ -274,7 +283,22 @@ func (t *tcpTransport) checkoutConn(ctx context.Context, p *peer) (net.Conn, err
 	p.mu.Unlock()
 
 	// Dial outside the lock so concurrent checkouts do not serialize on dialing.
-	return t.dialPeer(ctx, p)
+	conn, err := t.dialPeer(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+
+	// Every freshly-dialed connection must complete the binary negotiation handshake
+	// because the server's handleConn reads a 4-byte probe on every new connection.
+	// We run negotiateBinary unconditionally on fresh conns; the result is cached
+	// for logging/observability but the per-conn handshake is always required.
+	useBinary := t.negotiateBinary(conn)
+	p.mu.Lock()
+	p.binaryNegotiated = true
+	p.useBinary = useBinary
+	p.mu.Unlock()
+
+	return conn, nil
 }
 
 // releaseConn returns a healthy connection to the idle pool for reuse. If the
@@ -383,19 +407,27 @@ type MessageHandler interface {
 	HandleTimeoutNow(req *TimeoutNowReq) *TimeoutNowResp
 }
 
-func NewTCPTransport(listenAddr string, handler MessageHandler, timeout time.Duration, logger *zap.Logger) (*tcpTransport, error) {
-	return NewTCPTransportTLS(listenAddr, handler, timeout, logger, nil)
+// TCPTransportConfig holds all configuration for a TCP transport instance.
+type TCPTransportConfig struct {
+	// Timeout is the per-RPC dial and exchange deadline.
+	Timeout time.Duration
+	// Logger is used for transport-level logging.
+	Logger *zap.Logger
+	// TLS, when non-nil, enables mTLS on both server accept and peer dial paths.
+	TLS *tls.Config
+	// BinaryTransport, when true (the default for NewTCPTransport), causes the
+	// client to attempt binary-framing negotiation on each new connection.
+	// Servers that don't support it fall back to JSON automatically.
+	// Set to false to force JSON framing.
+	BinaryTransport bool
 }
 
-// NewTCPTransportTLS creates a TCP transport with optional TLS.
-// Pass a non-nil tlsCfg (from LoadTLSConfig) to enable encrypted inter-node
-// communication.  When tlsCfg is nil the transport falls back to plain TCP.
-func NewTCPTransportTLS(listenAddr string, handler MessageHandler, timeout time.Duration, logger *zap.Logger, tlsCfg *tls.Config) (*tcpTransport, error) {
+// NewTCPTransportWithConfig creates a TCP transport from a TCPTransportConfig.
+func NewTCPTransportWithConfig(listenAddr string, handler MessageHandler, cfg TCPTransportConfig) (*tcpTransport, error) {
 	var ln net.Listener
 	var err error
-
-	if tlsCfg != nil {
-		ln, err = tls.Listen("tcp", listenAddr, tlsCfg)
+	if cfg.TLS != nil {
+		ln, err = tls.Listen("tcp", listenAddr, cfg.TLS)
 	} else {
 		ln, err = net.Listen("tcp", listenAddr)
 	}
@@ -403,38 +435,49 @@ func NewTCPTransportTLS(listenAddr string, handler MessageHandler, timeout time.
 		return nil, err
 	}
 
-	// Build a client-side TLS config for dialing peers:
-	// use the same cert/CA as the server, but don't require client certs
-	// on the dial side (the server side will do that).
 	var clientTLS *tls.Config
-	if tlsCfg != nil {
-		clientTLS = tlsCfg.Clone()
-		clientTLS.ClientAuth = tls.NoClientCert // client-side dial config
-		// C11: the dial config must verify the server. LoadTLSConfig already
-		// pins MinVersion TLS 1.3 and populates RootCAs; ensure both survive
-		// the clone (Clone copies them) and that InsecureSkipVerify stays off.
+	if cfg.TLS != nil {
+		clientTLS = cfg.TLS.Clone()
+		clientTLS.ClientAuth = tls.NoClientCert
 		clientTLS.InsecureSkipVerify = false
 		if clientTLS.MinVersion == 0 {
 			clientTLS.MinVersion = tls.VersionTLS13
 		}
-		// ServerName is derived per-peer at dial time (serverNameFor); an
-		// explicit value set by the caller is preserved and takes precedence.
 	}
 
 	t := &tcpTransport{
-		peers:      make(map[raft.ServerID]*peer),
-		handler:    handler,
-		timeout:    timeout,
-		listener:   ln,
-		logger:     logger,
-		shutdownCh: make(chan struct{}),
-		tlsClient:  clientTLS,
+		peers:           make(map[raft.ServerID]*peer),
+		handler:         handler,
+		timeout:         cfg.Timeout,
+		listener:        ln,
+		logger:          cfg.Logger,
+		shutdownCh:      make(chan struct{}),
+		tlsClient:       clientTLS,
+		binaryTransport: cfg.BinaryTransport,
 	}
-
 	t.wg.Add(1)
 	go t.serve()
-
 	return t, nil
+}
+
+func NewTCPTransport(listenAddr string, handler MessageHandler, timeout time.Duration, logger *zap.Logger) (*tcpTransport, error) {
+	return NewTCPTransportWithConfig(listenAddr, handler, TCPTransportConfig{
+		Timeout:         timeout,
+		Logger:          logger,
+		BinaryTransport: true, // binary on by default
+	})
+}
+
+// NewTCPTransportTLS creates a TCP transport with optional TLS.
+// Pass a non-nil tlsCfg (from LoadTLSConfig) to enable encrypted inter-node
+// communication.  When tlsCfg is nil the transport falls back to plain TCP.
+func NewTCPTransportTLS(listenAddr string, handler MessageHandler, timeout time.Duration, logger *zap.Logger, tlsCfg *tls.Config) (*tcpTransport, error) {
+	return NewTCPTransportWithConfig(listenAddr, handler, TCPTransportConfig{
+		Timeout:         timeout,
+		Logger:          logger,
+		TLS:             tlsCfg,
+		BinaryTransport: true,
+	})
 }
 
 func (t *tcpTransport) SetLogger(logger *zap.Logger) {
@@ -531,6 +574,28 @@ const idleReadTimeout = 60 * time.Second
 // single response before the connection is closed (M5).
 const idleWriteTimeout = 30 * time.Second
 
+// negotiateBinary sends the binary magic probe on conn and reads the echo.
+// Returns true if the server echoed the probe (binary framing agreed).
+// Returns false on any error or mismatch (JSON fallback).
+func (t *tcpTransport) negotiateBinary(conn net.Conn) bool {
+	if !t.binaryTransport {
+		return false
+	}
+	// Short deadline: if the handshake doesn't complete quickly, fall back to JSON.
+	conn.SetDeadline(time.Now().Add(500 * time.Millisecond)) //nolint:errcheck
+	if _, err := conn.Write(binaryMagic[:]); err != nil {
+		conn.SetDeadline(time.Time{}) //nolint:errcheck
+		return false
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		conn.SetDeadline(time.Time{}) //nolint:errcheck
+		return false
+	}
+	conn.SetDeadline(time.Time{}) //nolint:errcheck
+	return [4]byte(echo) == binaryMagic
+}
+
 func (t *tcpTransport) handleConn(conn net.Conn) {
 	defer t.wg.Done()
 	defer conn.Close()
@@ -545,12 +610,33 @@ func (t *tcpTransport) handleConn(conn net.Conn) {
 		return
 	}
 
-	// C12: bound the bytes read for any single message so an unauthenticated
-	// peer cannot exhaust memory with an arbitrarily large JSON object. The
-	// limit is reset before each message; a message exceeding it fails to decode
-	// and the connection is closed.
+	// Peek at the first 4 bytes to determine framing mode.
+	conn.SetReadDeadline(time.Now().Add(idleReadTimeout)) //nolint:errcheck
+	probe := make([]byte, 4)
+	if _, err := io.ReadFull(conn, probe); err != nil {
+		return
+	}
+	conn.SetReadDeadline(time.Time{}) //nolint:errcheck
+
+	if [4]byte(probe) == binaryMagic {
+		// Echo magic and switch to binary framing.
+		if _, err := conn.Write(binaryMagic[:]); err != nil {
+			return
+		}
+		t.handleConnBinary(conn)
+		return
+	}
+
+	// JSON fallback: prepend consumed bytes back for the JSON decoder.
+	multi := io.MultiReader(bytes.NewReader(probe), conn)
+	t.handleConnJSON(conn, multi)
+}
+
+// handleConnJSON runs the JSON-framed RPC loop, reading from r (which may
+// include bytes that were already consumed for the framing probe).
+func (t *tcpTransport) handleConnJSON(conn net.Conn, r io.Reader) {
 	maxBytes := t.maxMsgBytes()
-	limited := &io.LimitedReader{R: conn, N: maxBytes}
+	limited := &io.LimitedReader{R: r, N: maxBytes}
 	decoder := json.NewDecoder(limited)
 
 	for {
@@ -561,80 +647,147 @@ func (t *tcpTransport) handleConn(conn net.Conn) {
 		var msg message
 		if err := decoder.Decode(&msg); err != nil {
 			if err != io.EOF {
-				t.logger.Error("failed to decode message", zap.Error(err))
+				if t.logger != nil {
+					t.logger.Error("failed to decode message", zap.Error(err))
+				}
 			}
 			return
 		}
 
-		var resp interface{}
-		switch msg.Type {
-		case "AppendEntries":
-			var req AppendEntriesReq
-			if err := json.Unmarshal(msg.Payload, &req); err != nil {
-				continue
-			}
-			if t.handler != nil {
-				r := t.handler.HandleAppendEntries(&req)
-				resp = r
-			}
-		case "RequestVote":
-			var req RequestVoteReq
-			if err := json.Unmarshal(msg.Payload, &req); err != nil {
-				continue
-			}
-			if t.handler != nil {
-				r := t.handler.HandleRequestVote(&req)
-				resp = r
-			}
-		case "InstallSnapshot":
-			var req InstallSnapshotReq
-			if err := json.Unmarshal(msg.Payload, &req); err != nil {
-				continue
-			}
-			if t.handler != nil {
-				r := t.handler.HandleInstallSnapshot(&req)
-				resp = r
-			}
-		case "TimeoutNow":
-			var req TimeoutNowReq
-			if err := json.Unmarshal(msg.Payload, &req); err != nil {
-				continue
-			}
-			if t.handler != nil {
-				r := t.handler.HandleTimeoutNow(&req)
-				resp = r
-			}
+		resp := t.dispatchJSON(&msg)
+		if resp == nil {
+			continue
 		}
+		respMsg := message{
+			// C12: echo the request's correlation ID and a type derived from
+			// the request type so the client can verify this frame is the
+			// response to the request it sent.
+			ID:      msg.ID,
+			Type:    msg.Type + "Response",
+			Payload: json.RawMessage{},
+		}
+		if data, err := json.Marshal(resp); err == nil {
+			respMsg.Payload = data
+		}
+		// M5: bound the time spent writing a response so a stalled/slow
+		// peer socket cannot block this goroutine indefinitely.
+		conn.SetWriteDeadline(time.Now().Add(idleWriteTimeout)) //nolint:errcheck
+		wbuf := encBufPool.Get().(*bytes.Buffer)
+		wbuf.Reset()
+		encErr := json.NewEncoder(wbuf).Encode(respMsg)
+		if encErr == nil {
+			_, encErr = conn.Write(wbuf.Bytes())
+		}
+		encBufPool.Put(wbuf)
+		if encErr != nil {
+			if t.logger != nil {
+				t.logger.Error("failed to write response", zap.Error(encErr))
+			}
+			return
+		}
+	}
+}
 
-		if resp != nil {
-			respMsg := message{
-				// C12: echo the request's correlation ID and a type derived from
-				// the request type so the client can verify this frame is the
-				// response to the request it sent.
-				ID:      msg.ID,
-				Type:    msg.Type + "Response",
-				Payload: json.RawMessage{},
-			}
-			if data, err := json.Marshal(resp); err == nil {
-				respMsg.Payload = data
-				// M5: bound the time spent writing a response so a stalled/slow
-				// peer socket cannot block this goroutine indefinitely.
-				conn.SetWriteDeadline(time.Now().Add(idleWriteTimeout)) //nolint:errcheck
-				wbuf := encBufPool.Get().(*bytes.Buffer)
-				wbuf.Reset()
-				encErr := json.NewEncoder(wbuf).Encode(respMsg)
-				if encErr == nil {
-					_, encErr = conn.Write(wbuf.Bytes())
-				}
-				encBufPool.Put(wbuf)
-				if encErr != nil {
-					if t.logger != nil {
-						t.logger.Error("failed to write response", zap.Error(encErr))
-					}
-					return
-				}
-			}
+// dispatchJSON decodes and dispatches a JSON-framed RPC message to the handler.
+func (t *tcpTransport) dispatchJSON(msg *message) interface{} {
+	if t.handler == nil {
+		return nil
+	}
+	switch msg.Type {
+	case "AppendEntries":
+		var req AppendEntriesReq
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			return nil
 		}
+		return t.handler.HandleAppendEntries(&req)
+	case "RequestVote":
+		var req RequestVoteReq
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			return nil
+		}
+		return t.handler.HandleRequestVote(&req)
+	case "InstallSnapshot":
+		var req InstallSnapshotReq
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			return nil
+		}
+		return t.handler.HandleInstallSnapshot(&req)
+	case "TimeoutNow":
+		var req TimeoutNowReq
+		if err := json.Unmarshal(msg.Payload, &req); err != nil {
+			return nil
+		}
+		return t.handler.HandleTimeoutNow(&req)
+	}
+	return nil
+}
+
+// handleConnBinary runs the binary-framed RPC loop on conn.
+func (t *tcpTransport) handleConnBinary(conn net.Conn) {
+	for {
+		conn.SetReadDeadline(time.Now().Add(idleReadTimeout)) //nolint:errcheck
+		typeTag, payload, err := ReadBinaryFrame(conn)
+		if err != nil {
+			return
+		}
+		resp, respTag, err := t.dispatchBinary(typeTag, payload)
+		if err != nil || resp == nil {
+			if err != nil && t.logger != nil {
+				t.logger.Error("binary dispatch error", zap.Error(err))
+			}
+			continue
+		}
+		conn.SetWriteDeadline(time.Now().Add(idleWriteTimeout)) //nolint:errcheck
+		if err := WriteBinaryFrame(conn, respTag, resp); err != nil {
+			if t.logger != nil {
+				t.logger.Error("failed to write binary response", zap.Error(err))
+			}
+			return
+		}
+	}
+}
+
+// dispatchBinary decodes a binary RPC payload, dispatches to the handler, and
+// returns the binary-encoded response payload + response type tag.
+func (t *tcpTransport) dispatchBinary(typeTag uint8, payload []byte) ([]byte, uint8, error) {
+	if t.handler == nil {
+		return nil, 0, nil
+	}
+	switch typeTag {
+	case TagAppendEntriesReq:
+		req, err := UnmarshalAppendEntriesReq(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		resp := t.handler.HandleAppendEntries(req)
+		data, err := MarshalAppendEntriesResp(resp)
+		return data, TagAppendEntriesResp, err
+	case TagRequestVoteReq:
+		req, err := UnmarshalRequestVoteReq(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		resp := t.handler.HandleRequestVote(req)
+		data, err := MarshalRequestVoteResp(resp)
+		return data, TagRequestVoteResp, err
+	case TagInstallSnapshotReq:
+		req, err := UnmarshalInstallSnapshotReq(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		resp := t.handler.HandleInstallSnapshot(req)
+		data, err := MarshalInstallSnapshotResp(resp)
+		return data, TagInstallSnapshotResp, err
+	case TagTimeoutNowReq:
+		req, err := UnmarshalTimeoutNowReq(payload)
+		if err != nil {
+			return nil, 0, err
+		}
+		resp := t.handler.HandleTimeoutNow(req)
+		data, err := MarshalTimeoutNowResp(resp)
+		return data, TagTimeoutNowResp, err
+	default:
+		return nil, 0, fmt.Errorf("transport: unknown binary typeTag: %d", typeTag)
 	}
 }
 
@@ -781,6 +934,72 @@ func (t *tcpTransport) exchangeDeadline(ctx context.Context, fallback time.Durat
 	return deadline
 }
 
+// marshalBinaryPayload marshals req (an RPC request struct) to binary using the
+// appropriate codec for msgType. It accepts both pointer and value forms of
+// each request type because sendRequest receives its req as interface{}.
+func marshalBinaryPayload(msgType string, req interface{}) ([]byte, error) {
+	switch msgType {
+	case "AppendEntries":
+		switch r := req.(type) {
+		case *AppendEntriesReq:
+			return MarshalAppendEntriesReq(r)
+		case AppendEntriesReq:
+			return MarshalAppendEntriesReq(&r)
+		}
+	case "RequestVote":
+		switch r := req.(type) {
+		case *RequestVoteReq:
+			return MarshalRequestVoteReq(r)
+		case RequestVoteReq:
+			return MarshalRequestVoteReq(&r)
+		}
+	case "InstallSnapshot":
+		switch r := req.(type) {
+		case *InstallSnapshotReq:
+			return MarshalInstallSnapshotReq(r)
+		case InstallSnapshotReq:
+			return MarshalInstallSnapshotReq(&r)
+		}
+	case "TimeoutNow":
+		switch r := req.(type) {
+		case *TimeoutNowReq:
+			return MarshalTimeoutNowReq(r)
+		case TimeoutNowReq:
+			return MarshalTimeoutNowReq(&r)
+		}
+	}
+	return nil, fmt.Errorf("transport: unknown binary msgType: %q", msgType)
+}
+
+// decodeBinaryResponseToJSON decodes a binary response payload and re-encodes
+// it as JSON so callers that json.Unmarshal the return value work unchanged.
+func decodeBinaryResponseToJSON(msgType string, data []byte) ([]byte, error) {
+	switch msgType {
+	case "AppendEntries":
+		r, err := UnmarshalAppendEntriesResp(data)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(r)
+	case "RequestVote":
+		r, err := UnmarshalRequestVoteResp(data)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(r)
+	case "InstallSnapshot":
+		r, err := UnmarshalInstallSnapshotResp(data)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(r)
+	case "TimeoutNow":
+		return json.Marshal(&TimeoutNowResp{})
+	default:
+		return nil, fmt.Errorf("transport: unknown binary response type for msgType: %q", msgType)
+	}
+}
+
 func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType string, req interface{}) ([]byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -808,6 +1027,37 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 	if err := conn.SetDeadline(t.exchangeDeadline(ctx, peer.timeout)); err != nil {
 		t.discardConn(conn)
 		return nil, err
+	}
+
+	// Branch on negotiated framing mode: binary or JSON.
+	peer.mu.Lock()
+	useBinary := peer.useBinary
+	peer.mu.Unlock()
+
+	if useBinary {
+		payload, err := marshalBinaryPayload(msgType, req)
+		if err != nil {
+			t.discardConn(conn)
+			return nil, err
+		}
+		typeTag := TypeTagForRPCType(msgType)
+		if err := WriteBinaryFrame(conn, typeTag, payload); err != nil {
+			t.discardConn(conn)
+			return nil, err
+		}
+		_, respPayload, err := ReadBinaryFrame(conn)
+		if err != nil {
+			t.discardConn(conn)
+			return nil, err
+		}
+		jsonPayload, err := decodeBinaryResponseToJSON(msgType, respPayload)
+		if err != nil {
+			t.discardConn(conn)
+			return nil, err
+		}
+		conn.SetDeadline(time.Time{}) //nolint:errcheck
+		t.releaseConn(peer, conn)
+		return jsonPayload, nil
 	}
 
 	decoder := json.NewDecoder(conn)
