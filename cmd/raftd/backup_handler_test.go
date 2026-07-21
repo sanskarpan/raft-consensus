@@ -12,35 +12,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// stubRaftWith returns a new stubRaft with optional fields set via a mutator.
-func stubRaftWith(fn func(*stubRaft)) *stubRaft {
-	r := &stubRaft{}
-	if fn != nil {
-		fn(r)
-	}
-	return r
-}
-
-// backupTestFields extends stubRaft with fields needed by backup handler tests.
-// We embed them directly on stubRaft via the extra fields added below.
-// newBackupServer creates a minimal Server wired up with a stubRaft for testing
-// the snapshot download/upload/restore handlers.
-func newBackupServer(t *testing.T, stub *stubRaft) *Server {
-	t.Helper()
-	if stub == nil {
-		stub = &stubRaft{}
-	}
-	s := &Server{
-		config:  &Config{AdminToken: "tok"},
-		logger:  zap.NewNop(),
-		limiter: newWriteLimiter(1000),
-		raftNode: &backupStubRaft{
-			stubRaft: stub,
-		},
-	}
-	return s
-}
-
 // backupStubRaft wraps stubRaft and adds backup-specific fields/methods so that
 // we can test the three new handlers without modifying the shared stubRaft.
 type backupStubRaft struct {
