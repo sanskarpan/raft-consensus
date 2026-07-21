@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — #264 Production PKI rollout strategy
+
+### Added
+- `pkg/transport`: `EnsureIntermediateCAAndCert()` — separate CA and node certs
+  for production PKI (ECDSA P-384 root CA, P-256 node cert, 1-year validity,
+  idempotent with 30-day renewal threshold, signed chain).  Returns
+  `IntermediateCAPaths{CACertFile, NodeCertFile, NodeKeyFile}`.
+- `pkg/transport/autocert_test.go`: 3 new tests —
+  `TestEnsureIntermediateCAAndCert_creates` (file creation, IsCA flag, chain
+  verification), `TestEnsureIntermediateCAAndCert_idempotent` (CA reuse, no
+  unnecessary node-cert regeneration), `TestEnsureIntermediateCAAndCert_nodeRotation`
+  (expired node cert triggers regeneration; CA serial unchanged).
+- `scripts/pki/vault-pki-setup.sh` — HashiCorp Vault PKI engine bootstrap:
+  root CA generation (or external import), intermediate CA, `raft-node` role
+  (1-year TTL, EC P-256, mTLS), `raft-pki` Vault policy, test issuance.
+- `scripts/pki/certmanager-install.sh` — cert-manager installation check and
+  Issuer setup: verifies/installs cert-manager, creates `SelfSigned`
+  ClusterIssuer, bootstraps cluster CA Certificate, creates CA-backed `Issuer`
+  `raft-cluster-issuer`, tests certificate issuance.
+- `scripts/pki/rotate-node-cert.sh` — zero-downtime node cert rotation: cert
+  validation (expiry, key-pair match, CA chain), atomic file replacement,
+  SIGHUP to trigger cert reloader, post-rotation health check, rollback guidance.
+- `deploy/helm/raft-cluster/values.yaml`: `tls` stanza with 5 modes
+  (`disabled`, `auto`, `cert-manager`, `manual`, `spiffe`); cert-manager
+  `issuerRef`/`duration`/`renewBefore`/`extraDNSNames`/`extraIPAddresses`;
+  manual `certSecretName`; SPIFFE `workloadAPISocket`.
+- `deploy/helm/raft-cluster/templates/cert-manager-issuer.yaml` — cert-manager
+  CRDs: `SelfSigned` ClusterIssuer (bootstrap), CA `Certificate` + Secret,
+  CA-backed `Issuer`, and one `Certificate` per node replica (per-node DNS SANs,
+  IP SANs, 1-year TTL, ECDSA P-256).
+- `deploy/helm/raft-cluster/templates/tls-secret.yaml` — named templates
+  `raft-cluster.tls-volumes`, `raft-cluster.tls-volume-mounts`, and
+  `raft-cluster.tls-env` used by StatefulSet/Deployment pods; renders correct
+  volume/env depending on `tls.mode`.
+- `docs/pki-guide.md` — comprehensive PKI deployment guide covering all 5
+  patterns (auto TLS, intermediate CA, cert-manager, Vault PKI, SPIFFE/SPIRE)
+  with prerequisites, step-by-step commands, config snippets, rotation
+  procedures, and a decision tree.
+
 ## [Unreleased] — #222 TCP binary wire format + sync.Pool
 
 ### Added
