@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,11 @@ type simNetwork struct {
 	partitioned map[[2]ServerID]bool
 
 	clock *simClock
+
+	// inflight tracks the number of message deliveries currently executing.
+	// Uses atomic.Int64 (not sync.WaitGroup) so Drain() can poll without
+	// blocking forever if Add/Done calls are imbalanced.
+	inflight atomic.Int64
 }
 
 // newSimNetwork creates a deterministic simNetwork with the given seed,
@@ -76,6 +83,29 @@ func (n *simNetwork) isPartitioned(src, dst ServerID) bool {
 	return n.partitioned[[2]ServerID{src, dst}]
 }
 
+// InFlight returns the number of currently executing message deliveries.
+func (n *simNetwork) InFlight() int64 {
+	return n.inflight.Load()
+}
+
+// Drain blocks until all in-flight message deliveries have completed.
+// It uses runtime.Gosched() to yield the scheduler so that the delivering
+// goroutines get CPU time to finish.
+func (n *simNetwork) Drain() {
+	for n.inflight.Load() > 0 {
+		runtime.Gosched()
+	}
+}
+
+// deliver runs fn (which calls a node's RPC handler) while holding the
+// inflight counter so Drain() can observe it. The caller is responsible for
+// any partition/existence checks before calling deliver.
+func (n *simNetwork) deliver(fn func()) {
+	n.inflight.Add(1)
+	defer n.inflight.Add(-1)
+	fn()
+}
+
 // AppendEntries implements Transport. It delivers directly to the target node's
 // handler if not partitioned; otherwise returns an error.
 func (n *simNetwork) AppendEntries(_ context.Context, target ServerID, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
@@ -97,7 +127,10 @@ func (n *simNetwork) AppendEntries(_ context.Context, target ServerID, req *Appe
 		n.clock.Advance(n.latency)
 	}
 
-	resp := node.HandleAppendEntriesRPC(req)
+	var resp *AppendEntriesResponse
+	n.deliver(func() {
+		resp = node.HandleAppendEntriesRPC(req)
+	})
 	return resp, nil
 }
 
@@ -120,7 +153,10 @@ func (n *simNetwork) RequestVote(_ context.Context, target ServerID, req *Reques
 		n.clock.Advance(n.latency)
 	}
 
-	resp := node.HandleRequestVoteRPC(req)
+	var resp *RequestVoteResponse
+	n.deliver(func() {
+		resp = node.HandleRequestVoteRPC(req)
+	})
 	return resp, nil
 }
 
@@ -143,7 +179,10 @@ func (n *simNetwork) InstallSnapshot(_ context.Context, target ServerID, req *In
 		n.clock.Advance(n.latency)
 	}
 
-	resp := node.HandleInstallSnapshotRPC(req)
+	var resp *InstallSnapshotResponse
+	n.deliver(func() {
+		resp = node.HandleInstallSnapshotRPC(req)
+	})
 	return resp, nil
 }
 
