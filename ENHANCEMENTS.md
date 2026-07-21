@@ -50,8 +50,9 @@ CI-green PR merged to `main`):
 | Publish + sign container images in CI/CD | #240 / #217 |
 | TTL/lease-based key expiry (deterministic apply-time clock, binary codec, tick sweep, E2E) | — / #207 |
 | Deterministic Simulation (DES) harness (#220): Clock/Ticker interfaces + realClock pass-through; simClock/simTicker; simNetwork with partition/heal; 3 deterministic scenario tests | — / #220 |
+| Production PKI rollout strategy (#264): `EnsureIntermediateCAAndCert` (separate CA + node certs, idempotent, 30-day renewal threshold); `scripts/pki/` (Vault PKI setup, cert-manager install + Issuer, cert rotation); Helm `tls` stanza (5 modes); cert-manager `Issuer`+`Certificate` CRDs; `docs/pki-guide.md` (5-scenario guide) | — / #264 |
 
-**Status (2026-07-20):** 32 roadmap issues resolved + all 6 verify-first items. EPIC #220 (DES harness) complete: injectable Clock/Ticker abstractions; simClock manually-advanceable deterministic clock; simNetwork deterministic in-process transport with bidirectional partition injection; 5 subtasks, 15 new tests covering election, partition recovery, and reproducibility. **7 enhancement EPICs remain open.** `main` is green; 0 open bugs.
+**Status (2026-07-21):** 33 roadmap issues resolved + all 6 verify-first items. EPIC #264 (production PKI) complete: intermediate CA pattern with `EnsureIntermediateCAAndCert`; Vault PKI engine bootstrap script; cert-manager installation and Issuer setup; zero-downtime cert rotation script; Helm cert-manager CRDs (Issuer + per-node Certificate); comprehensive PKI guide covering dev→enterprise scenarios. **6 enhancement EPICs remain open.** `main` is green; 0 open bugs.
 
 ---
 
@@ -308,7 +309,7 @@ runbooks, cert-gen script, docker-compose, version stamping.
 | ✅ Container image publishing + signing | M | S | **Shipped (#217)** — release.yml builds+pushes a multi-arch (amd64/arm64) image to GHCR with provenance+SBOM and cosign keyless signing; Dockerfile cross-compiles via TARGETARCH. | `release.yml`, `Dockerfile` |
 | ✅ ServiceMonitor / PodMonitor | M | S | **Shipped (#215)** — opt-in `servicemonitor.yaml` with bearer-token support. | `servicemonitor.yaml` |
 | NetworkPolicy | M | S | No default-deny; peer port should only accept sibling-pod traffic. | new `networkpolicy.yaml` |
-| ✅ Secret-based tokens | M | S | **Shipped (#215)** — `admin_token` now sourced from a Secret via `$ADMIN_TOKEN` (chart-managed or `existingSecret`); no plaintext in the ConfigMap. (TLS-in-chart still open.) | `configmap.yaml`, `secret.yaml` |
+| ✅ Secret-based tokens | M | S | **Shipped (#215)** — `admin_token` now sourced from a Secret via `$ADMIN_TOKEN` (chart-managed or `existingSecret`); no plaintext in the ConfigMap. (TLS-in-chart shipped as part of #264.) | `configmap.yaml`, `secret.yaml` |
 | Shipped systemd unit (bare-metal) | M | S | Only a doc snippet; ship a hardened `.service` + sysusers/tmpfiles via goreleaser nfpms. | new `packaging/systemd/` |
 | PV resize support + storageClass wiring | M | S | Fixed volumeClaim size; `persistence.enabled` is ignored. | statefulset, values |
 | Guaranteed-QoS production preset | M | S | Burstable QoS risks CPU throttling → spurious elections; provide requests==limits preset. | values, `docs/tuning.md` |

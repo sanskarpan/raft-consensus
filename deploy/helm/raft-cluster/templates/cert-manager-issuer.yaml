@@ -1,0 +1,170 @@
+{{- /*
+cert-manager-issuer.yaml — cert-manager Issuer and Certificate resources for
+raft-consensus TLS.
+
+Rendered only when tls.certManager.enabled is true (i.e., tls.mode is
+"cert-manager").  This template creates:
+
+  1. A SelfSigned ClusterIssuer used to bootstrap the cluster CA.
+  2. A CA Certificate (stored in a Secret) that becomes the trust anchor
+     distributed to all raft nodes.
+  3. An Issuer backed by that CA Certificate, used to sign per-node certs.
+  4. One Certificate resource per raft node (replicas count), each containing
+     the appropriate DNS SANs and IP SANs.
+
+Operator checklist before enabling:
+  - cert-manager is installed: kubectl get pods -n cert-manager
+  - Or run: scripts/pki/certmanager-install.sh
+  - For production: replace the SelfSigned bootstrap with a Vault/ACME issuer
+    by pointing tls.certManager.issuerRef at your production issuer and removing
+    the selfsigned-bootstrap-issuer block below.
+*/}}
+
+{{- if .Values.tls.certManager.enabled }}
+
+{{- $certManagerIssuerRef := .Values.tls.certManager.issuerRef }}
+{{- $duration     := .Values.tls.certManager.duration     | default "8760h" }}
+{{- $renewBefore  := .Values.tls.certManager.renewBefore  | default "720h" }}
+{{- $releaseName  := .Release.Name }}
+{{- $namespace    := .Release.Namespace }}
+
+---
+# SelfSigned ClusterIssuer — bootstrap root for the cluster CA.
+# Only needed when using the built-in self-signed CA (not an external issuer).
+# If tls.certManager.issuerRef points at an external issuer, you can remove
+# this resource (cert-manager will use your external issuer directly).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: {{ $releaseName }}-selfsigned-bootstrap
+  labels:
+    app.kubernetes.io/name: raft-cluster
+    app.kubernetes.io/instance: {{ $releaseName }}
+    app.kubernetes.io/component: pki-bootstrap
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    helm.sh/chart: {{ include "raft-cluster.chart" . }}
+spec:
+  selfSigned: {}
+
+---
+# Cluster CA Certificate — the shared trust anchor for all raft nodes.
+# cert-manager stores it in Secret "{{ $releaseName }}-ca-secret" as:
+#   tls.crt — CA certificate
+#   tls.key — CA private key (stays in-cluster, never exported)
+#   ca.crt  — copy of tls.crt (for standard trust-bundle mounts)
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $releaseName }}-ca
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: raft-cluster
+    app.kubernetes.io/instance: {{ $releaseName }}
+    app.kubernetes.io/component: pki-ca
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    helm.sh/chart: {{ include "raft-cluster.chart" . }}
+spec:
+  isCA: true
+  commonName: {{ $releaseName }}-root-ca
+  subject:
+    organizations:
+      - raft-cluster
+    organizationalUnits:
+      - Infrastructure
+  secretName: {{ $releaseName }}-ca-secret
+  duration: 87600h     # 10 years; rotate via kubectl delete certificate then helm upgrade
+  renewBefore: 8760h   # 1 year before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 384
+    rotationPolicy: Always   # new key on each renewal
+  issuerRef:
+    name: {{ $releaseName }}-selfsigned-bootstrap
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+---
+# CA-backed Issuer — signs per-node certificates using the cluster CA above.
+# This is what tls.certManager.issuerRef should point at (the default).
+# Replace this block with a reference to your Vault/ACME Issuer in production.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ $certManagerIssuerRef.name }}
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: raft-cluster
+    app.kubernetes.io/instance: {{ $releaseName }}
+    app.kubernetes.io/component: pki-issuer
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    helm.sh/chart: {{ include "raft-cluster.chart" . }}
+spec:
+  ca:
+    secretName: {{ $releaseName }}-ca-secret
+
+{{- /*
+  Per-node Certificate resources.
+  One Certificate is created for each replica (node-0 through node-(N-1)).
+  Each Certificate uses the node index to derive DNS names and is stored in a
+  dedicated Secret mounted by the corresponding StatefulSet pod.
+*/}}
+{{- $replicas := (.Values.replicaCount | default 3) | int }}
+{{- range $i := until $replicas }}
+{{- $nodeID   := printf "node%d" (add1 $i) }}
+{{- $svcName  := printf "%s-%s" $releaseName $nodeID }}
+---
+# Node Certificate for {{ $nodeID }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $releaseName }}-{{ $nodeID }}-cert
+  namespace: {{ $namespace }}
+  labels:
+    app.kubernetes.io/name: raft-cluster
+    app.kubernetes.io/instance: {{ $releaseName }}
+    app.kubernetes.io/component: node-cert
+    app.kubernetes.io/managed-by: {{ $.Release.Service }}
+    raft-consensus/node-id: {{ $nodeID }}
+  annotations:
+    helm.sh/chart: {{ include "raft-cluster.chart" $ }}
+spec:
+  secretName: {{ $releaseName }}-{{ $nodeID }}-tls
+  commonName: {{ $nodeID }}
+  subject:
+    organizations:
+      - raft-cluster
+  dnsNames:
+    - {{ $nodeID }}
+    - {{ $svcName }}
+    - {{ $svcName }}.{{ $namespace }}.svc.cluster.local
+    - localhost
+    {{- with $.Values.tls.certManager.extraDNSNames }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  ipAddresses:
+    - 127.0.0.1
+    - "::1"
+    {{- with $.Values.tls.certManager.extraIPAddresses }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  duration: {{ $duration }}
+  renewBefore: {{ $renewBefore }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
+  issuerRef:
+    name: {{ $certManagerIssuerRef.name }}
+    kind: {{ $certManagerIssuerRef.kind | default "Issuer" }}
+    group: {{ $certManagerIssuerRef.group | default "cert-manager.io" }}
+{{- end }}
+
+{{- end }}{{/* if tls.certManager.enabled */}}
