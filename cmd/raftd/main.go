@@ -134,6 +134,22 @@ type Config struct {
 	// X-Forwarded-For entry (or X-Real-IP) instead of RemoteAddr.
 	// Leave empty to trust no proxy (use RemoteAddr always).
 	TrustedProxyCIDRs []string `yaml:"trusted_proxy_cidrs"`
+
+	// BackupUploader selects the snapshot backup backend: "noop" (default) | "minio" | "s3".
+	// "s3" is an alias for "minio" — the same MinIO SDK works for AWS S3.
+	BackupUploader string `yaml:"backup_uploader"`
+
+	// BackupMinIO configures the MinIO/S3 backup backend when BackupUploader is "minio" or "s3".
+	BackupMinIO struct {
+		Endpoint  string `yaml:"endpoint"`
+		Bucket    string `yaml:"bucket"`
+		AccessKey string `yaml:"access_key"`
+		SecretKey string `yaml:"secret_key"`
+		UseSSL    bool   `yaml:"use_ssl"`
+		Region    string `yaml:"region"`
+		Prefix    string `yaml:"prefix"`
+		Compress  bool   `yaml:"compress"`
+	} `yaml:"backup_minio"`
 }
 
 type ClusterMember struct {
@@ -576,9 +592,32 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 		s.tracingProvider = tracing.NewNoopProvider()
 	}
 
-	// Initialize a no-op uploader by default; a real S3/GCS uploader can be
-	// swapped in by embedding this server with a custom Uploader (#216).
-	s.uploader = &backup.NoOpUploader{Logger: logger}
+	// Initialize the backup uploader based on config (#216).
+	switch config.BackupUploader {
+	case "minio", "s3":
+		uploaderCtx, uploaderCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer uploaderCancel()
+		var uploaderErr error
+		s.uploader, uploaderErr = backup.NewMinIOUploader(uploaderCtx, backup.MinIOConfig{
+			Endpoint:  config.BackupMinIO.Endpoint,
+			Bucket:    config.BackupMinIO.Bucket,
+			AccessKey: config.BackupMinIO.AccessKey,
+			SecretKey: config.BackupMinIO.SecretKey,
+			UseSSL:    config.BackupMinIO.UseSSL,
+			Region:    config.BackupMinIO.Region,
+			Prefix:    config.BackupMinIO.Prefix,
+			Compress:  config.BackupMinIO.Compress,
+		}, logger)
+		if uploaderErr != nil {
+			return nil, fmt.Errorf("MinIO uploader init: %w", uploaderErr)
+		}
+		logger.Info("MinIO backup uploader initialized",
+			zap.String("endpoint", config.BackupMinIO.Endpoint),
+			zap.String("bucket", config.BackupMinIO.Bucket),
+		)
+	default:
+		s.uploader = &backup.NoOpUploader{Logger: logger}
+	}
 
 	if err := s.initRaft(); err != nil {
 		return nil, err
