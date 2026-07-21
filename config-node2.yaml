@@ -30,3 +30,9 @@ cluster:
 #
 # Option C: Explicitly opt out of TLS (development only, not recommended)
 insecure_transport: true  # remove in production; suppresses the cleartext warning
+
+# SPIFFE/SPIRE workload identity (cloud-native alternative to static TLS)
+# Requires a SPIRE agent running on the host with socket at the configured path.
+# When set, overrides tls_cert/tls_key/tls_ca.
+# spiffe_socket: /run/spire/sockets/agent.sock
+# spiffe_trust_domain: cluster.local
