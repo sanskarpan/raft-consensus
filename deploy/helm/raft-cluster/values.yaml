@@ -6,3 +6,69 @@ service:
   httpPort: 8080
 
 adminToken: ""
+
+# ---------------------------------------------------------------------------
+# Certificate management
+# ---------------------------------------------------------------------------
+# tls.mode controls how raftd obtains TLS certificates for inter-node
+# communication and (optionally) the HTTP API.
+#
+# Supported modes:
+#   "disabled"     — no TLS; plaintext inter-node transport.
+#                    Only use for local dev with no network exposure.
+#   "auto"         — raftd auto-generates a self-signed cert on startup
+#                    (EnsureAutoTLSCerts). Zero config, suitable for dev/testing.
+#   "cert-manager" — cert-manager issues and rotates per-node certificates
+#                    automatically.  Requires cert-manager to be installed.
+#                    Configure certManager.issuerRef to point at your Issuer.
+#   "manual"       — certificates are pre-provisioned in a Kubernetes Secret
+#                    and mounted into the pod.  You are responsible for rotation.
+#   "spiffe"       — SPIFFE/SPIRE workload identity.  raftd reads SVIDs from
+#                    the SPIFFE Workload API socket.  No static secrets.
+#
+tls:
+  # Options: "disabled" | "auto" | "cert-manager" | "manual" | "spiffe"
+  mode: "auto"
+
+  # cert-manager settings (only used when mode: "cert-manager")
+  certManager:
+    # Set to true to render cert-manager Certificate and Issuer resources.
+    enabled: false
+
+    # issuerRef points at the cert-manager Issuer or ClusterIssuer that will
+    # sign node certificates.  Run scripts/pki/certmanager-install.sh to
+    # create a suitable Issuer, or bring your own (Vault, ACME, CFSSL, etc.).
+    issuerRef:
+      name: "raft-cluster-issuer"
+      # kind: "Issuer" for namespace-scoped; "ClusterIssuer" for cluster-wide.
+      kind: "Issuer"
+      group: "cert-manager.io"
+
+    # duration controls how long each node certificate is valid for.
+    # cert-manager renews the certificate before it expires (see renewBefore).
+    duration: "8760h"    # 1 year
+
+    # renewBefore triggers automatic renewal this far before expiry.
+    renewBefore: "720h"  # 30 days before expiry
+
+    # Additional DNS SANs appended to every node certificate.
+    # The node's own hostname and "localhost" are always included.
+    extraDNSNames: []
+
+    # Additional IP SANs appended to every node certificate.
+    # 127.0.0.1 and ::1 are always included.
+    extraIPAddresses: []
+
+  # manual cert settings (only used when mode: "manual")
+  manual:
+    # Name of an existing Kubernetes Secret containing:
+    #   tls.crt — PEM certificate (may include the CA chain)
+    #   tls.key — PEM private key
+    #   ca.crt  — PEM CA certificate (used as trust anchor by all nodes)
+    # Leave empty to skip Secret mounting (cert files must be in the data dir).
+    certSecretName: ""
+
+  # spiffe settings (only used when mode: "spiffe")
+  spiffe:
+    # Path to the SPIFFE Workload API socket (mounted by SPIRE agent DaemonSet).
+    workloadAPISocket: "/run/spiffe/workload.sock"
