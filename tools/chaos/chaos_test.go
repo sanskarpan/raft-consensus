@@ -189,6 +189,108 @@ func TestLeaderFailover(t *testing.T) {
 	}
 }
 
+// TestNetworkPartitionRecovery simulates a partial network partition by
+// stopping one follower, writing to the majority partition, then restarting
+// the follower and verifying it catches up via log replication.
+func TestNetworkPartitionRecovery(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping chaos test in short mode")
+	}
+
+	binaryPath := buildBinary(t)
+	harnessDir := t.TempDir()
+	const basePort = 21400
+	h := testharness.NewHarness(harnessDir, basePort, testharness.WithBinary(binaryPath))
+	defer h.StopAll() //nolint:errcheck
+
+	for _, id := range []string{"node1", "node2", "node3"} {
+		if err := h.StartNode(id); err != nil {
+			t.Fatalf("start %s: %v", id, err)
+		}
+	}
+
+	for _, id := range []string{"node1", "node2", "node3"} {
+		if err := h.WaitForHealth(id, 20*time.Second); err != nil {
+			t.Fatalf("health %s: %v", id, err)
+		}
+	}
+
+	leaderID, err := h.WaitForLeader(15 * time.Second)
+	if err != nil {
+		t.Fatalf("no leader: %v", err)
+	}
+	t.Logf("initial leader: %s", leaderID)
+
+	addrs := []string{
+		fmt.Sprintf("localhost:%d", basePort+100),
+		fmt.Sprintf("localhost:%d", basePort+101),
+		fmt.Sprintf("localhost:%d", basePort+102),
+	}
+	c := client.NewClient(client.WithAddresses(addrs), client.WithTimeout(10*time.Second))
+
+	// Pick a follower to partition off.
+	partitionedID := ""
+	for _, id := range []string{"node1", "node2", "node3"} {
+		if id != leaderID {
+			partitionedID = id
+			break
+		}
+	}
+	t.Logf("leader=%s partitioned follower=%s", leaderID, partitionedID)
+
+	// Stop the follower to simulate a partition.
+	t.Logf("partitioning follower %s", partitionedID)
+	if err := h.StopNode(partitionedID); err != nil {
+		t.Fatalf("stop follower: %v", err)
+	}
+
+	// Write 10 keys via the majority partition (leader + remaining follower).
+	const numKeys = 10
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("partition/%d", i)
+		if _, err := c.Put(key, fmt.Sprintf("pval-%d", i)); err != nil {
+			t.Errorf("put partition key %s: %v", key, err)
+		}
+	}
+
+	// Heal the partition by restarting the stopped follower.
+	t.Logf("healing partition: restarting %s", partitionedID)
+	if err := h.StartNode(partitionedID); err != nil {
+		t.Fatalf("restart partitioned follower: %v", err)
+	}
+	if err := h.WaitForHealth(partitionedID, 20*time.Second); err != nil {
+		t.Fatalf("health after partition heal: %v", err)
+	}
+
+	// The restarted follower must replicate all 10 keys; verify with stale reads
+	// (no Raft round-trip required — any node can serve them once replicated).
+	allKeysReadable := func() bool {
+		for i := 0; i < numKeys; i++ {
+			key := fmt.Sprintf("partition/%d", i)
+			kv, err := c.GetKVStale(key)
+			if err != nil || kv.Value != fmt.Sprintf("pval-%d", i) {
+				return false
+			}
+		}
+		return true
+	}
+	eventually(t, 15*time.Second, allKeysReadable, "all partition keys should be readable after follower rejoins")
+
+	// Final per-key assertion with diagnostics.
+	for i := 0; i < numKeys; i++ {
+		key := fmt.Sprintf("partition/%d", i)
+		kv, err := c.GetKVStale(key)
+		if err != nil {
+			t.Errorf("stale read %s after recovery: %v", key, err)
+			continue
+		}
+		want := fmt.Sprintf("pval-%d", i)
+		if kv.Value != want {
+			t.Errorf("key %s = %q, want %q", key, kv.Value, want)
+		}
+	}
+}
+
 // TestFollowerRestart verifies that a restarted follower catches up
 // from its persisted WAL and then from leader replication.
 func TestFollowerRestart(t *testing.T) {

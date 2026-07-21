@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -20,6 +21,19 @@ import (
 
 	"github.com/anishathalye/porcupine"
 )
+
+var noFaultInjection = flag.Bool("no-fault-injection", false, "skip Docker pause/unpause fault injection")
+
+// checkDocker runs "docker info" with a 2-second timeout and returns a non-nil
+// error if Docker is not available on the host.
+func checkDocker() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "info")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run()
+}
 
 var endpoints = []string{"localhost:8012", "localhost:8014", "localhost:8016"}
 var nodes = []string{"raft-node1", "raft-node2", "raft-node3"}
@@ -71,6 +85,8 @@ func httpDo(method, url, body string) (int, string) {
 }
 
 func main() {
+	flag.Parse()
+
 	start := time.Now()
 	now := func() int64 { return time.Since(start).Nanoseconds() }
 
@@ -79,23 +95,38 @@ func main() {
 	var stop int32
 	var wg sync.WaitGroup
 
+	// Decide whether to enable Docker-based fault injection.
+	faultInjectionEnabled := !*noFaultInjection
+	if faultInjectionEnabled {
+		if err := checkDocker(); err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: Docker unavailable (%v); skipping fault injection (pause/unpause). "+
+				"Linearizability check will still run.\n", err)
+			faultInjectionEnabled = false
+		}
+	} else {
+		fmt.Fprintln(os.Stderr, "WARNING: --no-fault-injection set; skipping Docker pause/unpause fault injection. "+
+			"Linearizability check will still run.")
+	}
+
 	// Fault injector: pause a current FOLLOWER for ~2s, then unpause; repeat.
 	// Pausing only followers keeps writes to the leader definite (no
 	// indeterminate ops -> no linearizability false positives) while still
 	// stressing replication (the paused follower lags and must catch up) and
 	// verifying that linearizable reads served by followers are never stale.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		rng := rand.New(rand.NewSource(7))
-		for atomic.LoadInt32(&stop) == 0 {
-			f := nodes[rng.Intn(len(nodes))] // pause ANY node, including the leader
-			_ = exec.Command("docker", "pause", f).Run()
-			time.Sleep(1500 * time.Millisecond)
-			_ = exec.Command("docker", "unpause", f).Run()
-			time.Sleep(1500 * time.Millisecond)
-		}
-	}()
+	if faultInjectionEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(7))
+			for atomic.LoadInt32(&stop) == 0 {
+				f := nodes[rng.Intn(len(nodes))] // pause ANY node, including the leader
+				_ = exec.Command("docker", "pause", f).Run()
+				time.Sleep(1500 * time.Millisecond)
+				_ = exec.Command("docker", "unpause", f).Run()
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}()
+	}
 
 	const workers = 4
 	for w := 0; w < workers; w++ {
@@ -165,9 +196,11 @@ func main() {
 		}
 	}
 	fmt.Printf("indeterminate (uncertain-outcome) puts: %d\n", indet)
-	// ensure all nodes unpaused
-	for _, n := range nodes {
-		_ = exec.Command("docker", "unpause", n).Run()
+	// ensure all nodes unpaused (only meaningful when fault injection ran)
+	if faultInjectionEnabled {
+		for _, n := range nodes {
+			_ = exec.Command("docker", "unpause", n).Run()
+		}
 	}
 
 	// Check linearizability per key.
