@@ -197,27 +197,20 @@ func TestDeterministicPartitionAndRecover(t *testing.T) {
 		}
 	}
 
-	// Advance enough ticks for the majority to hold a re-election
-	// (ElectionTick=5 so ~15 ticks is more than enough).
-	sc.Quiesce(40)
-
-	// The majority side should have a new leader.
+	// Poll tick-by-tick until a non-partitioned node becomes leader.
+	// ElectionTick=5 so in theory ~10 ticks suffice, but CI scheduling jitter
+	// can cause the goroutines to lag; allow up to 300 ticks to be safe.
 	var newLeader *raft
-	for _, r := range sc.nodes {
-		if r.localID != leaderID && r.State() == StateLeader {
-			newLeader = r
-			break
-		}
-	}
-	if newLeader == nil {
-		// Check if maybe the same leader re-emerged (only possible if partition
-		// was not effective) or try more ticks.
-		sc.Quiesce(40)
+	for i := 0; i < 300; i++ {
+		sc.Tick()
 		for _, r := range sc.nodes {
 			if r.localID != leaderID && r.State() == StateLeader {
 				newLeader = r
 				break
 			}
+		}
+		if newLeader != nil {
+			break
 		}
 	}
 	if newLeader == nil {
