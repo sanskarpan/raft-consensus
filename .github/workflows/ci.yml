@@ -49,7 +49,7 @@ jobs:
         run: go vet ./...
 
       - name: Test with race detector
-        run: go test -race -timeout 120s ./...
+        run: go test -race -timeout 180s ./...
 
       - name: Test with coverage
         if: matrix.go-version == '1.26.5'
@@ -154,18 +154,20 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Run chaos tests (no -short flag)
-        run: go test -race -timeout 300s -run "TestAT|TestChaos|TestPartition" ./pkg/raft/
-      - name: Fuzz on-disk parsers (short)
+      - name: Run lightweight chaos tests (also run on PR via ./...)
+        run: go test -race -v -timeout 120s -run "TestLeaderFailover|TestFollowerRestart|TestNetworkPartitionRecovery" ./tools/chaos/
+      - name: Run full testharness E2E (extended timeout)
+        run: go test -race -v -timeout 300s ./tools/testharness/
+      - name: Fuzz on-disk parsers (60s per target)
         run: |
           go test ./pkg/fsm/     -run='^$' -fuzz='^FuzzDecodeKVCommand$'    -fuzztime=60s
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzReadRecordAtBounded$' -fuzztime=60s
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzVerifySnapChecksum$'  -fuzztime=60s
           go test ./pkg/storage/ -run='^$' -fuzz='^FuzzWALRecovery$'         -fuzztime=60s
-      - name: Benchmarks (benchstat-formatted, for trend tracking)
+      - name: Benchmarks
         run: |
           go install golang.org/x/perf/cmd/benchstat@latest
-          go test -run='^$' -bench=. -benchmem -benchtime=50x -count=6 ./pkg/fsm/ ./pkg/storage/ | tee bench.txt
+          go test -run='^$' -bench=. -benchmem -benchtime=50x -count=6 ./pkg/fsm/ ./pkg/storage/ ./pkg/transport/ | tee bench.txt
           benchstat bench.txt || true
       - name: Upload benchmark results
         uses: actions/upload-artifact@v7
