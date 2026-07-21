@@ -25,6 +25,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sanskarpan/raft-consensus/pkg/backup"
 	"github.com/sanskarpan/raft-consensus/pkg/fsm"
 	"github.com/sanskarpan/raft-consensus/pkg/metrics"
 	"github.com/sanskarpan/raft-consensus/pkg/raft"
@@ -341,6 +342,7 @@ type Server struct {
 	reloadTLS       func() error      // #204: reload TLS certs on SIGHUP (nil if no TLS)
 	kv              *fsm.KVStore      // direct FSM reference for stale reads and watches
 	watchMgr        *fsm.WatchManager // SSE event fan-out
+	uploader        backup.Uploader   // pluggable snapshot uploader (#216)
 	watchCtxCancel  context.CancelFunc
 	sweepCancel     context.CancelFunc // cancels sweepPerIPLimiters goroutine on shutdown
 	tickCancel      context.CancelFunc // cancels leaderTickLoop goroutine on shutdown (#207)
@@ -569,6 +571,10 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	} else {
 		s.tracingProvider = tracing.NewNoopProvider()
 	}
+
+	// Initialize a no-op uploader by default; a real S3/GCS uploader can be
+	// swapped in by embedding this server with a custom Uploader (#216).
+	s.uploader = &backup.NoOpUploader{Logger: logger}
 
 	if err := s.initRaft(); err != nil {
 		return nil, err
@@ -957,6 +963,9 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/command", instrument("command", s.requireRole("write", s.rateLimitMiddleware(s.handleCommand))))
 	mux.HandleFunc("/admin/cluster", instrument("admin_cluster", s.authMiddleware(s.handleCluster)))
 	mux.HandleFunc("/admin/snapshot", instrument("admin_snapshot", s.requireRole("admin", s.handleSnapshot)))
+	mux.HandleFunc("/admin/snapshot/download", instrument("admin_snapshot_download", s.requireRole("admin", s.handleSnapshotDownload)))
+	mux.HandleFunc("/admin/snapshot/upload", instrument("admin_snapshot_upload", s.requireRole("admin", s.handleSnapshotUpload)))
+	mux.HandleFunc("/admin/restore", instrument("admin_restore", s.requireRole("admin", s.handleRestore)))
 	// M-O3: /metrics leaks topology/term/leader. Gate it behind the read role
 	// whenever any admin token is configured (or metrics_auth is set), so prod
 	// deployments require auth while token-less dev stays open.
@@ -1455,6 +1464,64 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
+func (s *Server) handleSnapshotDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	idx, term, rc, err := s.raftNode.LatestSnapshot()
+	if err != nil {
+		s.writeGenericError(w, http.StatusNotFound, "no snapshot available", err)
+		return
+	}
+	defer rc.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", "attachment; filename=\"snapshot.snap\"")
+	w.Header().Set("X-Snapshot-Index", fmt.Sprintf("%d", idx))
+	w.Header().Set("X-Snapshot-Term", fmt.Sprintf("%d", term))
+	if _, err := io.Copy(w, rc); err != nil {
+		s.logger.Warn("snapshot download stream error", zap.Error(err))
+	}
+}
+
+func (s *Server) handleSnapshotUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// First force a snapshot so we have a recent one to upload.
+	if err := s.raftNode.Snapshot(); err != nil {
+		s.writeGenericError(w, http.StatusInternalServerError, "snapshot failed", err)
+		return
+	}
+	_, _, rc, err := s.raftNode.LatestSnapshot()
+	if err != nil {
+		s.writeGenericError(w, http.StatusInternalServerError, "no snapshot after force", err)
+		return
+	}
+	defer rc.Close()
+	name := fmt.Sprintf("raft-backup-%d.snap", time.Now().Unix())
+	if err := s.uploader.Upload(r.Context(), name, rc); err != nil {
+		s.writeGenericError(w, http.StatusInternalServerError, "upload failed", err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "name": name}) //nolint:errcheck
+}
+
+func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if err := s.raftNode.Restore(r.Context(), r.Body); err != nil {
+		s.writeGenericError(w, http.StatusInternalServerError, "restore failed", err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {

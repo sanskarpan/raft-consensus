@@ -432,6 +432,10 @@ type Raft interface {
 	RequestLeadership(ctx context.Context) error
 
 	Snapshot() error
+	// LatestSnapshot opens the most recent snapshot from the snapshot store and
+	// returns its index, term, and a streaming reader. The caller must close rc.
+	// Returns an error if no snapshot is available.
+	LatestSnapshot() (index uint64, term uint64, rc io.ReadCloser, err error)
 	Restore(ctx context.Context, reader io.Reader) error
 
 	Start() error

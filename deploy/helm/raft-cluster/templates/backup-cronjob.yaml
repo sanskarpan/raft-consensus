@@ -1,0 +1,36 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-backup
+  labels:
+    app.kubernetes.io/name: raft-backup
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: backup
+            image: curlimages/curl:latest
+            command:
+            - sh
+            - -c
+            - |
+              curl -sf -X POST \
+                -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+                http://{{ .Release.Name }}-0.{{ .Release.Name }}.$(NAMESPACE).svc.cluster.local:{{ .Values.service.httpPort }}/admin/snapshot/upload
+            env:
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-admin
+                  key: token
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+{{- end }}

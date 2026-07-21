@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -62,8 +63,9 @@ func (r *leaderStub) Apply(_ context.Context, _ []byte) ([]byte, error) {
 
 // Healthy satisfies the healthChecker interface used by /ready (H-R2/H-O1).
 func (r *leaderStub) Healthy() bool                                { return !r.unhealthy }
-func (r *leaderStub) Snapshot() error                              { return nil }
-func (r *leaderStub) Restore(_ context.Context, _ io.Reader) error { return nil }
+func (r *leaderStub) Snapshot() error                                              { return nil }
+func (r *leaderStub) LatestSnapshot() (uint64, uint64, io.ReadCloser, error)       { return 0, 0, nil, errors.New("no snapshots") }
+func (r *leaderStub) Restore(_ context.Context, _ io.Reader) error                 { return nil }
 func (r *leaderStub) Start() error                                 { return nil }
 func (r *leaderStub) Shutdown() error                              { return nil }
 func (r *leaderStub) RequestLeadership(_ context.Context) error    { return nil }
