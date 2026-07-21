@@ -375,7 +375,7 @@ chaos/lincheck/testharness, CHANGELOG/CONTRIBUTING/SECURITY, benchmarks.
 
 | Title | Impact | Effort | Rationale | Where |
 |---|---|---|---|---|
-| Default-TCP JSON→binary wire format | H | M | The default `transport: tcp` JSON-encodes every RPC (reflection+alloc) on the hot path; reuse proto/binary framing. | `tcp.go` |
+| ✅ Default-TCP JSON→binary wire format | H | M | Shipped (#222). Varint binary codec for all 8 RPC types; 9-byte frame header; per-connection negotiation with JSON fallback; `encBufPool` sync.Pool on send path. | `tcp.go`, `binary.go` |
 | Binary-encode FSM `KvResult` in Apply | H | M | Every op in the serial apply loop `json.Marshal`s the result (reflection) — the most-executed alloc site. | `pkg/fsm/kv.go` |
 | Streaming FSM snapshot (no full-map JSON) | H | L | `KVStore.Snapshot()` deep-clones the whole keyspace under RLock then `json.Marshal`s it — O(N) memory spike. | `pkg/fsm/kv.go` |
 | `sync.Pool` for hot encode/decode buffers | M | S | No pooling anywhere; AE encode, WAL encode, FSM marshal, snapshot chunk buffers all allocate fresh. | raft/fsm/transport |

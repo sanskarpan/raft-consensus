@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — #222 TCP binary wire format + sync.Pool
+
+### Added
+- `pkg/transport/binary.go`: varint/uvarint binary codec for all 8 TCP RPC
+  types (AppendEntriesReq/Resp, RequestVoteReq/Resp, InstallSnapshotReq/Resp,
+  TimeoutNowReq/Resp). No reflection; explicit field-by-field encode/decode.
+- `pkg/transport/tcp.go`: `encBufPool` (`sync.Pool`) reuses `*bytes.Buffer`
+  allocations on the hot send path, reducing per-RPC heap allocations.
+- Binary frame protocol: 9-byte header (4-byte magic + 1-byte type tag +
+  4-byte payload length big-endian). `WriteBinaryFrame`/`ReadBinaryFrame`.
+- Per-connection negotiation: client sends `binaryMagic` probe; server echoes
+  to confirm. Result cached on `peer` struct. JSON fallback is automatic.
+- `TCPTransportConfig` struct + `NewTCPTransportWithConfig` constructor.
+  `BinaryTransport bool` field (default `true` in `NewTCPTransport`).
+- `cmd/raftd/main.go`: `binary_transport` YAML config key.
+- Benchmarks: 4.4x faster marshal, 19x faster unmarshal vs JSON.
+- E2E tests: `TestBinaryTransportCluster`, `TestBinaryTransportFallbackJSON`.
+
+### Changed
+- `NewTCPTransport`/`NewTCPTransportTLS` now delegate to
+  `NewTCPTransportWithConfig`; behavior unchanged (binary on by default).
+- `handleConn` refactored into `handleConnJSON`/`handleConnBinary` +
+  dispatch helpers; JSON path uses pooled encode buffers.
+
 ## [Unreleased]
 
 ### Added
