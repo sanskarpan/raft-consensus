@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -16,6 +17,12 @@ import (
 	"github.com/sanskarpan/raft-consensus/pkg/raft"
 	"go.uber.org/zap"
 )
+
+// encBufPool pools *bytes.Buffer values used to marshal outbound RPC payloads
+// on the hot send path, avoiding per-request heap allocations.
+var encBufPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
 
 type message struct {
 	// ID is a monotonic per-request correlation ID. The client sets a unique
@@ -492,7 +499,6 @@ func (t *tcpTransport) handleConn(conn net.Conn) {
 	maxBytes := t.maxMsgBytes()
 	limited := &io.LimitedReader{R: conn, N: maxBytes}
 	decoder := json.NewDecoder(limited)
-	encoder := json.NewEncoder(conn)
 
 	for {
 		// Refresh the read deadline before each message so idle connections
@@ -561,9 +567,16 @@ func (t *tcpTransport) handleConn(conn net.Conn) {
 				// M5: bound the time spent writing a response so a stalled/slow
 				// peer socket cannot block this goroutine indefinitely.
 				conn.SetWriteDeadline(time.Now().Add(idleWriteTimeout)) //nolint:errcheck
-				if err := encoder.Encode(respMsg); err != nil {
+				wbuf := encBufPool.Get().(*bytes.Buffer)
+				wbuf.Reset()
+				encErr := json.NewEncoder(wbuf).Encode(respMsg)
+				if encErr == nil {
+					_, encErr = conn.Write(wbuf.Bytes())
+				}
+				encBufPool.Put(wbuf)
+				if encErr != nil {
 					if t.logger != nil {
-						t.logger.Error("failed to write response", zap.Error(err))
+						t.logger.Error("failed to write response", zap.Error(encErr))
 					}
 					return
 				}
@@ -744,7 +757,6 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 		return nil, err
 	}
 
-	encoder := json.NewEncoder(conn)
 	decoder := json.NewDecoder(conn)
 
 	// C12: assign a unique correlation ID for this request. The server echoes
@@ -761,9 +773,17 @@ func (t *tcpTransport) sendRequest(ctx context.Context, peer *peer, msgType stri
 		msg.Payload = data
 	}
 
-	if err := encoder.Encode(msg); err != nil {
+	// Use pooled buffer to encode the outer message envelope.
+	wbuf := encBufPool.Get().(*bytes.Buffer)
+	wbuf.Reset()
+	encErr := json.NewEncoder(wbuf).Encode(msg)
+	if encErr == nil {
+		_, encErr = conn.Write(wbuf.Bytes())
+	}
+	encBufPool.Put(wbuf)
+	if encErr != nil {
 		t.discardConn(conn)
-		return nil, err
+		return nil, encErr
 	}
 
 	var resp message
