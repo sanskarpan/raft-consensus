@@ -87,6 +87,16 @@ type Config struct {
 	// over TLS, never plaintext (C11). Set it in production to guarantee no
 	// accidental cleartext inter-node traffic.
 	RequireTLS bool `yaml:"require_tls"`
+	// InsecureTransport explicitly disables TLS for inter-node communication.
+	// Set to true only in development environments. Production deployments should
+	// configure tls_cert/tls_key/tls_ca for mTLS. Suppresses the cleartext
+	// warning when set. (M-TLS1)
+	InsecureTransport bool `yaml:"insecure_transport"`
+	// AutoTLS, when true, generates a self-signed certificate+key pair in DataDir
+	// on first startup if no TLS certificate is configured. The generated cert is
+	// used for both serving and peer verification (self-signed CA). This enables
+	// encrypted inter-node traffic with zero manual cert setup. (M-TLS2)
+	AutoTLS bool `yaml:"auto_tls"`
 	// BinaryTransport, when true (the default), causes the TCP transport to
 	// negotiate binary framing with peers on the hot RPC path.
 	// Set to false to force JSON framing (useful for debugging or rollback).
@@ -627,6 +637,33 @@ func (s *Server) initRaft() error {
 
 	if err := os.MkdirAll(nodeDir, 0755); err != nil {
 		return err
+	}
+
+	// M-TLS1: warn loudly when inter-node traffic will be cleartext.
+	// This is not a hard failure so existing deployments without TLS continue to
+	// work, but operators who haven't set insecure_transport explicitly are
+	// notified that they should address it.
+	tlsExplicit := s.config.TLSCert != "" || s.config.TLSKey != "" || s.config.TLSCA != ""
+	if !tlsExplicit && !s.config.InsecureTransport && !s.config.AutoTLS {
+		s.logger.Warn("inter-node traffic is NOT encrypted — set auto_tls: true for development " +
+			"or configure tls_cert/tls_key/tls_ca for production mTLS; " +
+			"to silence this warning set insecure_transport: true")
+	}
+
+	// M-TLS2: auto-generate a self-signed ECDSA cert if auto_tls is set and no
+	// manual cert is configured.
+	if s.config.AutoTLS && !tlsExplicit {
+		paths, err := transport.EnsureAutoTLSCerts(nodeDir, s.config.NodeID)
+		if err != nil {
+			return fmt.Errorf("auto TLS cert generation: %w", err)
+		}
+		s.logger.Info("auto-TLS: using self-signed certificate",
+			zap.String("cert", paths.CertFile),
+			zap.String("key", paths.KeyFile),
+		)
+		s.config.TLSCert = paths.CertFile
+		s.config.TLSKey = paths.KeyFile
+		s.config.TLSCA = paths.CAFile
 	}
 
 	wal, err := storage.NewWAL(nodeDir+"/wal", nil)

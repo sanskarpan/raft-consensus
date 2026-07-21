@@ -1,6 +1,15 @@
 package transport
 
-import "crypto/tls"
+import (
+	"crypto/tls"
+	"crypto/x509"
+)
+
+// VerifySANForNodeID exposes the unexported verifySANForNodeID for unit tests.
+var VerifySANForNodeID = verifySANForNodeID
+
+// Ensure the type alias compiles (the function returns a func matching tls.Config.VerifyPeerCertificate).
+var _ func([][]byte, [][]*x509.Certificate) error = VerifySANForNodeID("")
 
 // Test-only accessors for otherwise-unexported TLS configuration, used by the
 // C11 hardening regression tests. Compiled only under `go test`.

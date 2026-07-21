@@ -768,6 +768,15 @@ func (t *GrpcTransport) AddPeer(id raft.ServerID, addr raft.ServerAddress) error
 		// against its own cert SANs.
 		peerTLS := outboundTLS.Clone()
 		peerTLS.ServerName = serverNameFor(outboundTLS.ServerName, string(addr))
+		// Wire SAN verification so a cert that merely chains to the cluster CA
+		// but has the wrong node identity is rejected (M-TLS4). Only active when
+		// the allowed-member set is configured (implying mTLS + explicit authz).
+		// SessionTicketsDisabled prevents resumed sessions from bypassing
+		// VerifyPeerCertificate (gosec G123).
+		if string(id) != "" && len(t.allowedMembers) > 0 {
+			peerTLS.SessionTicketsDisabled = true
+			peerTLS.VerifyPeerCertificate = verifySANForNodeID(string(id))
+		}
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(peerTLS)))
 	} else {
 		// C11: never silently fall back to plaintext when TLS is required.
@@ -1230,6 +1239,34 @@ func (h *grpcAdminHandler) TransferLeadership(ctx context.Context, req *proto.Tr
 		return h.transport.adminHandler.HandleTransferLeadership(req), nil
 	}
 	return &proto.TransferLeadershipResponse{}, nil
+}
+
+// verifySANForNodeID returns a tls.Config.VerifyPeerCertificate function that
+// checks the peer cert contains expectedNodeID in its DNS SANs or CN.
+// This prevents a node with a valid cluster CA cert but wrong identity from
+// impersonating another node when mTLS is active.
+func verifySANForNodeID(expectedNodeID string) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("transport: no certificate provided by peer")
+		}
+		cert, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("transport: parse peer cert: %w", err)
+		}
+		// Check DNS SANs first.
+		for _, san := range cert.DNSNames {
+			if san == expectedNodeID {
+				return nil
+			}
+		}
+		// Fall back to CN.
+		if cert.Subject.CommonName == expectedNodeID {
+			return nil
+		}
+		return fmt.Errorf("transport: peer cert does not contain expected node ID %q (SANs: %v, CN: %q)",
+			expectedNodeID, cert.DNSNames, cert.Subject.CommonName)
+	}
 }
 
 func convertEntries(entries []*raft.LogEntry) []*proto.LogEntry {
