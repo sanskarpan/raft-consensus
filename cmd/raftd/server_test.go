@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -324,8 +325,9 @@ func (r *stubRaft) WaitApplied(ctx context.Context, idx uint64) error {
 func (r *stubRaft) Configuration() raft.Configuration                 { return raft.Configuration{} }
 func (r *stubRaft) ReadIndex(_ context.Context) (uint64, error)       { return 0, nil }
 func (r *stubRaft) Apply(_ context.Context, _ []byte) ([]byte, error) { return nil, nil }
-func (r *stubRaft) Snapshot() error                                   { return nil }
-func (r *stubRaft) Restore(_ context.Context, _ io.Reader) error      { return nil }
+func (r *stubRaft) Snapshot() error                                                { return nil }
+func (r *stubRaft) LatestSnapshot() (uint64, uint64, io.ReadCloser, error)         { return 0, 0, nil, errors.New("no snapshots") }
+func (r *stubRaft) Restore(_ context.Context, _ io.Reader) error                   { return nil }
 func (r *stubRaft) Start() error                                      { return nil }
 func (r *stubRaft) Shutdown() error                                   { return nil }
 func (r *stubRaft) RequestLeadership(_ context.Context) error         { return nil }

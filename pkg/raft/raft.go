@@ -2598,6 +2598,25 @@ func (r *raft) Snapshot() error {
 	return future.err
 }
 
+// LatestSnapshot opens the most recent snapshot from the snapshot store.
+// It returns the snapshot's index, term, and a streaming reader. The caller
+// must close rc. Returns an error if no snapshots are available.
+func (r *raft) LatestSnapshot() (uint64, uint64, io.ReadCloser, error) {
+	snaps, err := r.snapshot.List()
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	if len(snaps) == 0 {
+		return 0, 0, nil, fmt.Errorf("no snapshots available")
+	}
+	// List returns newest first.
+	snap, meta, err := r.snapshot.Open(snaps[0].ID)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("open snapshot %s: %w", snaps[0].ID, err)
+	}
+	return meta.Index, meta.Term, snap.Reader(), nil
+}
+
 func (r *raft) triggerSnapshot() {
 	r.mu.RLock()
 	threshold := r.config.SnapshotThreshold
