@@ -87,6 +87,10 @@ type Config struct {
 	// over TLS, never plaintext (C11). Set it in production to guarantee no
 	// accidental cleartext inter-node traffic.
 	RequireTLS bool `yaml:"require_tls"`
+	// BinaryTransport, when true (the default), causes the TCP transport to
+	// negotiate binary framing with peers on the hot RPC path.
+	// Set to false to force JSON framing (useful for debugging or rollback).
+	BinaryTransport bool `yaml:"binary_transport"`
 	// WatchIdleTimeout is the maximum time a /v1/watch SSE connection may be
 	// idle (no events delivered) before it is closed by the server.
 	// Zero uses the default of 5 minutes.
@@ -738,12 +742,15 @@ func (s *Server) initRaft() error {
 			}
 			s.logger.Info("TCP transport TLS enabled")
 		}
-		tcpTrans, err := transport.NewTCPTransportTLS(
+		tcpTrans, err := transport.NewTCPTransportWithConfig(
 			s.config.ListenAddr,
 			wrapper,
-			10*time.Second,
-			s.logger,
-			tcpTLSCfg,
+			transport.TCPTransportConfig{
+				Timeout:         10 * time.Second,
+				Logger:          s.logger,
+				TLS:             tcpTLSCfg,
+				BinaryTransport: s.config.BinaryTransport,
+			},
 		)
 		if err != nil {
 			return err
