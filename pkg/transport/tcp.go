@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,58 @@ import (
 // on the hot send path, avoiding per-request heap allocations.
 var encBufPool = sync.Pool{
 	New: func() interface{} { return new(bytes.Buffer) },
+}
+
+// binaryMagic is the 4-byte probe sent by a connecting client to negotiate
+// binary framing. If the server echoes it, both sides switch to binary framing.
+var binaryMagic = [4]byte{'R', 'F', 0x02, 0x00}
+
+// binaryFrameHeaderSize is the size of the binary frame header in bytes:
+// 4-byte magic + 1-byte type tag + 4-byte payload length (big-endian uint32).
+const binaryFrameHeaderSize = 9
+
+// WriteBinaryFrame writes a framed binary message to w.
+// Frame layout: [4]magic | uint8 typeTag | uint32 payloadLen (big-endian) | payload
+func WriteBinaryFrame(w io.Writer, typeTag uint8, payload []byte) error {
+	var hdr [binaryFrameHeaderSize]byte
+	copy(hdr[:4], binaryMagic[:])
+	hdr[4] = typeTag
+	binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		_, err := w.Write(payload)
+		return err
+	}
+	return nil
+}
+
+// ReadBinaryFrame reads one framed binary message from r.
+// Returns the type tag and payload. Returns error on magic mismatch or I/O failure.
+func ReadBinaryFrame(r io.Reader) (typeTag uint8, payload []byte, err error) {
+	var hdr [binaryFrameHeaderSize]byte
+	if _, err = io.ReadFull(r, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	if [4]byte(hdr[:4]) != binaryMagic {
+		return 0, nil, fmt.Errorf("transport: binary frame magic mismatch: %x", hdr[:4])
+	}
+	typeTag = hdr[4]
+	payloadLen := binary.BigEndian.Uint32(hdr[5:9])
+	if payloadLen == 0 {
+		return typeTag, []byte{}, nil
+	}
+	payload = make([]byte, payloadLen)
+	if _, err = io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	return typeTag, payload, nil
+}
+
+// BinaryMagic returns the 4-byte handshake probe constant for use in tests.
+func BinaryMagic() [4]byte {
+	return binaryMagic
 }
 
 type message struct {
