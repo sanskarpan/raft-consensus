@@ -1,0 +1,68 @@
+{{/*
+SPIFFE/SPIRE workload identity configuration.
+
+When spiffe.enabled is true this template renders a ConfigMap with a sample
+SPIRE agent registration entry (for reference) and documents how to annotate
+the Raft StatefulSet so the SPIRE agent injects the workload socket.
+
+Usage
+-----
+  helm upgrade --install raft-cluster ./raft-cluster \
+    --set spiffe.enabled=true \
+    --set spiffe.trustDomain=cluster.local
+
+The StatefulSet spec must include:
+  1. A hostPath volume pointing at the SPIRE agent socket directory.
+  2. A volumeMount in the raft container that exposes the socket.
+  3. (Optional) a SPIRE Workload Registrar annotation so the agent
+     auto-registers the pod's SPIFFE ID on creation.
+
+Example StatefulSet patch (add under spec.template):
+  metadata:
+    annotations:
+      # SPIRE Workload Registrar / controller annotation (k8s-workload-registrar).
+      # Replace <namespace> and <service-account> with your deployment values.
+      spiffe.io/spiffe-id: "spiffe://{{ .Values.spiffe.trustDomain }}/ns/<namespace>/sa/<service-account>"
+  spec:
+    volumes:
+      - name: spire-agent-socket
+        hostPath:
+          path: /run/spire/sockets
+          type: DirectoryOrCreate
+    containers:
+      - name: raft
+        volumeMounts:
+          - name: spire-agent-socket
+            mountPath: /run/spire/sockets
+            readOnly: true
+        env:
+          - name: SPIFFE_ENDPOINT_SOCKET
+            value: "unix://{{ .Values.spiffe.socket }}"
+*/}}
+
+{{- if .Values.spiffe.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "raft-cluster.fullname" . }}-spiffe
+  labels:
+    {{- include "raft-cluster.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/chart: {{ include "raft-cluster.chart" . }}
+data:
+  # Trust domain used for SPIFFE peer authorization.
+  # All Raft nodes must present SVIDs from this domain.
+  trust-domain: {{ .Values.spiffe.trustDomain | quote }}
+
+  # Path to the SPIRE agent Workload API socket (mounted as a hostPath volume).
+  socket: {{ .Values.spiffe.socket | quote }}
+
+  # Sample SPIRE registration entry (apply with: spire-server entry create ...).
+  # Adjust the selectors to match your deployment's namespace and service account.
+  registration-entry-hint: |
+    spire-server entry create \
+      -spiffeID spiffe://{{ .Values.spiffe.trustDomain }}/raft/node \
+      -parentID spiffe://{{ .Values.spiffe.trustDomain }}/agent/k8s \
+      -selector k8s:ns:{{ .Release.Namespace }} \
+      -selector k8s:sa:{{ include "raft-cluster.serviceAccountName" . | default "default" }}
+{{- end }}

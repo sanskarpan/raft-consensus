@@ -6,3 +6,22 @@ service:
   httpPort: 8080
 
 adminToken: ""
+
+# SPIFFE/SPIRE workload identity (optional — cloud-native alternative to manual TLS).
+# When enabled, each Raft node gets its X.509 SVID from the SPIRE agent running
+# as a DaemonSet (or sidecar), eliminating static cert management. Certificate
+# rotation is automatic and requires no node restart.
+#
+# To use this feature:
+#   1. Deploy SPIRE server + agent in your cluster (see https://spiffe.io/docs/latest/deploying/).
+#   2. Set spiffe.enabled: true and configure the trust domain to match your SPIRE server.
+#   3. The StatefulSet gets a SPIRE agent socket volume and annotation automatically.
+#
+# When spiffe.enabled is false, the existing tls_cert/tls_key/tls_ca fields are used.
+spiffe:
+  enabled: false
+  # socket is the host-path to the SPIRE agent Workload API socket.
+  # This is mounted into each Raft pod at the same path.
+  socket: /run/spire/sockets/agent.sock
+  # trustDomain must match the trust domain configured in your SPIRE server.
+  trustDomain: "cluster.local"

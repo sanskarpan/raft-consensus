@@ -160,6 +160,17 @@ type Config struct {
 		Prefix    string `yaml:"prefix"`
 		Compress  bool   `yaml:"compress"`
 	} `yaml:"backup_minio"`
+
+	// SpiffeSocket is the path to the SPIFFE Workload API socket. When set,
+	// SPIFFE SVIDs are used for mutual TLS instead of static cert files.
+	// Overrides tls_cert/tls_key/tls_ca when set.
+	// Example: /run/spire/sockets/agent.sock
+	// If empty, the SPIFFE_ENDPOINT_SOCKET environment variable is used.
+	SpiffeSocket string `yaml:"spiffe_socket"`
+	// SpiffeTrustDomain is the trust domain for SPIFFE peer authorization,
+	// e.g. "cluster.local". All peers must present SVIDs from this trust
+	// domain for mTLS to succeed.
+	SpiffeTrustDomain string `yaml:"spiffe_trust_domain"`
 }
 
 type ClusterMember struct {
@@ -374,14 +385,15 @@ type Server struct {
 	watchMgr        *fsm.WatchManager // SSE event fan-out
 	uploader        backup.Uploader   // pluggable snapshot uploader (#216)
 	watchCtxCancel  context.CancelFunc
-	sweepCancel     context.CancelFunc // cancels sweepPerIPLimiters goroutine on shutdown
-	tickCancel      context.CancelFunc // cancels leaderTickLoop goroutine on shutdown (#207)
-	limiter         *writeLimiter      // global token-bucket rate limiter
-	perIPLimiters   sync.Map           // map[string]*writeLimiter — per client-IP limiters
-	watchCount      int64              // current number of open /v1/watch SSE streams (atomic)
-	watchPerIP      sync.Map           // map[string]*int64 — open watch streams per client IP
-	trustedNets     []*net.IPNet       // parsed from config TrustedProxyCIDRs
-	tracingProvider *tracing.Provider  // shutdown on exit
+	sweepCancel     context.CancelFunc      // cancels sweepPerIPLimiters goroutine on shutdown
+	tickCancel      context.CancelFunc      // cancels leaderTickLoop goroutine on shutdown (#207)
+	spiffeSource    *transport.SpiffeSource // SPIFFE workload identity source (nil if not configured)
+	limiter         *writeLimiter           // global token-bucket rate limiter
+	perIPLimiters   sync.Map                // map[string]*writeLimiter — per client-IP limiters
+	watchCount      int64                   // current number of open /v1/watch SSE streams (atomic)
+	watchPerIP      sync.Map                // map[string]*int64 — open watch streams per client IP
+	trustedNets     []*net.IPNet            // parsed from config TrustedProxyCIDRs
+	tracingProvider *tracing.Provider       // shutdown on exit
 	logger          *zap.Logger
 	http            *http.Server
 	debugServer     *http.Server
@@ -679,11 +691,28 @@ func (s *Server) initRaft() error {
 		return err
 	}
 
+	// SPIFFE workload identity: when spiffe_socket is configured (or the
+	// SPIFFE_ENDPOINT_SOCKET env var is set), obtain an X.509 SVID from the
+	// SPIRE agent instead of loading static cert files. This overrides the
+	// manual tls_cert/tls_key/tls_ca settings — the auto-rotating SVID takes
+	// precedence for mTLS. Close() is called in Shutdown().
+	if s.config.SpiffeSocket != "" || os.Getenv("SPIFFE_ENDPOINT_SOCKET") != "" {
+		ctx := context.Background()
+		spiffeSrc, err := transport.NewSpiffeSource(ctx, s.config.SpiffeSocket, s.logger)
+		if err != nil {
+			return fmt.Errorf("SPIFFE source init: %w", err)
+		}
+		s.spiffeSource = spiffeSrc
+		s.logger.Info("SPIFFE workload identity active",
+			zap.String("socket", s.config.SpiffeSocket),
+			zap.String("trust_domain", s.config.SpiffeTrustDomain))
+	}
+
 	// M-TLS1: warn loudly when inter-node traffic will be cleartext.
 	// This is not a hard failure so existing deployments without TLS continue to
 	// work, but operators who haven't set insecure_transport explicitly are
 	// notified that they should address it.
-	tlsExplicit := s.config.TLSCert != "" || s.config.TLSKey != "" || s.config.TLSCA != ""
+	tlsExplicit := s.config.TLSCert != "" || s.config.TLSKey != "" || s.config.TLSCA != "" || s.spiffeSource != nil
 	if !tlsExplicit && !s.config.InsecureTransport && !s.config.AutoTLS {
 		s.logger.Warn("inter-node traffic is NOT encrypted — set auto_tls: true for development " +
 			"or configure tls_cert/tls_key/tls_ca for production mTLS; " +
@@ -1241,6 +1270,14 @@ func (s *Server) Shutdown() {
 
 	if err := s.raftNode.Shutdown(); err != nil {
 		s.logger.Error("raft shutdown error", zap.Error(err))
+	}
+
+	// Stop SPIFFE workload identity source — this terminates the background
+	// certificate rotation watch with the SPIRE agent.
+	if s.spiffeSource != nil {
+		if err := s.spiffeSource.Close(); err != nil {
+			s.logger.Warn("SPIFFE source close error", zap.Error(err))
+		}
 	}
 
 	// Flush and stop the OpenTelemetry tracer provider.
