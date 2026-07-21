@@ -14,3 +14,19 @@ cluster:
   - id: node3
     address: localhost:8015
     http_address: localhost:8016
+
+# Transport security (M-TLS1 / M-TLS2)
+# Choose ONE of the following options:
+#
+# Option A: Zero-config encrypted dev (self-signed cert generated in data_dir)
+# auto_tls: true
+#
+# Option B: Production mTLS with CA-issued per-node certs
+#   Generate certs first: ./scripts/gen-dev-certs.sh certs/
+# tls_cert: certs/node3.crt
+# tls_key: certs/node3.key
+# tls_ca: certs/ca.crt
+# require_tls: true
+#
+# Option C: Explicitly opt out of TLS (development only, not recommended)
+insecure_transport: true  # remove in production; suppresses the cleartext warning
