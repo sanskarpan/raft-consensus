@@ -9,7 +9,7 @@ Raft-core tunables are defined in `pkg/raft/types.go`.
 - [Environment](#environment)
 - [YAML: server configuration](#yaml-server-configuration)
   - [Cluster membership](#cluster-membership)
-  - [Timing / Raft ticks](#timing--raft-ticks)
+  - [Timing and Raft ticks](#timing-and-raft-ticks)
   - [Authentication and roles](#authentication-and-roles)
   - [Transport and TLS](#transport-and-tls)
   - [HTTP API TLS](#http-api-tls)
@@ -71,7 +71,7 @@ or zero):
 Startup validation (`validateCluster`) requires: `cluster` non-empty, no empty or
 duplicate IDs, and the local `node_id` present in the list.
 
-### Timing / Raft ticks
+### Timing and Raft ticks
 
 One tick is **50 ms**. Election and heartbeat are expressed in ticks.
 

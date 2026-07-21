@@ -9,7 +9,7 @@ exactly those registered in `pkg/metrics/raft.go` and exposed at `/metrics`.
 - [Example Prometheus queries](#example-prometheus-queries)
 - [Suggested alerts](#suggested-alerts)
 - [Common failures and remediation](#common-failures-and-remediation)
-- [Backup and restore](#backup--restore)
+- [Backup and restore](#backup-and-restore)
 - [Scaling membership](#scaling-membership)
 
 ## Health and readiness

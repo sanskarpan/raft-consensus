@@ -1,0 +1,73 @@
+site_name: raft-consensus
+site_description: >-
+  A production-grade, fully-featured Raft consensus implementation in Go —
+  replicated KV store, gRPC/TCP transport, mTLS, SPIFFE, backup/DR, DES testing harness.
+site_author: sanskarpan
+repo_url: https://github.com/sanskarpan/raft-consensus
+repo_name: sanskarpan/raft-consensus
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.details
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Quick-start: quickstart.md
+  - Architecture:
+      - Overview: architecture.md
+      - Configuration reference: configuration.md
+  - KV Store:
+      - API reference: kv-store.md
+      - Transactions: transactions.md
+      - Watches & events: watches.md
+      - TTL & key expiry: ttl.md
+  - Transport & Security:
+      - TCP & gRPC transport: transport.md
+      - PKI & TLS: pki-guide.md
+  - Operations:
+      - Cluster management: operations.md
+      - Observability: observability.md
+      - Backup & disaster recovery: disaster-recovery.md
+  - Testing:
+      - DES harness: testing.md
+  - Design decisions:
+      - ADR index: adr/index.md
+      - "ADR-0001: Deterministic apply-time clock": adr/0001-apply-time-clock.md
+      - "ADR-0002: Binary TCP wire format": adr/0002-binary-transport.md
+      - "ADR-0003: SPIFFE workload identity": adr/0003-spiffe.md
+      - "ADR-0004: DES simulation harness": adr/0004-des-harness.md
+  - Changelog: changelog.md
