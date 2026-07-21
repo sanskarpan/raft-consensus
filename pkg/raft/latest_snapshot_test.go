@@ -46,7 +46,6 @@ func (s *testSink) Close() error {
 
 type testSnapReader struct {
 	data []byte
-	r    io.Reader
 }
 
 func (s *testSnapReader) Index() uint64         { return 0 }
