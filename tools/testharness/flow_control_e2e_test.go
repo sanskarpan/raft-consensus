@@ -16,7 +16,6 @@ package testharness_test
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -40,12 +39,7 @@ func setupFCCluster(t *testing.T, basePort int, extraConfig string) (*testharnes
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
-		t.Skipf("skipping: raftd build failed: %v\n%s", buildErr, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	harnessDir := filepath.Join(tmpDir, "harness")
 	if err := os.MkdirAll(harnessDir, 0755); err != nil {

@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,13 +45,7 @@ func setupTTLCluster(t *testing.T) (*client.Client, func()) {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
-		os.RemoveAll(tmpDir)
-		t.Skipf("skipping: raftd build failed: %v\n%s", buildErr, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	harnessDir := filepath.Join(tmpDir, "harness")
 	if err := os.MkdirAll(harnessDir, 0755); err != nil {

@@ -3,7 +3,7 @@
 > A linearizable, strongly-consistent distributed key/value store built on a from-scratch Raft implementation in Go — WAL storage, gRPC/TCP transport, mTLS, snapshots, joint-consensus membership, watches, and a React dashboard.
 
 [![CI](https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/go-1.25%2B-00ADD8?logo=go)](https://go.dev/dl/)
+[![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev/dl/)
 [![Go Report Card](https://goreportcard.com/badge/github.com/sanskarpan/raft-consensus)](https://goreportcard.com/report/github.com/sanskarpan/raft-consensus)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 
@@ -83,15 +83,15 @@ go build -o raftd ./cmd/raftd
 go build -o kvctl ./cmd/kvctl
 ```
 
-Run a 3-node cluster locally using the bundled per-node configs (raft ports 8001/8003/8005, HTTP ports 8002/8004/8006):
+Run a 3-node cluster locally using the bundled per-node configs (raft ports 8011/8013/8015, HTTP ports 8012/8014/8016):
 
 ```bash
 ./raftd -config config-node1.yaml &
 ./raftd -config config-node2.yaml &
 ./raftd -config config-node3.yaml &
 
-./kvctl --endpoints localhost:8002,localhost:8004,localhost:8006 put hello world
-./kvctl --endpoints localhost:8002,localhost:8004,localhost:8006 get hello
+./kvctl --endpoints localhost:8012,localhost:8014,localhost:8016 put hello world
+./kvctl --endpoints localhost:8012,localhost:8014,localhost:8016 get hello
 ```
 
 > These sample configs set `allow_no_auth` implicitly off; when no `admin_token`/`admin_tokens` are configured the auth middleware **fails closed** and rejects requests. For local experimentation add `allow_no_auth: true` to each config, or configure a token (see [Configuration](#configuration-reference)).
@@ -139,6 +139,8 @@ Default chart ports are `service.raftPort: 8080` and `service.httpPort: 8081`. S
 | `admin_token` | string | `""` | Legacy single token; grants the `write` role. |
 | `admin_tokens` | map | `{}` | `token → role` map (`read` or `write`). |
 | `allow_no_auth` | bool | `false` | Explicitly run without auth (dev only); otherwise auth fails closed. |
+| `auto_tls` | bool | `false` | Generates self-signed cert+key in `data_dir` on first startup for automatic encrypted inter-node traffic. |
+| `insecure_transport` | bool | `false` | Suppresses the cleartext warning (dev only); production must use `tls_cert`/`tls_key`/`tls_ca` or `auto_tls`. |
 | `tls_cert` / `tls_key` / `tls_ca` | string | `""` | Peer transport TLS/mTLS cert, key, CA. |
 | `require_tls` | bool | `false` | Fail closed: peers may only be dialed over TLS. |
 | `https_cert` / `https_key` | string | `""` | Enable TLS on the HTTP API (both required together). |
@@ -258,6 +260,19 @@ Full threat model and hardening checklist: [docs/security.md](docs/security.md).
 | [docs/tuning.md](docs/tuning.md) | Performance tuning and benchmarking. |
 | [docs/security.md](docs/security.md) | Security model, threat model, hardening checklist. |
 | [docs/versioning.md](docs/versioning.md) | Versioning and compatibility policy. |
+| [docs/changelog.md](docs/changelog.md) | Release history and version changelog. |
+| [docs/disaster-recovery.md](docs/disaster-recovery.md) | Disaster recovery procedures and data restoration. |
+| [docs/index.md](docs/index.md) | Documentation index and overview. |
+| [docs/kv-store.md](docs/kv-store.md) | Key/value store semantics, versioning, and lease/TTL design. |
+| [docs/observability.md](docs/observability.md) | Detailed metrics reference, dashboard templates, and alerting rules. |
+| [docs/pki-guide.md](docs/pki-guide.md) | PKI setup guide for mTLS certificate management. |
+| [docs/quickstart.md](docs/quickstart.md) | Expanded quickstart guide with Docker Compose and Kubernetes. |
+| [docs/runbook.md](docs/runbook.md) | Incident response runbook for common failure scenarios. |
+| [docs/testing.md](docs/testing.md) | Test architecture: unit, integration, chaos, and linearizability verification. |
+| [docs/transactions.md](docs/transactions.md) | Transaction protocol: compare-and-swap branches and atomicity guarantees. |
+| [docs/transport.md](docs/transport.md) | Transport layer: TCP binary, gRPC, TLS/mTLS configuration. |
+| [docs/ttl.md](docs/ttl.md) | TTL/lease design: key expiry, tick loop, and sweep semantics. |
+| [docs/watches.md](docs/watches.md) | Watch/SSE streaming: key and prefix watches, revision history, reconnect. |
 
 ## License
 

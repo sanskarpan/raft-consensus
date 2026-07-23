@@ -56,14 +56,8 @@ func TestMultiProcessCluster(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	buildOut, buildErr := buildCmd.CombinedOutput()
-	if buildErr != nil {
-		t.Skipf("skipping: failed to build raftd binary: %v\n%s", buildErr, buildOut)
-	}
-	t.Logf("built raftd binary: %s", binaryPath)
+	binaryPath := buildRaftd(t)
+	t.Logf("using raftd binary: %s", binaryPath)
 
 	// Step 3 & 4: Create harness and start 3 nodes.
 	harnessDir := filepath.Join(tmpDir, "harness")
@@ -174,13 +168,7 @@ func setupV1Cluster(t *testing.T, basePort int) (*testharness.Harness, string, [
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
-	// Build the raftd binary.
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
-		t.Skipf("skipping: raftd build failed: %v\n%s", buildErr, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	harnessDir := filepath.Join(tmpDir, "harness")
 	if err := os.MkdirAll(harnessDir, 0755); err != nil {
@@ -481,12 +469,7 @@ func TestMembershipAPI(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	h := testharness.NewHarness(tmpDir, 20030, testharness.WithBinary(binaryPath))
 	defer h.StopAll() //nolint:errcheck
@@ -566,12 +549,7 @@ func TestWatchAuthRejected(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	// Write a single-node config with a static admin token.
 	nodeDir := filepath.Join(tmpDir, "authnode")

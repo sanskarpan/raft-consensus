@@ -38,6 +38,9 @@ scripts/certs/generated/
 /kvctl
 /cmd/raftd/raftd
 /cmd/kvctl/kvctl
+# AI agent worktrees
+.claude/
+
 # Runtime state files
 *.db
 *.wal

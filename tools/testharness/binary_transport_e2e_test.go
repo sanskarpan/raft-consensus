@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -30,12 +29,7 @@ func setupBinaryCluster(t *testing.T, basePort int, extraConfig string) (*testha
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
-	binaryPath := filepath.Join(tmpDir, "raftd")
-	buildCmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/raftd")
-	buildCmd.Dir = projectRoot(t)
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		t.Skipf("skipping: failed to build raftd: %v\n%s", err, out)
-	}
+	binaryPath := buildRaftd(t)
 
 	harnessDir := filepath.Join(tmpDir, "harness")
 	if err := os.MkdirAll(harnessDir, 0755); err != nil {
