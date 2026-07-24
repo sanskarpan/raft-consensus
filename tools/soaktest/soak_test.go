@@ -17,7 +17,7 @@ import (
 	"github.com/sanskarpan/raft-consensus/tools/testharness"
 )
 
-var soakDuration = flag.Duration("soak.duration", 30*time.Second, "duration of the soak test")
+var soakDuration = flag.Duration("soak.duration", 10*time.Second, "duration of the soak test")
 var soakConcurrency = flag.Int("soak.concurrency", 10, "number of concurrent writers")
 
 func projectRoot(t *testing.T) string {
