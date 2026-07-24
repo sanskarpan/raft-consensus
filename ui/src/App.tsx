@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import ErrorBoundary from './components/ErrorBoundary'
 import ClusterTopology from './components/ClusterTopology'
 import ReplicationLag from './components/ReplicationLag'
 import MetricsDashboard from './components/MetricsDashboard'
@@ -12,8 +13,8 @@ import { useAuth } from './hooks/useAuth'
 const TABS = ['Cluster', 'KV Store', 'Metrics', 'Logs', 'Snapshots', 'Settings'] as const
 type Tab = typeof TABS[number]
 
-// Default HTTP addresses matching config-node{1,2,3}.yaml (http_addr :8002/:8004/:8006)
-const DEFAULT_NODES = ['localhost:8002', 'localhost:8004', 'localhost:8006']
+// Default HTTP addresses matching config-node{1,2,3}.yaml (http_addr :8012/:8014/:8016)
+const DEFAULT_NODES = ['localhost:8012', 'localhost:8014', 'localhost:8016']
 const NODES_KEY = 'raft_node_addrs'
 
 function loadNodes(): string[] {
@@ -77,11 +78,15 @@ export default function App() {
         </div>
 
         {/* Tab nav */}
-        <nav className="max-w-7xl mx-auto px-4 flex gap-1 pb-0">
+        <nav className="max-w-7xl mx-auto px-4 flex gap-1 pb-0" role="tablist" aria-label="Dashboard sections">
           {TABS.map(t => (
             <button
               key={t}
+              role="tab"
+              aria-selected={tab === t}
+              aria-controls={`panel-${t}`}
               onClick={() => setTab(t)}
+              onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); const idx = TABS.indexOf(t); const next = e.key === 'ArrowLeft' ? (idx - 1 + TABS.length) % TABS.length : (idx + 1) % TABS.length; setTab(TABS[next]); } }}
               className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
                 tab === t
                   ? 'bg-white dark:bg-gray-900 text-gray-900 dark:text-white'
@@ -96,15 +101,18 @@ export default function App() {
 
       {/* Content */}
       <main className="max-w-7xl mx-auto px-4 py-6">
+        <ErrorBoundary>
         {tab === 'Cluster' && (
-          <div className="space-y-6">
+          <div id="panel-Cluster" role="tabpanel" className="space-y-6">
             <ClusterTopology nodeAddrs={nodes} token={token ?? undefined} />
             <ReplicationLag nodeAddrs={nodes} token={token ?? undefined} />
           </div>
         )}
 
         {tab === 'KV Store' && (
-          <KVExplorer nodeAddrs={nodes} token={token ?? undefined} />
+          <div id="panel-KV Store" role="tabpanel">
+            <KVExplorer nodeAddrs={nodes} token={token ?? undefined} />
+          </div>
         )}
 
         {tab === 'Metrics' && (
@@ -171,6 +179,7 @@ export default function App() {
             </div>
           </div>
         )}
+        </ErrorBoundary>
       </main>
     </div>
   )

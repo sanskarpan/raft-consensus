@@ -31,12 +31,23 @@ jobs:
       - name: Install syft
         uses: anchore/sbom-action/download-syft@v0
 
+      # Generate release notes from the commit history since the last tag.
+      # Uses GitHub's built-in release notes generator for a consistent changelog.
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          gh api repos/${{ github.repository }}/releases/generate-notes \
+            --field tag_name=${{ github.ref_name }} \
+            --jq '.body' > /tmp/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          args: release --clean --release-notes /tmp/release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -160,3 +171,38 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign sign --yes "ghcr.io/${{ github.repository }}@${DIGEST}"
+
+  # Package and publish the Helm chart to GHCR OCI registry so users can
+  # install via: helm install my-raft oci://ghcr.io/sanskarpan/raft-consensus/charts/raft
+  helm-chart:
+    name: Publish Helm chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Package Helm chart
+        run: |
+          helm package charts/raft \
+            --version "${VERSION#v}" \
+            --destination /tmp/helm-charts
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+
+      - name: Push Helm chart to GHCR
+        run: |
+          helm push /tmp/helm-charts/raft-*.tgz \
+            oci://ghcr.io/${{ github.repository_owner }}/charts

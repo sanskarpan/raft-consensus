@@ -12,6 +12,11 @@ service:
   raftPort: 8080
   httpPort: 8081
 
+# Priority class for the Raft pods. Use a high-priority class for critical
+# control-plane workloads to prevent preemption during node pressure.
+# Example: priorityClassName: system-cluster-critical
+priorityClassName: ""
+
 resources:
   requests:
     cpu: 100m
@@ -50,8 +55,9 @@ terminationGracePeriodSeconds: 40
 # anti-affinity). Leave empty to use the default soft rule.
 affinity: {}
 
-# Spread pods across failure domains (e.g. zones). Empty by default.
-# Example:
+# Spread pods across failure domains (e.g. zones). Empty uses a built-in
+# default that spreads across zones with maxSkew=1 for production deployments.
+# Example override:
 #   - maxSkew: 1
 #     topologyKey: topology.kubernetes.io/zone
 #     whenUnsatisfiable: ScheduleAnyway
@@ -59,11 +65,39 @@ affinity: {}
 #       matchLabels: { app: <release>-raft }
 topologySpreadConstraints: []
 
+# Additional labels and annotations applied to every pod.
+podLabels: {}
+podAnnotations: {}
+
+# Extra environment variables injected into the raftd container.
+extraEnv: []
+# - name: MY_VAR
+#   value: my-value
+
+# Extra volume definitions and their corresponding volume mounts.
+extraVolumes: []
+# - name: my-volume
+#   configMap:
+#     name: my-config
+extraVolumeMounts: []
+# - name: my-volume
+#   mountPath: /etc/my-config
+#   readOnly: true
+
+# Update strategy for the StatefulSet. RollingUpdate is the default and safe
+# for Raft since each pod restarts independently. OnDelete gives manual control.
+updateStrategy: RollingUpdate
+
 # PodDisruptionBudget: cap voluntary disruptions so a node drain/upgrade cannot
 # evict enough quorum members to break the cluster.
 podDisruptionBudget:
   enabled: true
   maxUnavailable: 1
+
+# NetworkPolicy controls inter-pod traffic. When enabled, only traffic on the
+# Raft and HTTP ports from the same namespace is permitted.
+networkPolicy:
+  enabled: false
 
 # ServiceMonitor for the Prometheus Operator (requires its CRD).
 serviceMonitor:

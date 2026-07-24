@@ -13,11 +13,23 @@ spec:
   selector:
     matchLabels:
       app: {{ .Release.Name }}-raft
+  updateStrategy:
+    type: {{ .Values.updateStrategy | default "RollingUpdate" }}
   template:
     metadata:
       labels:
         app: {{ .Release.Name }}-raft
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 40 }}
       {{- if .Values.affinity }}
       affinity:
@@ -35,9 +47,17 @@ spec:
                     app: {{ .Release.Name }}-raft
                 topologyKey: kubernetes.io/hostname
       {{- end }}
-      {{- with .Values.topologySpreadConstraints }}
+      {{- if .Values.topologySpreadConstraints }}
       topologySpreadConstraints:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.topologySpreadConstraints | nindent 8 }}
+      {{- else }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: {{ .Release.Name }}-raft
       {{- end }}
       # distroless runs as uid 65532 (nonroot); fsGroup makes the mounted
       # PVC group-writable so the process can create its data dir.
@@ -61,6 +81,9 @@ spec:
                   name: {{ .Values.config.existingSecret | default (printf "%s-raft-token" .Release.Name) }}
                   key: {{ .Values.config.existingSecretKey | default "admin-token" }}
                   optional: true
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: raft
               containerPort: {{ .Values.service.raftPort }}
@@ -85,10 +108,16 @@ spec:
               mountPath: /data
             - name: config
               mountPath: /etc/raftd
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ .Release.Name }}-raft-config
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
   volumeClaimTemplates:
     - metadata:
         name: data
