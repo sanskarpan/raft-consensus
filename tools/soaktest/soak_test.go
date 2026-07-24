@@ -39,18 +39,13 @@ func projectRoot(t *testing.T) string {
 	}
 }
 
-func buildRaftd(t *testing.T) string {
-	t.Helper()
-	return buildRaftdCached(t)
-}
-
 var (
 	raftdBuildOnce sync.Once
 	raftdBinary    string
 	raftdBuildErr  error
 )
 
-func buildRaftdCached(t *testing.T) string {
+func buildRaftd(t *testing.T) string {
 	t.Helper()
 	raftdBuildOnce.Do(func() {
 		tmpDir, err := os.MkdirTemp("", "raftd-soak-*")
@@ -92,7 +87,7 @@ func setupSoakCluster(t *testing.T, basePort int) (*testharness.Harness, *client
 	}
 	t.Cleanup(func() { os.RemoveAll(tmpDir) })
 
-	binaryPath := buildRaftdCached(t)
+	binaryPath := buildRaftd(t)
 	harnessDir := filepath.Join(tmpDir, "harness")
 	if err := os.MkdirAll(harnessDir, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
