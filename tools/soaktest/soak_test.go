@@ -125,7 +125,7 @@ func setupSoakCluster(t *testing.T, basePort int) (*testharness.Harness, *client
 }
 
 func TestSoakSustainedWrite(t *testing.T) {
-	_, c := setupSoakCluster(t, 26000)
+	_, c := setupSoakCluster(t, 27000)
 	dur := *soakDuration
 	conc := *soakConcurrency
 
@@ -215,7 +215,7 @@ func TestSoakSustainedWrite(t *testing.T) {
 }
 
 func TestSoakLeaderFailover(t *testing.T) {
-	h, c := setupSoakCluster(t, 26200)
+	h, c := setupSoakCluster(t, 27200)
 	dur := *soakDuration
 
 	leaderID, err := h.WaitForLeader(15 * time.Second)
@@ -260,8 +260,10 @@ func TestSoakLeaderFailover(t *testing.T) {
 	}
 	measurements := make(chan measurement, 100000)
 	writeDone := make(chan struct{})
-
+	var writeWG sync.WaitGroup
+	writeWG.Add(1)
 	go func() {
+		defer writeWG.Done()
 		for {
 			select {
 			case <-writeDone:
@@ -276,8 +278,6 @@ func TestSoakLeaderFailover(t *testing.T) {
 			val := fmt.Sprintf("v-%06d", i)
 			start := time.Now()
 			_, err := c.Put(key, val)
-			// Recheck done in case it was signaled during the Put call,
-			// to avoid sending on a closed channel.
 			select {
 			case <-writeDone:
 				return
@@ -329,6 +329,7 @@ func TestSoakLeaderFailover(t *testing.T) {
 
 	time.Sleep(dur / 2)
 	close(writeDone)
+	writeWG.Wait()
 	close(measurements)
 	<-collectDone
 
