@@ -125,7 +125,7 @@ func setupSoakCluster(t *testing.T, basePort int) (*testharness.Harness, *client
 }
 
 func TestSoakSustainedWrite(t *testing.T) {
-	_, c := setupSoakCluster(t, 27000)
+	_, c := setupSoakCluster(t, 28000)
 	dur := *soakDuration
 	conc := *soakConcurrency
 
@@ -215,7 +215,7 @@ func TestSoakSustainedWrite(t *testing.T) {
 }
 
 func TestSoakLeaderFailover(t *testing.T) {
-	h, c := setupSoakCluster(t, 27200)
+	h, c := setupSoakCluster(t, 28200)
 	dur := *soakDuration
 
 	leaderID, err := h.WaitForLeader(15 * time.Second)
