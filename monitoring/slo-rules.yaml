@@ -1,0 +1,40 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: raft-slos
+  labels:
+    app: raft
+spec:
+  groups:
+    - name: raft.slos
+      rules:
+        - record: raft:slo:availability:ratio_5m
+          expr: |
+            clamp_min(
+              sum(rate(raft_proposals_total{outcome="committed"}[5m]))
+              /
+              (sum(rate(raft_proposals_total{outcome="committed"}[5m]))
+               + sum(rate(raft_proposals_total{outcome="dropped"}[5m]))
+               + sum(rate(raft_proposals_total{outcome="failed"}[5m])))
+            , 0)
+
+        - record: raft:slo:commit_latency:p99_5m
+          expr: histogram_quantile(0.99, sum(rate(raft_proposal_commit_latency_seconds_bucket[5m])) by (le))
+
+        - record: raft:slo:commit_latency:p50_5m
+          expr: histogram_quantile(0.50, sum(rate(raft_proposal_commit_latency_seconds_bucket[5m])) by (le))
+
+        - record: raft:slo:fsync_latency:p99_5m
+          expr: histogram_quantile(0.99, sum(rate(raft_wal_fsync_seconds_bucket[5m])) by (le))
+
+        - record: raft:slo:replication:active
+          expr: max(rate(raft_append_entries_sent_total{success="true"}[5m])) > 0
+
+        - record: raft:slo:leader:stable
+          expr: (1 - (increase(raft_leader_changes_total[5m]) > bool 0))
+
+        - record: raft:slo:apply_lag:max
+          expr: max(raft_apply_lag)
+
+        - record: raft:slo:replication_lag:max
+          expr: max(raft_replication_lag)
