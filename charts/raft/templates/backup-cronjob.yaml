@@ -1,0 +1,102 @@
+{{- if .Values.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-raft-backup
+  labels:
+    app: {{ .Release.Name }}-raft
+spec:
+  schedule: "{{ .Values.backup.schedule }}"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.backup.startingDeadlineSeconds | default 300 }}
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 604800
+      template:
+        metadata:
+          labels:
+            app: {{ .Release.Name }}-raft-backup
+        spec:
+          serviceAccountName: {{ .Values.backup.serviceAccountName | default "" }}
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: "{{ .Values.backup.image.repository }}:{{ .Values.backup.image.tag }}"
+              imagePullPolicy: {{ .Values.backup.image.pullPolicy | default "IfNotPresent" }}
+              env:
+                - name: RAFT_SERVICE
+                  value: "{{ .Release.Name }}-raft-0.{{ .Release.Name }}-raft-headless"
+                - name: RAFT_HTTP_PORT
+                  value: "{{ .Values.service.httpPort }}"
+                {{- if .Values.config.adminToken }}
+                - name: ADMIN_TOKEN
+                  value: "{{ .Values.config.adminToken }}"
+                {{- end }}
+                {{- if .Values.backup.extraEnv }}
+                {{- toYaml .Values.backup.extraEnv | nindent 16 }}
+                {{- end }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  SNAPSHOT_DIR="/tmp/raft-backups"
+                  mkdir -p "$SNAPSHOT_DIR"
+                  TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
+                  SNAPSHOT_FILE="${SNAPSHOT_DIR}/raft-snapshot-${TIMESTAMP}.snap"
+                  NODE_URL="http://${RAFT_SERVICE}:${RAFT_HTTP_PORT}"
+
+                  echo "[$(date -Iseconds)] triggering snapshot on ${RAFT_SERVICE}..."
+                  STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                    -X POST \
+                    {{- if .Values.config.adminToken }}
+                    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+                    {{- end }}
+                    "${NODE_URL}/admin/snapshot" \
+                    --max-time 60)
+                  if [ "$STATUS" != "200" ]; then
+                    echo "[$(date -Iseconds)] snapshot trigger returned HTTP ${STATUS}; aborting"
+                    exit 1
+                  fi
+                  echo "[$(date -Iseconds)] snapshot triggered successfully (HTTP ${STATUS})"
+
+                  echo "[$(date -Iseconds)] downloading snapshot..."
+                  curl -s \
+                    {{- if .Values.config.adminToken }}
+                    -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+                    {{- end }}
+                    "${NODE_URL}/admin/snapshot/download" \
+                    --max-time 300 \
+                    -o "${SNAPSHOT_FILE}"
+                  echo "[$(date -Iseconds)] snapshot downloaded (${SNAPSHOT_FILE})"
+
+                  SNAPSHOT_SIZE=$(stat -c%s "${SNAPSHOT_FILE}" 2>/dev/null || stat -f%z "${SNAPSHOT_FILE}" 2>/dev/null || echo "unknown")
+                  echo "[$(date -Iseconds)] snapshot size: ${SNAPSHOT_SIZE} bytes"
+
+                  {{- if .Values.backup.s3.enabled }}
+                  echo "[$(date -Iseconds)] uploading to S3..."
+                  S3_BUCKET="{{ .Values.backup.s3.bucket }}"
+                  S3_PREFIX="{{ .Values.backup.s3.prefix }}"
+                  S3_ENDPOINT="{{ .Values.backup.s3.endpoint }}"
+                  S3_REGION="{{ .Values.backup.s3.region }}"
+                  aws s3 cp "${SNAPSHOT_FILE}" "s3://${S3_BUCKET}/${S3_PREFIX}raft-snapshot-${TIMESTAMP}.snap" \
+                    {{- if .Values.backup.s3.endpoint }}
+                    --endpoint-url "${S3_ENDPOINT}" \
+                    {{- end }}
+                    --region "${S3_REGION}"
+                  echo "[$(date -Iseconds)] upload to S3 complete"
+                  {{- end }}
+
+                  {{- if .Values.backup.gcs.enabled }}
+                  echo "[$(date -Iseconds)] uploading to GCS..."
+                  GCS_BUCKET="{{ .Values.backup.gcs.bucket }}"
+                  GCS_PREFIX="{{ .Values.backup.gcs.prefix }}"
+                  gsutil cp "${SNAPSHOT_FILE}" "gs://${GCS_BUCKET}/${GCS_PREFIX}raft-snapshot-${TIMESTAMP}.snap"
+                  echo "[$(date -Iseconds)] upload to GCS complete"
+                  {{- end }}
+
+                  echo "[$(date -Iseconds)] backup completed successfully"
+              {{- with .Values.backup.resources }}
+              resources:
+                {{- toYaml . | nindent 16 }}
+              {{- end }}
+{{- end }}
