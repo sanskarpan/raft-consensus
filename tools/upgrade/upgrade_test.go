@@ -105,6 +105,7 @@ func TestFullClusterUpgrade(t *testing.T) {
 
 	t.Log("starting all nodes with new binary...")
 	h2 := testharness.NewHarness(harnessDir, basePort, testharness.WithBinary(v2Binary))
+	defer h2.StopAll()
 	for _, id := range nodeIDs {
 		if err := h2.StartNode(id); err != nil {
 			t.Fatalf("start %s (v2): %v", id, err)
@@ -199,6 +200,7 @@ func TestFullClusterRollback(t *testing.T) {
 
 	t.Log("restarting all nodes (simulated rollback)...")
 	h2 := testharness.NewHarness(harnessDir, basePort, testharness.WithBinary(rollbackBinary))
+	defer h2.StopAll()
 	for _, id := range nodeIDs {
 		if err := h2.StartNode(id); err != nil {
 			t.Fatalf("start %s (rollback): %v", id, err)
