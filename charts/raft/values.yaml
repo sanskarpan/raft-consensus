@@ -99,6 +99,36 @@ podDisruptionBudget:
 networkPolicy:
   enabled: false
 
+# Backup CronJob configuration. The CronJob triggers a snapshot via the admin
+# API, downloads it, and optionally uploads to S3 or GCS.
+backup:
+  enabled: false
+  schedule: "0 3 * * *"
+  startingDeadlineSeconds: 300
+  image:
+    repository: amazon/aws-cli
+    tag: "2.24.0"
+    pullPolicy: IfNotPresent
+  serviceAccountName: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  s3:
+    enabled: false
+    bucket: ""
+    prefix: "raft-backups/"
+    endpoint: ""
+    region: us-east-1
+  gcs:
+    enabled: false
+    bucket: ""
+    prefix: "raft-backups/"
+  extraEnv: []
+
 # ServiceMonitor for the Prometheus Operator (requires its CRD).
 serviceMonitor:
   enabled: false
