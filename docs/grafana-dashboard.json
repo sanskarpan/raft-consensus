@@ -14,7 +14,7 @@
   "tags": ["raft", "consensus"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "10s",
   "time": { "from": "now-1h", "to": "now" },
   "templating": {
@@ -34,7 +34,7 @@
       "id": 1,
       "title": "Leader present",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "max(raft_leader_id)", "legendFormat": "has leader" }],
       "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "0": { "text": "NO LEADER", "color": "red" }, "1": { "text": "OK", "color": "green" } } } ] } }
@@ -43,23 +43,63 @@
       "id": 2,
       "title": "Current term",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "max(raft_term)", "legendFormat": "term" }]
+    },
+    {
+      "id": 12,
+      "title": "Commit / Apply index",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "max(raft_commit_index)", "legendFormat": "commit" },
+        { "expr": "max(raft_applied_index)", "legendFormat": "applied" }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Node count",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [{ "expr": "count(raft_term)", "legendFormat": "nodes" }]
     },
     {
       "id": 3,
       "title": "Leader changes (rate 10m)",
       "type": "timeseries",
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "sum(increase(raft_leader_changes_total[10m]))", "legendFormat": "changes/10m" }]
     },
     {
-      "id": 4,
-      "title": "Commit latency (propose→apply)",
+      "id": 14,
+      "title": "HTTP request latency by handler (p99)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(raft_http_request_duration_seconds_bucket[5m])) by (le, handler))", "legendFormat": "{{handler}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 15,
+      "title": "HTTP request rate by handler",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "sum(rate(raft_http_request_duration_seconds_count[5m])) by (handler)", "legendFormat": "{{handler}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Commit latency (propose → apply)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [
         { "expr": "histogram_quantile(0.50, sum(rate(raft_proposal_commit_latency_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
@@ -71,7 +111,7 @@
       "id": 5,
       "title": "WAL fsync latency",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [
         { "expr": "histogram_quantile(0.50, sum(rate(raft_wal_fsync_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
@@ -80,10 +120,33 @@
       "fieldConfig": { "defaults": { "unit": "s" } }
     },
     {
+      "id": 16,
+      "title": "FSM apply latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, increase(raft_fsm_apply_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, increase(raft_fsm_apply_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 17,
+      "title": "AppendEntries latency by target (p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(raft_append_entries_latency_seconds_bucket[5m])) by (le, target))", "legendFormat": "{{target}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
       "id": 6,
       "title": "Apply lag (commit − applied)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 28 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "max(raft_apply_lag)", "legendFormat": "apply lag" }]
     },
@@ -91,15 +154,25 @@
       "id": 7,
       "title": "Per-follower replication lag",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 28 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "raft_replication_lag", "legendFormat": "{{target}}" }]
+    },
+    {
+      "id": 18,
+      "title": "AppendEntries sent rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 28 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "sum(rate(raft_append_entries_sent_total[5m])) by (target, success)", "legendFormat": "{{target}}: {{success}}" }
+      ]
     },
     {
       "id": 8,
       "title": "Proposals by outcome (rate)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "sum(rate(raft_proposals_total[5m])) by (outcome)", "legendFormat": "{{outcome}}" }]
     },
@@ -107,28 +180,107 @@
       "id": 9,
       "title": "Rejections by kind (rate)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "sum(rate(raft_rejections_total[5m])) by (kind)", "legendFormat": "{{kind}}" }]
+    },
+    {
+      "id": 19,
+      "title": "Elections / vote rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "rate(raft_elections_total[5m])", "legendFormat": "elections/s" },
+        { "expr": "rate(raft_votes_granted_total[5m])", "legendFormat": "votes/s" }
+      ]
     },
     {
       "id": 10,
       "title": "Snapshot size (bytes)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [{ "expr": "raft_snapshot_size_bytes", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "bytes" } }
     },
     {
+      "id": 20,
+      "title": "Snapshot / restore rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "rate(raft_snapshots_total[5m])", "legendFormat": "snapshots/s" },
+        { "expr": "rate(raft_snapshots_restored_total[5m])", "legendFormat": "restores/s" }
+      ]
+    },
+    {
+      "id": 21,
+      "title": "InstallSnapshot latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "histogram_quantile(0.99, rate(raft_install_snapshot_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 22,
+      "title": "Watch connections",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 52 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "raft_watch_connections", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 23,
+      "title": "Backup metrics",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 52 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "rate(raft_backup_upload_duration_seconds_count[5m])", "legendFormat": "upload rate" },
+        { "expr": "rate(raft_backup_upload_bytes_total[5m])", "legendFormat": "upload bytes/s" },
+        { "expr": "rate(raft_backup_upload_errors_total[5m])", "legendFormat": "upload errors/s" }
+      ]
+    },
+    {
+      "id": 24,
+      "title": "RequestVote latency",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 52 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(raft_request_vote_latency_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.99, rate(raft_request_vote_latency_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
       "id": 11,
       "title": "Go goroutines / heap",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
       "datasource": "${DS_PROMETHEUS}",
       "targets": [
         { "expr": "go_goroutines", "legendFormat": "goroutines {{instance}}" },
         { "expr": "go_memstats_heap_inuse_bytes", "legendFormat": "heap {{instance}}" }
+      ]
+    },
+    {
+      "id": 25,
+      "title": "Go GC / goroutine metrics",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "datasource": "${DS_PROMETHEUS}",
+      "targets": [
+        { "expr": "rate(go_gc_duration_seconds_sum[5m])", "legendFormat": "GC CPU/s" },
+        { "expr": "go_memstats_alloc_bytes", "legendFormat": "alloc bytes {{instance}}" },
+        { "expr": "go_memstats_stack_inuse_bytes", "legendFormat": "stack {{instance}}" }
       ]
     }
   ]
