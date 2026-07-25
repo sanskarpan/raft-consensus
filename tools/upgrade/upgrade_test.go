@@ -59,7 +59,7 @@ func TestFullClusterUpgrade(t *testing.T) {
 	}
 
 	harnessDir := t.TempDir()
-	const basePort = 21600
+	const basePort = 21800
 
 	v1Binary := filepath.Join(harnessDir, "raftd-v1")
 	buildBinary(t, v1Binary)
@@ -153,7 +153,7 @@ func TestFullClusterRollback(t *testing.T) {
 	}
 
 	harnessDir := t.TempDir()
-	const basePort = 21700
+	const basePort = 25000
 
 	v1Binary := filepath.Join(harnessDir, "raftd-v1")
 	buildBinary(t, v1Binary)
