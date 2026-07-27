@@ -68,7 +68,7 @@ func (f *fakeGCSStorage) ReadObject(_ context.Context, bucket, key string) ([]by
 func (f *fakeGCSStorage) ListObjects(_ context.Context, bucket, prefix string) ([]gcsObjInfo, error) {
 	bktPrefix := bucket + "/"
 	var out []gcsObjInfo
-	for k, _ := range f.objects {
+	for k := range f.objects {
 		if !strings.HasPrefix(k, bktPrefix) {
 			continue
 		}
