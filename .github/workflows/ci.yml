@@ -211,7 +211,7 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --load \
             -t raftd:smoke --build-arg VERSION=ci .
-          docker run --rm raftd:smoke raftd -version
+          docker run --rm raftd:smoke -version
           docker rmi raftd:smoke
 
   # Nightly chaos/soak run, gated to the scheduled trigger (2 AM UTC cron above)
