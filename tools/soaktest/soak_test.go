@@ -337,12 +337,33 @@ func TestSoakLeaderFailover(t *testing.T) {
 		t.Logf("write latency ms: p50=%.2f p95=%.2f", p50, p95)
 	}
 
-	// Verify all written keys are readable.
+	// Wait for the cluster to settle before verifying. With node1 dead the
+	// 2-node cluster can experience several successive elections before the
+	// winner's heartbeats quell the other node; give it a full election window.
+	time.Sleep(3 * time.Second)
+
+	// Verify all written keys are readable. A single GetKV call can transiently
+	// return an error while the cluster is mid-election (503 / leader unknown),
+	// so retry each key for up to 10 s before declaring it missing.
 	t.Log("verifying data integrity...")
 	var missing, corrupt int
 	mu.Lock()
-	for key, want := range written {
-		kv, err := c.GetKV(key)
+	keys := make(map[string]string, len(written))
+	for k, v := range written {
+		keys[k] = v
+	}
+	mu.Unlock()
+	verifyDeadline := time.Now().Add(10 * time.Second)
+	for key, want := range keys {
+		var kv *client.KVPair
+		var err error
+		for time.Now().Before(verifyDeadline) {
+			kv, err = c.GetKV(key)
+			if err == nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 		if err != nil {
 			missing++
 			continue
@@ -351,12 +372,11 @@ func TestSoakLeaderFailover(t *testing.T) {
 			corrupt++
 		}
 	}
-	mu.Unlock()
 	if missing > 0 {
 		t.Errorf("data loss: %d keys missing after leader failover", missing)
 	}
 	if corrupt > 0 {
 		t.Errorf("data corruption: %d keys have wrong values", corrupt)
 	}
-	t.Logf("data integrity: %d/%d keys verified (missing=%d, corrupt=%d)", len(written)-missing-corrupt, len(written), missing, corrupt)
+	t.Logf("data integrity: %d/%d keys verified (missing=%d, corrupt=%d)", len(keys)-missing-corrupt, len(keys), missing, corrupt)
 }
