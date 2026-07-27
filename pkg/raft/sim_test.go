@@ -252,7 +252,9 @@ func TestDeterministicPartitionAndRecover(t *testing.T) {
 	}()
 
 	// Advance clock so the new leader can commit and the old leader can catch up.
-	sc.Quiesce(40)
+	// Use 100 ticks to match the budget used by other convergence tests; 40 was
+	// too few under the -race detector where goroutine scheduling is slower.
+	sc.Quiesce(100)
 
 	// After healing and advancing, all nodes should converge on the same
 	// commitIndex. The old leader will step down upon seeing the new leader's

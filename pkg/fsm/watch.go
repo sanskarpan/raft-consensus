@@ -173,28 +173,24 @@ func (wm *WatchManager) subscribe(ctx context.Context, key string, prefix bool, 
 
 	entryCtx, cancel := context.WithCancel(ctx)
 
-	// Capture the current revision BEFORE registering the watcher (H11). Any
-	// event with Revision > snapshotRevision is guaranteed to be dispatched live
-	// (because the watcher is registered before that event can be applied), while
-	// events with Revision <= snapshotRevision are delivered by history replay.
-	// Reading the revision after registration left a window where an event could
-	// slip in and be delivered both live and via replay (dup + out-of-order).
-	snapshotRevision := wm.kv.GetRevision()
-
 	entry := &watchEntry{
-		id:       id,
-		key:      key,
-		prefix:   prefix,
-		startRev: snapshotRevision,
-		ch:       ch,
-		ctx:      entryCtx,
-		cancel:   cancel,
+		id:     id,
+		key:    key,
+		prefix: prefix,
+		ch:     ch,
+		ctx:    entryCtx,
+		cancel: cancel,
 	}
 
-	// Register after capturing the revision. dispatch() filters per-entry on
-	// startRev so events at or below it are never delivered live even if they are
-	// applied after registration.
+	// Snapshot the revision and register the watcher atomically under wm.mu.
+	// dispatch() holds wm.mu.RLock() before fanning out events, so acquiring
+	// wm.mu here ensures no event can slip between the revision snapshot and
+	// registration (H11). An event dispatched after we release the lock will
+	// have Revision > snapshotRevision and reach the watcher live; events with
+	// Revision <= snapshotRevision are delivered by history replay below.
 	wm.mu.Lock()
+	snapshotRevision := wm.kv.GetRevision()
+	entry.startRev = snapshotRevision
 	wm.watchers[id] = entry
 	wm.mu.Unlock()
 

@@ -2650,7 +2650,6 @@ func (r *raft) processSnapshot(req *reqSnapshotFuture) {
 	// entries from advancing between reading index and snapshotting.
 	r.mu.RLock()
 	index := r.applyIndex
-	term := r.lastTerm
 	config := r.configuration.Copy()
 	snap, err := r.fsm.Snapshot()
 	r.mu.RUnlock()
@@ -2659,6 +2658,24 @@ func (r *raft) processSnapshot(req *reqSnapshotFuture) {
 		req.err = err
 		close(req.done)
 		return
+	}
+
+	// Look up the actual term of the entry at applyIndex. Using r.lastTerm
+	// (the term at lastIndex) would record the wrong term when applyIndex <
+	// lastIndex and a term boundary falls between them, corrupting snapshot
+	// metadata and breaking the follower's log-matching check on install.
+	var term uint64
+	if index > 0 {
+		if e, gerr := r.log.Get(index); gerr == nil {
+			term = e.Term
+		} else {
+			// Entry compacted into a prior snapshot; lastTerm is the correct
+			// fallback because WAL compaction only runs up to snapshotIndex
+			// which must equal the previous applyIndex.
+			r.mu.RLock()
+			term = r.lastTerm
+			r.mu.RUnlock()
+		}
 	}
 
 	sink, err := r.snapshot.Create(SnapshotVersionMax, index, term, config)

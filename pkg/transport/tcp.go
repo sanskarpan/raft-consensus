@@ -52,6 +52,8 @@ func WriteBinaryFrame(w io.Writer, typeTag uint8, payload []byte) error {
 
 // ReadBinaryFrame reads one framed binary message from r.
 // Returns the type tag and payload. Returns error on magic mismatch or I/O failure.
+// Payloads exceeding defaultMaxMessageBytes are rejected to prevent OOM allocation
+// from a peer-controlled length field.
 func ReadBinaryFrame(r io.Reader) (typeTag uint8, payload []byte, err error) {
 	var hdr [binaryFrameHeaderSize]byte
 	if _, err = io.ReadFull(r, hdr[:]); err != nil {
@@ -62,6 +64,9 @@ func ReadBinaryFrame(r io.Reader) (typeTag uint8, payload []byte, err error) {
 	}
 	typeTag = hdr[4]
 	payloadLen := binary.BigEndian.Uint32(hdr[5:9])
+	if int64(payloadLen) > defaultMaxMessageBytes {
+		return 0, nil, fmt.Errorf("transport: binary frame payload %d bytes exceeds limit %d", payloadLen, defaultMaxMessageBytes)
+	}
 	if payloadLen == 0 {
 		return typeTag, []byte{}, nil
 	}

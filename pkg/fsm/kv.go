@@ -329,18 +329,30 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 
 	case "range":
 		// Prefix scan — no mutation, no revision bump. #207: filter expired keys.
+		// Cap at maxRangeResults (checked before append, matching public Range()).
+		// Return the limit error as an application-level applyErr so it is
+		// surfaced to the caller without disrupting the FSM state machine.
 		var kvs []*KeyValue
+		var rangeOverflow bool
 		for key, kv := range k.data {
 			if strings.HasPrefix(key, cmd.Key) && k.isLive(kv) {
+				if len(kvs) >= maxRangeResults {
+					rangeOverflow = true
+					break
+				}
 				kvs = append(kvs, kvClone(kv))
 			}
 		}
-		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		rangeJSON, err := json.Marshal(kvs)
-		if err != nil {
-			return nil, err
+		if rangeOverflow {
+			res, applyErr = json.Marshal(KvResult{Error: fmt.Sprintf("range result exceeds limit of %d keys; use a more specific prefix", maxRangeResults)})
+		} else {
+			sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
+			rangeJSON, err := json.Marshal(kvs)
+			if err != nil {
+				return nil, err
+			}
+			res, applyErr = json.Marshal(KvResult{Value: string(rangeJSON)})
 		}
-		res, applyErr = json.Marshal(KvResult{Value: string(rangeJSON)})
 
 	case "incr":
 		// Atomic counter: interpret the current value and the delta (carried in
@@ -447,8 +459,9 @@ func (k *KVStore) applyPutLocked(key, value string, prev *KeyValue, expiresAt in
 // isLive reports whether kv is present and not yet expired (#207). Caller must
 // hold at least mu.RLock(). The check is against the FSM's virtual clock
 // (applyTimeMs), which is identical on every replica, so expiry is deterministic.
+// A nil kv is treated as absent (not live).
 func (k *KVStore) isLive(kv *KeyValue) bool {
-	return kv.ExpiresAtMs == 0 || kv.ExpiresAtMs > k.applyTimeMs
+	return kv != nil && (kv.ExpiresAtMs == 0 || kv.ExpiresAtMs > k.applyTimeMs)
 }
 
 // sweepExpiredLocked deletes all keys whose TTL has lapsed (ExpiresAtMs > 0
@@ -590,6 +603,12 @@ func (k *KVStore) applyTxnLocked(req *TxnRequest) TxnResponse {
 // evalCompare evaluates a single Compare condition. Caller must hold mu.Lock() or mu.RLock().
 func (k *KVStore) evalCompare(c Compare) bool {
 	kv := k.data[c.Key]
+	// Treat expired-but-unswept keys as absent so TTL-based CAS conditions
+	// evaluate correctly without waiting for the next tick sweep. isLive is
+	// nil-safe and returns false for nil kv, so this also handles missing keys.
+	if !k.isLive(kv) {
+		kv = nil
+	}
 	switch c.Target {
 	case "value":
 		if kv == nil {

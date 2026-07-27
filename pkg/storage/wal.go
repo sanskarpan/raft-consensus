@@ -788,6 +788,28 @@ func (w *WAL) deleteRangeLocked(min, max uint64) error {
 	w.lastIndex = w.index.lastIndex
 	w.index.mu.RUnlock()
 
+	// After a tail-truncation, the current segment may now be empty: all of
+	// its entries were >= min and have been removed from the index and from
+	// the file by truncateCurrentSegmentAt. Detect this by checking whether
+	// lastIndex has fallen below currentSegment.baseIndex — if so, the
+	// segment holds no live entries. Keeping a stale baseIndex would cause
+	// entries re-appended at indices below it to be written into the segment
+	// but permanently unreadable (getEntry rejects idx < seg.baseIndex).
+	// Fix: delete the now-empty segment and let the logic below create a
+	// fresh one with the correct baseIndex.
+	if w.currentSegment != nil && w.lastIndex < w.currentSegment.baseIndex {
+		oldPath := w.currentSegment.path
+		_ = w.currentSegment.file.Close()
+		_ = os.Remove(oldPath)
+		for i, s := range w.segments {
+			if s == w.currentSegment {
+				w.segments = append(w.segments[:i], w.segments[i+1:]...)
+				break
+			}
+		}
+		w.currentSegment = nil
+	}
+
 	// After non-current segment deletions, ensure currentSegment is valid.
 	if len(w.segments) == 0 {
 		return w.createNewSegment(w.lastIndex + 1)
@@ -802,10 +824,15 @@ func (w *WAL) deleteRangeLocked(min, max uint64) error {
 // This prevents deleted entries from reappearing after a crash/restart.
 // Caller must hold w.mu (write lock).
 func (w *WAL) truncateCurrentSegmentAt(min uint64) error {
+	// Only consider index entries that belong to the current segment. Entries
+	// from other segments store byte offsets measured within their own files;
+	// using those offsets to truncate the current segment's file would cut at
+	// the wrong position and silently destroy or corrupt data.
+	curBaseIndex := w.currentSegment.baseIndex
 	w.index.mu.RLock()
 	var truncOffset int64 = -1
 	for idx, entry := range w.index.indexes {
-		if idx >= min {
+		if idx >= min && entry.baseIndex == curBaseIndex {
 			if truncOffset < 0 || entry.offset < truncOffset {
 				truncOffset = entry.offset
 			}

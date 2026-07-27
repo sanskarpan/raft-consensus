@@ -205,12 +205,10 @@ func (s *FileSnapshotStore) Create(version raft.SnapshotVersion, index, term uin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.snapshots) >= s.retainCount {
-		// Use the lock-free helper since we already hold the mutex.
-		if err := s.pruneLocked(); err != nil {
-			return nil, err
-		}
-	}
+	// Pruning is deferred to sink.Close() after the new snapshot is durably
+	// committed. Pruning here (before Write/Close) creates a crash window
+	// where the old snapshot is deleted but the new one is not yet visible,
+	// leaving the node with zero valid snapshots on disk.
 
 	id := fmt.Sprintf("%d-%d", term, index)
 	tmpPath := filepath.Join(s.path, snapshotDir, id+tmpSuffix)
@@ -332,6 +330,17 @@ func (s *fileSnapshotSink) Close() error {
 	sort.Slice(s.store.snapshots, func(i, j int) bool {
 		return s.store.snapshots[i].Index > s.store.snapshots[j].Index
 	})
+	// Prune after the new snapshot is durably committed so there is always
+	// at least one valid snapshot on disk during the prune window. Use strict
+	// greater-than (not >=) because the new snapshot is already in the list;
+	// we want to reach exactly retainCount entries, not retainCount-1.
+	for len(s.store.snapshots) > s.store.retainCount {
+		oldest := s.store.snapshots[len(s.store.snapshots)-1]
+		if err := s.store.deleteLocked(oldest.ID); err != nil {
+			s.store.mu.Unlock()
+			return fmt.Errorf("snapshot: prune after close: %w", err)
+		}
+	}
 	s.store.mu.Unlock()
 
 	return nil
@@ -505,22 +514,6 @@ func (s *FileSnapshotStore) Delete(id string) error {
 	return s.deleteLocked(id)
 }
 
-// pruneLocked removes the oldest snapshots to make room for a new one,
-// keeping at most (retainCount - 1) so that after the new snapshot is
-// closed the total stays at retainCount.
-// Caller must hold s.mu.
-func (s *FileSnapshotStore) pruneLocked() error {
-	// Snapshots are sorted newest-first. Delete from the tail (oldest) until
-	// we have retainCount-1 entries so there is room for the new one.
-	for len(s.snapshots) >= s.retainCount {
-		oldest := s.snapshots[len(s.snapshots)-1]
-		if err := s.deleteLocked(oldest.ID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // deleteLocked removes a snapshot (and its sidecar) by ID without acquiring the mutex.
 // Caller must hold s.mu.
 func (s *FileSnapshotStore) deleteLocked(id string) error {
@@ -544,6 +537,7 @@ func (s *FileSnapshotStore) deleteLocked(id string) error {
 		}
 	}
 	delete(s.checksummed, id)
+	delete(s.snapCompression, id)
 
 	return nil
 }
