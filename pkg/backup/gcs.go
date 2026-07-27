@@ -43,12 +43,78 @@ type GCSConfig struct {
 	TestEndpoint string
 }
 
+// gcsObjInfo carries the name and creation time of a GCS object.
+type gcsObjInfo struct {
+	Name    string
+	Created time.Time
+}
+
+// gcsStorage is the interface GCSUploader uses to interact with GCS.
+// The production implementation wraps *storage.Client; tests use a fake.
+type gcsStorage interface {
+	// BucketExists returns nil if the bucket exists, storage.ErrBucketNotExist
+	// (or an equivalent error) if it does not, and another error otherwise.
+	BucketExists(ctx context.Context, bucket string) error
+	// EnsureBucket creates the bucket.
+	EnsureBucket(ctx context.Context, bucket string) error
+	WriteObject(ctx context.Context, bucket, key, contentType string, b []byte) error
+	ReadObject(ctx context.Context, bucket, key string) ([]byte, error)
+	ListObjects(ctx context.Context, bucket, prefix string) ([]gcsObjInfo, error)
+}
+
+// gcsClientAdapter wraps *storage.Client to implement gcsStorage.
+type gcsClientAdapter struct{ c *storage.Client }
+
+func (a *gcsClientAdapter) BucketExists(ctx context.Context, bucket string) error {
+	_, err := a.c.Bucket(bucket).Attrs(ctx)
+	return err
+}
+
+func (a *gcsClientAdapter) EnsureBucket(ctx context.Context, bucket string) error {
+	return a.c.Bucket(bucket).Create(ctx, "", nil)
+}
+
+func (a *gcsClientAdapter) WriteObject(ctx context.Context, bucket, key, contentType string, b []byte) error {
+	wc := a.c.Bucket(bucket).Object(key).NewWriter(ctx)
+	wc.ContentType = contentType
+	if _, err := wc.Write(b); err != nil {
+		_ = wc.Close()
+		return err
+	}
+	return wc.Close()
+}
+
+func (a *gcsClientAdapter) ReadObject(ctx context.Context, bucket, key string) ([]byte, error) {
+	rc, err := a.c.Bucket(bucket).Object(key).NewReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return io.ReadAll(rc)
+}
+
+func (a *gcsClientAdapter) ListObjects(ctx context.Context, bucket, prefix string) ([]gcsObjInfo, error) {
+	it := a.c.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: prefix})
+	var out []gcsObjInfo
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, gcsObjInfo{Name: attrs.Name, Created: attrs.Created})
+	}
+	return out, nil
+}
+
 // GCSUploader uploads and downloads Raft snapshots to Google Cloud Storage.
 // It implements the Uploader interface and is safe for concurrent use.
 type GCSUploader struct {
-	client *storage.Client
-	cfg    GCSConfig
-	logger *zap.Logger
+	backend gcsStorage
+	cfg     GCSConfig
+	logger  *zap.Logger
 }
 
 // NewGCSUploader creates and validates a GCSUploader. It ensures the target
@@ -66,14 +132,15 @@ func NewGCSUploader(ctx context.Context, cfg GCSConfig, logger *zap.Logger) (*GC
 		return nil, fmt.Errorf("storage.NewClient: %w", err)
 	}
 
+	u := &GCSUploader{backend: &gcsClientAdapter{c: client}, cfg: cfg, logger: logger}
+
 	// Verify (and optionally create) the bucket. In production environments the
 	// bucket is pre-provisioned; this is mostly a connectivity check.
-	bkt := client.Bucket(cfg.Bucket)
-	if _, err := bkt.Attrs(ctx); err != nil {
+	if err := u.backend.BucketExists(ctx, cfg.Bucket); err != nil {
 		if isNotFound(err) {
 			// Attempt to create the bucket. This succeeds in integration tests
 			// (fake-gcs-server) and on GCP when the SA has the right IAM role.
-			if createErr := bkt.Create(ctx, "", nil); createErr != nil {
+			if createErr := u.backend.EnsureBucket(ctx, cfg.Bucket); createErr != nil {
 				client.Close()
 				return nil, fmt.Errorf("bucket %q does not exist and creation failed: %w", cfg.Bucket, createErr)
 			}
@@ -86,7 +153,7 @@ func NewGCSUploader(ctx context.Context, cfg GCSConfig, logger *zap.Logger) (*GC
 		}
 	}
 
-	return &GCSUploader{client: client, cfg: cfg, logger: logger}, nil
+	return u, nil
 }
 
 // buildClientOptions returns the GCS client options for the given config.
@@ -195,7 +262,7 @@ func (u *GCSUploader) doUpload(ctx context.Context, name string, raw []byte) err
 	}
 
 	// Upload data object.
-	if err := u.writeObject(ctx, dataKey, payload, "application/octet-stream"); err != nil {
+	if err := u.backend.WriteObject(ctx, u.cfg.Bucket, dataKey, "application/octet-stream", payload); err != nil {
 		return fmt.Errorf("write object %q: %w", dataKey, err)
 	}
 	uploadBytes.Add(float64(n))
@@ -206,22 +273,11 @@ func (u *GCSUploader) doUpload(ctx context.Context, name string, raw []byte) err
 		return fmt.Errorf("marshal manifest: %w", err)
 	}
 	manifestKey := dataKey + ".manifest.json"
-	if err := u.writeObject(ctx, manifestKey, manifestData, "application/json"); err != nil {
+	if err := u.backend.WriteObject(ctx, u.cfg.Bucket, manifestKey, "application/json", manifestData); err != nil {
 		return fmt.Errorf("write manifest %q: %w", manifestKey, err)
 	}
 
 	return nil
-}
-
-// writeObject writes b to the GCS object at key with the given content type.
-func (u *GCSUploader) writeObject(ctx context.Context, key string, b []byte, contentType string) error {
-	wc := u.client.Bucket(u.cfg.Bucket).Object(key).NewWriter(ctx)
-	wc.ContentType = contentType
-	if _, err := wc.Write(b); err != nil {
-		_ = wc.Close()
-		return err
-	}
-	return wc.Close()
 }
 
 // Download retrieves the named object, verifies its SHA-256 against the
@@ -247,7 +303,7 @@ func (u *GCSUploader) doDownload(ctx context.Context, name string) (io.ReadClose
 	// Fetch manifest with retry.
 	var manifestData []byte
 	if retryErr := u.cfg.Retry.Do(ctx, func() error {
-		data, err := u.readObject(ctx, manifestKey)
+		data, err := u.backend.ReadObject(ctx, u.cfg.Bucket, manifestKey)
 		if err != nil {
 			return fmt.Errorf("read manifest %q: %w", manifestKey, err)
 		}
@@ -265,7 +321,7 @@ func (u *GCSUploader) doDownload(ctx context.Context, name string) (io.ReadClose
 	// Fetch data object with retry.
 	var dataPayload []byte
 	if retryErr := u.cfg.Retry.Do(ctx, func() error {
-		data, err := u.readObject(ctx, dataKey)
+		data, err := u.backend.ReadObject(ctx, u.cfg.Bucket, dataKey)
 		if err != nil {
 			return fmt.Errorf("read object %q: %w", dataKey, err)
 		}
@@ -298,16 +354,6 @@ func (u *GCSUploader) doDownload(ctx context.Context, name string) (io.ReadClose
 	return io.NopCloser(bytes.NewReader(dataPayload)), nil
 }
 
-// readObject fetches the full contents of the GCS object at key.
-func (u *GCSUploader) readObject(ctx context.Context, key string) ([]byte, error) {
-	rc, err := u.client.Bucket(u.cfg.Bucket).Object(key).NewReader(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer rc.Close()
-	return io.ReadAll(rc)
-}
-
 // List returns the names of all stored backup data objects (not manifests),
 // newest first by object creation time.
 func (u *GCSUploader) List(ctx context.Context) ([]string, error) {
@@ -322,26 +368,21 @@ func (u *GCSUploader) List(ctx context.Context) ([]string, error) {
 	}
 	var entries []entry
 
-	query := &storage.Query{Prefix: prefix}
-	it := u.client.Bucket(u.cfg.Bucket).Objects(ctx, query)
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("listing GCS objects: %w", err)
-		}
+	objs, err := u.backend.ListObjects(ctx, u.cfg.Bucket, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("listing GCS objects: %w", err)
+	}
+	for _, obj := range objs {
 		// Skip manifest sidecars.
-		if strings.HasSuffix(attrs.Name, ".manifest.json") {
+		if strings.HasSuffix(obj.Name, ".manifest.json") {
 			continue
 		}
 		// Strip prefix to return bare names.
-		n := attrs.Name
+		n := obj.Name
 		if prefix != "" {
 			n = strings.TrimPrefix(n, prefix)
 		}
-		entries = append(entries, entry{name: n, created: attrs.Created})
+		entries = append(entries, entry{name: n, created: obj.Created})
 	}
 
 	// Sort newest-first.

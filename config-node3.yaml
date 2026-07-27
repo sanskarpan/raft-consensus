@@ -29,7 +29,14 @@ cluster:
 # require_tls: true
 #
 # Option C: Explicitly opt out of TLS (development only, not recommended)
-insecure_transport: true  # remove in production; suppresses the cleartext warning
+# DANGER: enable only for local development — plaintext inter-node traffic
+# insecure_transport: true
+# For development with zero PKI setup, use auto_tls instead:
+# auto_tls: true
+
+# Authentication — set a strong random token before connecting to any network:
+# admin_token: "change-me-to-a-random-secret"
+# allow_no_auth: false  # default; never set true in production
 
 # SPIFFE/SPIRE workload identity (cloud-native alternative to static TLS)
 # Requires a SPIRE agent running on the host with socket at the configured path.

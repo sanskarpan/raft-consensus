@@ -31,12 +31,41 @@ type MinIOConfig struct {
 	Retry     RetryConfig
 }
 
+// minioStorage is the interface MinIOUploader uses to interact with the object
+// store. The production implementation wraps *minio.Client; tests use a fake.
+type minioStorage interface {
+	BucketExists(ctx context.Context, bucket string) (bool, error)
+	MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error
+	PutObject(ctx context.Context, bucket, key string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error)
+	GetObject(ctx context.Context, bucket, key string, opts minio.GetObjectOptions) (io.ReadCloser, error)
+	ListObjects(ctx context.Context, bucket string, opts minio.ListObjectsOptions) <-chan minio.ObjectInfo
+}
+
+// minioClientAdapter wraps *minio.Client to implement minioStorage.
+type minioClientAdapter struct{ c *minio.Client }
+
+func (a *minioClientAdapter) BucketExists(ctx context.Context, bucket string) (bool, error) {
+	return a.c.BucketExists(ctx, bucket)
+}
+func (a *minioClientAdapter) MakeBucket(ctx context.Context, bucket string, opts minio.MakeBucketOptions) error {
+	return a.c.MakeBucket(ctx, bucket, opts)
+}
+func (a *minioClientAdapter) PutObject(ctx context.Context, bucket, key string, r io.Reader, size int64, opts minio.PutObjectOptions) (minio.UploadInfo, error) {
+	return a.c.PutObject(ctx, bucket, key, r, size, opts)
+}
+func (a *minioClientAdapter) GetObject(ctx context.Context, bucket, key string, opts minio.GetObjectOptions) (io.ReadCloser, error) {
+	return a.c.GetObject(ctx, bucket, key, opts)
+}
+func (a *minioClientAdapter) ListObjects(ctx context.Context, bucket string, opts minio.ListObjectsOptions) <-chan minio.ObjectInfo {
+	return a.c.ListObjects(ctx, bucket, opts)
+}
+
 // MinIOUploader uploads/downloads Raft snapshots to MinIO or any S3-compatible
 // object store. It implements the Uploader interface.
 type MinIOUploader struct {
-	client *minio.Client
-	cfg    MinIOConfig
-	logger *zap.Logger
+	storage minioStorage
+	cfg     MinIOConfig
+	logger  *zap.Logger
 }
 
 // NewMinIOUploader creates and validates a MinIOUploader. It creates the bucket
@@ -58,13 +87,15 @@ func NewMinIOUploader(ctx context.Context, cfg MinIOConfig, logger *zap.Logger) 
 		return nil, fmt.Errorf("minio.New: %w", err)
 	}
 
-	exists, err := client.BucketExists(ctx, cfg.Bucket)
+	u := &MinIOUploader{storage: &minioClientAdapter{c: client}, cfg: cfg, logger: logger}
+
+	exists, err := u.storage.BucketExists(ctx, cfg.Bucket)
 	if err != nil {
 		return nil, fmt.Errorf("checking bucket %q: %w", cfg.Bucket, err)
 	}
 	if !exists {
 		opts := minio.MakeBucketOptions{Region: cfg.Region}
-		if err := client.MakeBucket(ctx, cfg.Bucket, opts); err != nil {
+		if err := u.storage.MakeBucket(ctx, cfg.Bucket, opts); err != nil {
 			return nil, fmt.Errorf("creating bucket %q: %w", cfg.Bucket, err)
 		}
 		if logger != nil {
@@ -72,13 +103,16 @@ func NewMinIOUploader(ctx context.Context, cfg MinIOConfig, logger *zap.Logger) 
 		}
 	}
 
-	return &MinIOUploader{client: client, cfg: cfg, logger: logger}, nil
+	return u, nil
 }
 
 // ClientForTest exposes the underlying minio.Client for integration test
 // manipulation (e.g. injecting corruption). Not for production use.
 func (u *MinIOUploader) ClientForTest() *minio.Client {
-	return u.client
+	if a, ok := u.storage.(*minioClientAdapter); ok {
+		return a.c
+	}
+	return nil
 }
 
 // objectKey returns the full object key for the given name, applying the configured prefix.
@@ -161,7 +195,7 @@ func (u *MinIOUploader) doUpload(ctx context.Context, name string, raw []byte) e
 		ContentType: "application/octet-stream",
 		PartSize:    64 * 1024 * 1024, // 64 MiB parts for multipart
 	}
-	info, err := u.client.PutObject(ctx, u.cfg.Bucket, dataKey, bytes.NewReader(payload), n, opts)
+	info, err := u.storage.PutObject(ctx, u.cfg.Bucket, dataKey, bytes.NewReader(payload), n, opts)
 	if err != nil {
 		return fmt.Errorf("PutObject %q: %w", dataKey, err)
 	}
@@ -174,7 +208,7 @@ func (u *MinIOUploader) doUpload(ctx context.Context, name string, raw []byte) e
 	}
 	manifestKey := dataKey + ".manifest.json"
 	manifestSize := int64(len(manifestData))
-	_, err = u.client.PutObject(ctx, u.cfg.Bucket, manifestKey,
+	_, err = u.storage.PutObject(ctx, u.cfg.Bucket, manifestKey,
 		bytes.NewReader(manifestData), manifestSize,
 		minio.PutObjectOptions{ContentType: "application/json"},
 	)
@@ -208,7 +242,7 @@ func (u *MinIOUploader) doDownload(ctx context.Context, name string) (io.ReadClo
 	// Fetch manifest with retry.
 	var manifestData []byte
 	if retryErr := u.cfg.Retry.Do(ctx, func() error {
-		mObj, err := u.client.GetObject(ctx, u.cfg.Bucket, manifestKey, minio.GetObjectOptions{})
+		mObj, err := u.storage.GetObject(ctx, u.cfg.Bucket, manifestKey, minio.GetObjectOptions{})
 		if err != nil {
 			return fmt.Errorf("GetObject manifest %q: %w", manifestKey, err)
 		}
@@ -229,7 +263,7 @@ func (u *MinIOUploader) doDownload(ctx context.Context, name string) (io.ReadClo
 	// Fetch data object with retry.
 	var dataPayload []byte
 	retryErr := u.cfg.Retry.Do(ctx, func() error {
-		obj, err := u.client.GetObject(ctx, u.cfg.Bucket, dataKey, minio.GetObjectOptions{})
+		obj, err := u.storage.GetObject(ctx, u.cfg.Bucket, dataKey, minio.GetObjectOptions{})
 		if err != nil {
 			return fmt.Errorf("GetObject %q: %w", dataKey, err)
 		}
@@ -277,7 +311,7 @@ func (u *MinIOUploader) List(ctx context.Context) ([]string, error) {
 	}
 	var entries []entry
 
-	for obj := range u.client.ListObjects(ctx, u.cfg.Bucket, minio.ListObjectsOptions{
+	for obj := range u.storage.ListObjects(ctx, u.cfg.Bucket, minio.ListObjectsOptions{
 		Prefix:    prefix,
 		Recursive: true,
 	}) {

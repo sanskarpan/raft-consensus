@@ -121,6 +121,10 @@ type Config struct {
 	// OtlpEndpoint, if set, sends traces to the given OTLP/gRPC endpoint.
 	// Example: "localhost:4317"
 	OtlpEndpoint string `yaml:"otlp_endpoint"`
+	// OtlpInsecure, when true, disables TLS on the OTLP/gRPC exporter.
+	// Use only in development environments or when the OTLP endpoint is
+	// local (e.g. a sidecar collector). Default: false (TLS required).
+	OtlpInsecure bool `yaml:"otlp_insecure"`
 
 	// TTLTickInterval is how often the leader proposes a tick command to advance
 	// the FSM's virtual clock and sweep expired keys (#207). Default: 1s.
@@ -610,7 +614,7 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 	// Initialize OpenTelemetry tracing.
 	ctx := context.Background()
 	if config.OtlpEndpoint != "" {
-		tp, err := tracing.NewOTLPProvider(ctx, config.OtlpEndpoint, config.NodeID)
+		tp, err := tracing.NewOTLPProvider(ctx, config.OtlpEndpoint, config.NodeID, config.OtlpInsecure)
 		if err != nil {
 			logger.Warn("failed to create OTLP tracing provider; using noop", zap.Error(err))
 			s.tracingProvider = tracing.NewNoopProvider()
@@ -1029,7 +1033,7 @@ func (s *Server) waitApplied(ctx context.Context, idx uint64) error {
 func (s *Server) initHTTP() {
 	s.http = &http.Server{
 		Addr:         s.config.HTTPAddr,
-		Handler:      s.requestIDMiddleware(s.corsMiddleware(s.buildMux())),
+		Handler:      s.requestIDMiddleware(s.secureHeadersMiddleware(s.corsMiddleware(s.buildMux()))),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -1075,6 +1079,20 @@ func (s *Server) requestIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set(requestIDHeader, id)
 		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// secureHeadersMiddleware sets defensive HTTP response headers on every
+// response: X-Content-Type-Options prevents MIME-sniffing attacks,
+// X-Frame-Options blocks clickjacking, and Content-Security-Policy
+// prevents inline-script injection. These are no-ops for API clients
+// but required by security scanners and browsers hitting the metrics/UI.
+func (s *Server) secureHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'")
+		next.ServeHTTP(w, r)
 	})
 }
 

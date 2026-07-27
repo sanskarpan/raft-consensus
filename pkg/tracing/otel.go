@@ -3,6 +3,7 @@ package tracing
 
 import (
 	"context"
+	"crypto/tls"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,6 +14,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/grpc/credentials"
 )
 
 const serviceName = "raftd"
@@ -32,11 +34,19 @@ func NewNoopProvider() *Provider {
 
 // NewOTLPProvider creates a TracerProvider that exports to an OTLP endpoint.
 // endpoint example: "localhost:4317"
-func NewOTLPProvider(ctx context.Context, endpoint, nodeID string) (*Provider, error) {
-	exp, err := otlptracegrpc.New(ctx,
+// insecure, when true, disables TLS on the gRPC connection (development only).
+// When false (the default), TLS 1.2+ is required.
+func NewOTLPProvider(ctx context.Context, endpoint, nodeID string, insecure bool) (*Provider, error) {
+	grpcOpts := []otlptracegrpc.Option{
 		otlptracegrpc.WithEndpoint(endpoint),
-		otlptracegrpc.WithInsecure(),
-	)
+	}
+	if insecure {
+		grpcOpts = append(grpcOpts, otlptracegrpc.WithInsecure())
+	} else {
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		grpcOpts = append(grpcOpts, otlptracegrpc.WithTLSCredentials(credentials.NewTLS(tlsCfg)))
+	}
+	exp, err := otlptracegrpc.New(ctx, grpcOpts...)
 	if err != nil {
 		return nil, err
 	}
