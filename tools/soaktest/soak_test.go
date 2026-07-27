@@ -344,7 +344,9 @@ func TestSoakLeaderFailover(t *testing.T) {
 
 	// Verify all written keys are readable. A single GetKV call can transiently
 	// return an error while the cluster is mid-election (503 / leader unknown),
-	// so retry each key for up to 10 s before declaring it missing.
+	// so retry each key individually for up to 5 s before declaring it missing.
+	// The deadline is per-key so that a slow/missing key doesn't exhaust the
+	// budget for all subsequent keys (which would leave kv==nil with err==nil).
 	t.Log("verifying data integrity...")
 	var missing, corrupt int
 	mu.Lock()
@@ -353,18 +355,18 @@ func TestSoakLeaderFailover(t *testing.T) {
 		keys[k] = v
 	}
 	mu.Unlock()
-	verifyDeadline := time.Now().Add(10 * time.Second)
 	for key, want := range keys {
+		deadline := time.Now().Add(5 * time.Second)
 		var kv *client.KVPair
-		var err error
-		for time.Now().Before(verifyDeadline) {
-			kv, err = c.GetKV(key)
-			if err == nil {
+		var lastErr error
+		for time.Now().Before(deadline) {
+			kv, lastErr = c.GetKV(key)
+			if lastErr == nil {
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		if err != nil {
+		if lastErr != nil {
 			missing++
 			continue
 		}
