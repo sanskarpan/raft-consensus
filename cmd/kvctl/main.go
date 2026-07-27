@@ -139,6 +139,17 @@ func main() {
 		}
 		runRestore(*leader, cmdArgs[0])
 
+	case "completion":
+		shell := "bash"
+		if len(cmdArgs) >= 1 {
+			shell = cmdArgs[0]
+		}
+		runCompletion(shell)
+
+	case "help":
+		usage()
+		os.Exit(0)
+
 	default:
 		fatalf("unknown command %q\n", cmd)
 	}
@@ -151,20 +162,121 @@ Usage:
   kvctl [flags] <command> [args...]
 
 Commands:
-  put    <key> <value>     Set a key (--ttl=N sets TTL in seconds)
-  incr   <key> <delta>     Atomically add delta (may be negative) to an integer key
-  get    <key>             Get a key (linearizable by default; --stale for local FSM read)
-  delete <key>             Delete a key
-  range  [prefix]          List all keys (optionally filtered by prefix)
-  txn    [file|-]          Execute a transaction from JSON file or stdin
-  watch  <key>             Stream change events (--prefix for prefix watch, --revision=N to replay)
-  status                   Print cluster status and revision
-  backup [output-file]     Download a snapshot from the leader (requires --leader)
-  restore <file>           Restore a snapshot to the leader (requires --leader)
+  put        <key> <value>     Set a key (--ttl=N sets TTL in seconds)
+  incr       <key> <delta>     Atomically add delta (may be negative) to an integer key
+  get        <key>             Get a key (linearizable by default; --stale for local FSM read)
+  delete     <key>             Delete a key
+  range      [prefix]          List all keys (optionally filtered by prefix)
+  txn        [file|-]          Execute a transaction from JSON file or stdin
+  watch      <key>             Stream change events (--prefix for prefix watch, --revision=N to replay)
+  status                       Print cluster status and revision
+  backup     [output-file]     Download a snapshot from the leader (requires --leader)
+  restore    <file>            Restore a snapshot to the leader (requires --leader)
+  completion [bash|zsh|fish]   Print shell completion script (default: bash)
+  help                         Print this help message
 
 Flags:
 `)
 	flag.PrintDefaults()
+}
+
+// completionCommands is the canonical list of subcommands, used by shell completion scripts.
+var completionCommands = []string{
+	"put", "incr", "get", "delete", "range", "txn",
+	"watch", "status", "backup", "restore", "completion", "help",
+}
+
+func runCompletion(shell string) {
+	switch shell {
+	case "bash":
+		fmt.Print(`# kvctl bash completion
+# Source this file or add to ~/.bashrc:
+#   source <(kvctl completion bash)
+_kvctl_completions() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  local cmds="put incr get delete range txn watch status backup restore completion help"
+  local flags="--endpoints --timeout --stale --prefix --revision --limit --ttl --leader"
+  if [[ ${COMP_CWORD} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "${cmds}" -- "${cur}") )
+  elif [[ "${cur}" == -* ]]; then
+    COMPREPLY=( $(compgen -W "${flags}" -- "${cur}") )
+  elif [[ "${prev}" == "completion" ]]; then
+    COMPREPLY=( $(compgen -W "bash zsh fish" -- "${cur}") )
+  fi
+}
+complete -F _kvctl_completions kvctl
+`)
+	case "zsh":
+		fmt.Print(`#compdef kvctl
+# kvctl zsh completion
+# Add to ~/.zshrc:
+#   source <(kvctl completion zsh)
+_kvctl() {
+  local -a cmds flags
+  cmds=(
+    'put:Set a key'
+    'incr:Atomically add delta to an integer key'
+    'get:Get a key'
+    'delete:Delete a key'
+    'range:List all keys with prefix'
+    'txn:Execute a transaction from JSON'
+    'watch:Stream change events for a key'
+    'status:Print cluster status and revision'
+    'backup:Download a snapshot from the leader'
+    'restore:Restore a snapshot to the leader'
+    'completion:Print shell completion script'
+    'help:Print help'
+  )
+  flags=(
+    '--endpoints[Comma-separated node HTTP addresses]:addr'
+    '--timeout[Request timeout]:duration'
+    '--stale[Use stale consistency for get/range]'
+    '--prefix[Watch by prefix instead of exact key]'
+    '--revision[Start watch/history from revision]:int'
+    '--limit[Page size for range]:int'
+    '--ttl[TTL in seconds for put]:int'
+    '--leader[Leader HTTP address for backup/restore]:addr'
+  )
+  if (( CURRENT == 2 )); then
+    _describe 'command' cmds
+  else
+    _arguments ${flags[@]}
+  fi
+}
+_kvctl
+`)
+	case "fish":
+		fmt.Print(`# kvctl fish completion
+# Copy to ~/.config/fish/completions/kvctl.fish
+#   kvctl completion fish > ~/.config/fish/completions/kvctl.fish
+set -l commands put incr get delete range txn watch status backup restore completion help
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a put        -d 'Set a key'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a incr       -d 'Atomically add delta to an integer key'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a get        -d 'Get a key'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a delete     -d 'Delete a key'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a range      -d 'List all keys with prefix'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a txn        -d 'Execute a transaction from JSON'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a watch      -d 'Stream change events for a key'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a status     -d 'Print cluster status'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a backup     -d 'Download a snapshot from the leader'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a restore    -d 'Restore a snapshot to the leader'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a completion -d 'Print shell completion script'
+complete -c kvctl -f -n "not __fish_seen_subcommand_from $commands" -a help       -d 'Print help'
+complete -c kvctl -f -n "__fish_seen_subcommand_from completion" -a "bash zsh fish"
+complete -c kvctl -l endpoints -d 'Comma-separated node HTTP addresses'
+complete -c kvctl -l timeout   -d 'Request timeout'
+complete -c kvctl -l stale     -d 'Stale consistency for get/range'
+complete -c kvctl -l prefix    -d 'Watch by prefix'
+complete -c kvctl -l revision  -d 'Start watch from revision'
+complete -c kvctl -l limit     -d 'Page size for range'
+complete -c kvctl -l ttl       -d 'TTL in seconds for put'
+complete -c kvctl -l leader    -d 'Leader HTTP address for backup/restore'
+`)
+	default:
+		fatalf("unknown shell %q — supported: bash, zsh, fish\n", shell)
+	}
 }
 
 func fatalf(format string, args ...interface{}) {

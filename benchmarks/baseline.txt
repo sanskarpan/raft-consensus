@@ -1,0 +1,70 @@
+# Benchmark baseline — darwin/arm64 (Apple M3 Pro, -benchtime=20x -count=3)
+# Captured from: main branch, July 2026
+#
+# CI compares PR vs merge-base (same linux/amd64 runner) in the benchstat job.
+# This file serves as a developer reference and as a fallback when the
+# benchstat PR job is not available (e.g. direct pushes to main).
+#
+# To regenerate:
+#   go test -run='^$' -bench=. -benchmem -benchtime=50x -count=6 \
+#       ./pkg/fsm/ ./pkg/storage/ ./pkg/transport/ > benchmarks/baseline.txt
+#
+# To compare a branch against this baseline:
+#   go test -run='^$' -bench=. -benchmem -benchtime=50x -count=6 \
+#       ./pkg/fsm/ ./pkg/storage/ ./pkg/transport/ > /tmp/pr.txt
+#   benchstat benchmarks/baseline.txt /tmp/pr.txt
+
+goos: darwin
+goarch: arm64
+pkg: github.com/sanskarpan/raft-consensus/pkg/fsm
+cpu: Apple M3 Pro
+BenchmarkDecodeKVCommandBinary-11    	      20	       108.3 ns/op	     128 B/op	       5 allocs/op
+BenchmarkDecodeKVCommandBinary-11    	      20	       106.2 ns/op	     128 B/op	       5 allocs/op
+BenchmarkDecodeKVCommandBinary-11    	      20	        93.75 ns/op	     128 B/op	       5 allocs/op
+BenchmarkDecodeKVCommandJSON-11      	      20	      5431 ns/op	     352 B/op	       9 allocs/op
+BenchmarkDecodeKVCommandJSON-11      	      20	      1494 ns/op	     352 B/op	       9 allocs/op
+BenchmarkDecodeKVCommandJSON-11      	      20	      1269 ns/op	     352 B/op	       9 allocs/op
+BenchmarkKVGetUnderApply-11          	      20	       516.7 ns/op	     217 B/op	       3 allocs/op
+BenchmarkKVGetUnderApply-11          	      20	       702.1 ns/op	     408 B/op	       6 allocs/op
+BenchmarkKVGetUnderApply-11          	      20	       416.7 ns/op	     389 B/op	       3 allocs/op
+BenchmarkFSMApplyPut-11              	      20	      1071 ns/op	     907 B/op	      11 allocs/op
+BenchmarkFSMApplyPut-11              	      20	       848.0 ns/op	     907 B/op	      11 allocs/op
+BenchmarkFSMApplyPut-11              	      20	      1198 ns/op	     907 B/op	      11 allocs/op
+BenchmarkFSMApplyTxn-11              	      20	      3456 ns/op	    1722 B/op	      29 allocs/op
+BenchmarkFSMApplyTxn-11              	      20	      2962 ns/op	    1722 B/op	      29 allocs/op
+BenchmarkFSMApplyTxn-11              	      20	      3342 ns/op	    1722 B/op	      29 allocs/op
+PASS
+ok  	github.com/sanskarpan/raft-consensus/pkg/fsm	0.345s
+goos: darwin
+goarch: arm64
+pkg: github.com/sanskarpan/raft-consensus/pkg/storage
+cpu: Apple M3 Pro
+BenchmarkEncodeRecord-11      	      20	        41.65 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEncodeRecord-11      	      20	        31.25 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEncodeRecord-11      	      20	        50.00 ns/op	      64 B/op	       1 allocs/op
+BenchmarkWALGet-11            	      20	      4588 ns/op	     144 B/op	       4 allocs/op
+BenchmarkWALGet-11            	      20	     11604 ns/op	     144 B/op	       4 allocs/op
+BenchmarkWALGet-11            	      20	     20079 ns/op	     144 B/op	       4 allocs/op
+BenchmarkWALGetParallel-11    	      20	      8096 ns/op	     384 B/op	       5 allocs/op
+BenchmarkWALGetParallel-11    	      20	     10029 ns/op	     436 B/op	       5 allocs/op
+BenchmarkWALGetParallel-11    	      20	     11244 ns/op	     190 B/op	       5 allocs/op
+PASS
+ok  	github.com/sanskarpan/raft-consensus/pkg/storage	32.793s
+goos: darwin
+goarch: arm64
+pkg: github.com/sanskarpan/raft-consensus/pkg/transport
+cpu: Apple M3 Pro
+BenchmarkMarshalBinaryAppendEntriesReq-11      	      20	       335.4 ns/op	     168 B/op	       4 allocs/op
+BenchmarkMarshalBinaryAppendEntriesReq-11      	      20	       350.0 ns/op	     168 B/op	       4 allocs/op
+BenchmarkMarshalBinaryAppendEntriesReq-11      	      20	       235.4 ns/op	     168 B/op	       4 allocs/op
+BenchmarkMarshalJSONAppendEntriesReq-11        	      20	      3085 ns/op	     421 B/op	       1 allocs/op
+BenchmarkMarshalJSONAppendEntriesReq-11        	      20	      1069 ns/op	     421 B/op	       1 allocs/op
+BenchmarkMarshalJSONAppendEntriesReq-11        	      20	       958.4 ns/op	     421 B/op	       1 allocs/op
+BenchmarkUnmarshalBinaryAppendEntriesReq-11    	      20	       308.3 ns/op	     264 B/op	       7 allocs/op
+BenchmarkUnmarshalBinaryAppendEntriesReq-11    	      20	       545.9 ns/op	     264 B/op	       7 allocs/op
+BenchmarkUnmarshalBinaryAppendEntriesReq-11    	      20	       225.0 ns/op	     264 B/op	       7 allocs/op
+BenchmarkUnmarshalJSONAppendEntriesReq-11      	      20	      3008 ns/op	     568 B/op	      15 allocs/op
+BenchmarkUnmarshalJSONAppendEntriesReq-11      	      20	      3152 ns/op	     568 B/op	      15 allocs/op
+BenchmarkUnmarshalJSONAppendEntriesReq-11      	      20	      4585 ns/op	     568 B/op	      15 allocs/op
+PASS
+ok  	github.com/sanskarpan/raft-consensus/pkg/transport	0.957s
