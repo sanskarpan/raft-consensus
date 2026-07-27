@@ -34,7 +34,7 @@ go build -o raftd ./cmd/raftd
 go build -o kvctl ./cmd/kvctl
 ```
 
-Start a 3-node cluster locally (raft ports 8011/8013/8015, HTTP 8002/8004/8006):
+Start a 3-node cluster locally (raft ports 8011/8013/8015, HTTP 8012/8014/8016):
 
 ```bash
 ./raftd -config config-node1.yaml &
@@ -43,7 +43,7 @@ Start a 3-node cluster locally (raft ports 8011/8013/8015, HTTP 8002/8004/8006):
 ```
 
 ```bash
-export EP=localhost:8002,localhost:8004,localhost:8006
+export EP=localhost:8012,localhost:8014,localhost:8016
 
 kvctl --endpoints $EP put user/1 alice        # write
 kvctl --endpoints $EP get user/1              # linearizable read
@@ -142,7 +142,7 @@ EOF
 Or with the HTTP API:
 
 ```bash
-curl -X POST localhost:8002/v1/txn -H "Authorization: Bearer $T" -d '{
+curl -X POST localhost:8012/v1/txn -H "Authorization: Bearer $T" -d '{
   "compare":[{"key":"user/1","target":"value","result":"equal","value":"alice"}],
   "success":[{"type":0,"key":"user/1","value":"alice-updated"}],
   "failure":[]
