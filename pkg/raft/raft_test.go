@@ -2900,3 +2900,168 @@ func TestReadIndexContextCancelled(t *testing.T) {
 		t.Error("expected ReadIndex to return an error when no follower acks available, got nil")
 	}
 }
+
+// TestSplitVoteConvergesToSingleLeader verifies that when two nodes start
+// elections simultaneously in the same term — causing a split vote where
+// neither can reach quorum — the cluster still converges to exactly one
+// leader via the randomised election-timeout backoff (Raft §5.2).
+func TestSplitVoteConvergesToSingleLeader(t *testing.T) {
+	nodes, transports, _ := makeCluster(t)
+	for _, r := range nodes {
+		if err := r.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer r.Shutdown()
+	}
+
+	leader := findLeader(t, nodes, 5*time.Second)
+	var leaderIdx int
+	for i, r := range nodes {
+		if r == leader {
+			leaderIdx = i
+		}
+	}
+
+	var followers []*raft
+	for _, r := range nodes {
+		if r != leader {
+			followers = append(followers, r)
+		}
+	}
+
+	// Partition the current leader so it cannot send heartbeats or respond to
+	// vote requests, forcing an election among the followers.
+	partitionNode(transports[leaderIdx])
+
+	// Trigger elections on both followers concurrently. Both become candidates
+	// in the same term and vote for themselves, so each rejects the other's
+	// RequestVote — a classic split vote. After the split, randomised
+	// election-timeout backoff must break the tie.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for _, f := range followers {
+		f := f
+		go func() {
+			defer wg.Done()
+			f.HandleTimeoutNowRPC()
+		}()
+	}
+	wg.Wait()
+
+	// Despite the split vote, exactly one leader must emerge from the two
+	// follower nodes within a reasonable window.
+	eventually(t, 10*time.Second, func() bool {
+		count := 0
+		for _, f := range followers {
+			if f.State() == StateLeader {
+				count++
+			}
+		}
+		return count == 1
+	}, "expected exactly one leader to emerge from two followers after split-vote resolution")
+
+	// Heal so the original leader can step down cleanly.
+	healNode(transports[leaderIdx])
+}
+
+// TestLogDivergenceStaleLeaderRejoin verifies that when a partitioned leader
+// holds uncommitted entries that diverge from what the new majority committed,
+// those stale entries are overwritten upon partition heal (Raft §5.4 Log
+// Matching Property and leader completeness).
+func TestLogDivergenceStaleLeaderRejoin(t *testing.T) {
+	nodes, transports, _ := makeCluster(t)
+	for _, r := range nodes {
+		if err := r.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer r.Shutdown()
+	}
+
+	// Elect an initial leader and commit a baseline entry on all nodes.
+	leader := findLeader(t, nodes, 5*time.Second)
+	var leaderIdx int
+	for i, r := range nodes {
+		if r == leader {
+			leaderIdx = i
+		}
+	}
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel1()
+	if _, err := leader.Apply(ctx1, []byte("baseline-entry")); err != nil {
+		t.Fatalf("Apply baseline-entry: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // let followers receive the committed entry
+
+	// Record the original term before isolating the leader.
+	leader.mu.RLock()
+	origTerm := leader.term
+	leader.mu.RUnlock()
+
+	// Partition the leader so it cannot replicate to followers.
+	partitionNode(transports[leaderIdx])
+
+	// Directly inject a stale uncommitted entry into the isolated leader's log,
+	// simulating a client write that was accepted locally but never replicated
+	// to a quorum before the partition.
+	leader.mu.Lock()
+	staleIdx := leader.lastIndex + 1
+	staleEntry := &LogEntry{Index: staleIdx, Term: origTerm, Type: EntryNormal, Data: []byte("stale-entry")}
+	if err := leader.log.Append([]*LogEntry{staleEntry}); err != nil {
+		leader.mu.Unlock()
+		t.Fatalf("inject stale log entry: %v", err)
+	}
+	leader.lastIndex = staleIdx
+	leader.lastTerm = origTerm
+	leader.mu.Unlock()
+
+	// Wait for a new leader to emerge on the remaining two nodes.
+	var newLeader *raft
+	eventually(t, 5*time.Second, func() bool {
+		for i, r := range nodes {
+			if i != leaderIdx && r.State() == StateLeader {
+				newLeader = r
+				return true
+			}
+		}
+		return false
+	}, "no new leader elected after partitioning original leader")
+
+	// Commit an authoritative entry on the new leader. Its leadership no-op
+	// at staleIdx conflicts with the stale entry on the old leader.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	if _, err := newLeader.Apply(ctx2, []byte("authoritative-entry")); err != nil {
+		t.Fatalf("Apply through new leader: %v", err)
+	}
+
+	newLeader.mu.RLock()
+	newTerm := newLeader.term
+	newLeader.mu.RUnlock()
+
+	// Heal the partition: the old leader will receive AppendEntries from the
+	// new leader, discover the higher term, step down, and have its divergent
+	// log entry overwritten.
+	healNode(transports[leaderIdx])
+
+	// The old leader must step down and apply entries at least through staleIdx.
+	eventually(t, 5*time.Second, func() bool {
+		leader.mu.RLock()
+		state := leader.state
+		ci := leader.commitIndex
+		leader.mu.RUnlock()
+		return state != StateLeader && ci >= staleIdx
+	}, "old leader did not step down and converge to new leader's commitIndex")
+
+	// Confirm the stale entry was overwritten: the entry at staleIdx must now
+	// carry the new leader's term, not the original leader's.
+	entry, err := leader.log.Get(staleIdx)
+	if err != nil {
+		t.Fatalf("log.Get(%d) on old leader after convergence: %v", staleIdx, err)
+	}
+	if entry.Term == origTerm {
+		t.Errorf("stale entry at index %d still has original term %d; log repair did not overwrite it (new leader term = %d)",
+			staleIdx, origTerm, newTerm)
+	}
+	_ = newTerm
+}

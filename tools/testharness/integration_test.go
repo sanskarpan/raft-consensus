@@ -145,6 +145,56 @@ func TestMultiProcessCluster(t *testing.T) {
 		t.Fatalf("WaitForLeader after follower restart: %v", err)
 	}
 	t.Log("cluster is still operational after follower restart")
+
+	// Step 12: Verify data durability by reading all 15 committed keys
+	// directly from the restarted follower (stale read, no leader forwarding).
+	// This confirms that WAL replay on restart correctly reconstructs FSM state.
+	followerAddr, err := h.GetNodeAddr(followerID)
+	if err != nil {
+		t.Fatalf("GetNodeAddr(%s): %v", followerID, err)
+	}
+	if strings.HasPrefix(followerAddr, ":") {
+		followerAddr = "localhost" + followerAddr
+	}
+	fc := client.NewClient(
+		client.WithAddresses([]string{followerAddr}),
+		client.WithTimeout(5*time.Second),
+	)
+
+	// Poll until all 15 keys are visible on the follower. The run() goroutine
+	// may still be replaying committed WAL entries when health is first confirmed.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		allPresent := true
+		for i := 0; i < 15; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			expected := fmt.Sprintf("value-%d", i)
+			kv, gerr := fc.GetKVStale(key)
+			if gerr != nil || kv.Value != expected {
+				allPresent = false
+				break
+			}
+		}
+		if allPresent {
+			break
+		}
+		if time.Now().After(deadline) {
+			for i := 0; i < 15; i++ {
+				key := fmt.Sprintf("key-%d", i)
+				expected := fmt.Sprintf("value-%d", i)
+				kv, gerr := fc.GetKVStale(key)
+				if gerr != nil {
+					t.Errorf("GetKVStale(%s) from restarted follower: %v", key, gerr)
+				} else if kv.Value != expected {
+					t.Errorf("key %s from restarted follower: got %q, want %q", key, kv.Value, expected)
+				}
+			}
+			t.Fatalf("restarted follower %s did not replay all 15 committed entries within deadline", followerID)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Logf("restarted follower %s has all 15 committed keys — WAL replay verified", followerID)
 }
 
 // ---------------------------------------------------------------------------
