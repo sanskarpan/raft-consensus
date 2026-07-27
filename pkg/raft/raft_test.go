@@ -2904,7 +2904,7 @@ func TestReadIndexContextCancelled(t *testing.T) {
 // TestSplitVoteConvergesToSingleLeader verifies that when two nodes start
 // elections simultaneously in the same term — causing a split vote where
 // neither can reach quorum — the cluster still converges to exactly one
-// leader via the randomised election-timeout backoff (Raft §5.2).
+// leader via the randomized election-timeout backoff (Raft §5.2).
 func TestSplitVoteConvergesToSingleLeader(t *testing.T) {
 	nodes, transports, _ := makeCluster(t)
 	for _, r := range nodes {
@@ -2935,7 +2935,7 @@ func TestSplitVoteConvergesToSingleLeader(t *testing.T) {
 
 	// Trigger elections on both followers concurrently. Both become candidates
 	// in the same term and vote for themselves, so each rejects the other's
-	// RequestVote — a classic split vote. After the split, randomised
+	// RequestVote — a classic split vote. After the split, randomized
 	// election-timeout backoff must break the tie.
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -2958,7 +2958,7 @@ func TestSplitVoteConvergesToSingleLeader(t *testing.T) {
 			}
 		}
 		return count == 1
-	}, "expected exactly one leader to emerge from two followers after split-vote resolution")
+	}, "expected exactly one leader to emerge from two followers after split-vote resolution — randomized timeout must break the tie")
 
 	// Heal so the original leader can step down cleanly.
 	healNode(transports[leaderIdx])
