@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/terminal-demo.svg" alt="kvctl terminal demo — put, get, status, txn, watch" width="680">
+  <img src="docs/assets/terminal-demo.png" alt="kvctl terminal demo — put, get, status, txn, watch" width="680">
 </p>
 
 `raftd` is a replicated key/value store where a cluster of nodes stays in agreement using [Raft consensus](https://raft.github.io/raft.pdf). Writes commit to a majority before being acknowledged. Reads are **linearizable by default** — a heartbeat quorum confirms the leader still holds quorum before serving data, so a partitioned stale leader can never return stale reads. Stale local reads are opt-in for speed.
@@ -66,7 +66,7 @@ curl -s localhost:8002/v1/status | jq .
 ## Dashboard
 
 <p align="center">
-  <img src="docs/assets/dashboard.svg" alt="Raft Dashboard — cluster topology and KV explorer" width="860">
+  <img src="docs/assets/dashboard.png" alt="Raft Dashboard — cluster topology and KV explorer" width="880">
 </p>
 
 The React/Vite dashboard (`ui/`) lets you explore the cluster, browse and edit keys, stream live watch events, inspect replication lag, and trigger snapshots — all from a browser.
