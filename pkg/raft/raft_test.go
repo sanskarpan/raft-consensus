@@ -930,15 +930,15 @@ func TestCommitIndexPersistedAndRestoredOnRestart(t *testing.T) {
 		t.Fatal("commitIndex is still 0 after applying entries")
 	}
 
-	// Verify commitIndex was persisted in the stable store.
-	raw, err := r.stable.Get([]byte(KeyCommitIndex))
-	if err != nil || raw == nil {
-		t.Fatalf("KeyCommitIndex not found in stable store: err=%v raw=%v", err, raw)
-	}
-	persisted := bytesToUint64(raw)
-	if persisted != committedIdx {
-		t.Errorf("persisted commitIndex = %d, want %d", persisted, committedIdx)
-	}
+	// Verify commitIndex is persisted in the stable store. The flush is
+	// coalesced through a buffered channel (persistCommitCh) and written by
+	// the run() goroutine, so the stable store may briefly lag behind the
+	// in-memory value. Poll until the flush completes rather than asserting
+	// immediately.
+	eventually(t, 2*time.Second, func() bool {
+		raw, err := r.stable.Get([]byte(KeyCommitIndex))
+		return err == nil && raw != nil && bytesToUint64(raw) == committedIdx
+	}, fmt.Sprintf("stable store commit index not flushed to %d", committedIdx))
 
 	// Shut down and restart sharing the same log and stable stores.
 	if err := r.Shutdown(); err != nil {
