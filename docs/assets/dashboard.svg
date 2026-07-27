@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 480" width="880" height="480">
+  <!-- Overall window -->
+  <rect width="880" height="480" rx="10" ry="10" fill="#0f172a"/>
+
+  <!-- ── Top nav bar ── -->
+  <rect width="880" height="52" rx="10" ry="10" fill="#1e293b"/>
+  <rect y="40" width="880" height="12" fill="#1e293b"/>
+  <line x1="0" y1="52" x2="880" y2="52" stroke="#334155" stroke-width="1"/>
+
+  <!-- Logo -->
+  <text x="22" y="33" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="18" font-weight="bold" fill="#f8fafc">⬡</text>
+  <text x="44" y="33" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="14" font-weight="600" fill="#f8fafc">raft-consensus</text>
+
+  <!-- Nav tabs -->
+  <!-- Active: Cluster -->
+  <rect x="180" y="14" width="72" height="26" rx="6" fill="#334155"/>
+  <text x="216" y="31" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="500" fill="#f8fafc" text-anchor="middle">Cluster</text>
+
+  <text x="270" y="31" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" fill="#94a3b8">KV Store</text>
+  <text x="346" y="31" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" fill="#94a3b8">Metrics</text>
+  <text x="410" y="31" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" fill="#94a3b8">Nodes</text>
+
+  <!-- Status pill: healthy -->
+  <rect x="750" y="14" width="110" height="26" rx="13" fill="#064e3b"/>
+  <circle cx="768" cy="27" r="4" fill="#10b981"/>
+  <text x="778" y="32" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#6ee7b7">cluster healthy</text>
+
+  <!-- ── Left card: Cluster Topology ── -->
+  <rect x="16" y="66" width="264" height="400" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+
+  <!-- Card header -->
+  <text x="30" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="600" fill="#f8fafc">Cluster Topology</text>
+  <line x1="16" y1="100" x2="280" y2="100" stroke="#334155" stroke-width="1"/>
+
+  <!-- node1 (Leader) — yellow border -->
+  <rect x="26" y="108" width="244" height="86" rx="6" fill="#0f172a" stroke="#fbbf24" stroke-width="2"/>
+  <!-- Crown icon area -->
+  <text x="42" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="16">👑</text>
+  <text x="64" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="600" fill="#f8fafc">node1</text>
+  <!-- Leader badge -->
+  <rect x="110" y="117" width="54" height="18" rx="4" fill="#78350f"/>
+  <text x="137" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="700" fill="#fef08a" text-anchor="middle">Leader</text>
+  <!-- Node details -->
+  <text x="42" y="152" font-family="'Courier New', Consolas, monospace" font-size="11" fill="#94a3b8">:8002</text>
+  <text x="42" y="168" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">term=3  commit=42  applied=42</text>
+  <text x="42" y="185" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">uptime=2h14m  snap=yes</text>
+
+  <!-- node2 (Follower) — blue border -->
+  <rect x="26" y="204" width="244" height="76" rx="6" fill="#0f172a" stroke="#3b82f6" stroke-width="2"/>
+  <text x="42" y="224" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="600" fill="#f8fafc">node2</text>
+  <rect x="97" y="211" width="60" height="18" rx="4" fill="#1e3a8a"/>
+  <text x="127" y="224" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="700" fill="#bfdbfe" text-anchor="middle">Follower</text>
+  <text x="42" y="244" font-family="'Courier New', Consolas, monospace" font-size="11" fill="#94a3b8">:8004</text>
+  <text x="42" y="260" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">lag=0ms  commit=42</text>
+  <text x="42" y="272" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#6b7280">(last contact 47ms ago)</text>
+
+  <!-- node3 (Follower) — blue border -->
+  <rect x="26" y="290" width="244" height="76" rx="6" fill="#0f172a" stroke="#3b82f6" stroke-width="2"/>
+  <text x="42" y="310" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="600" fill="#f8fafc">node3</text>
+  <rect x="97" y="297" width="60" height="18" rx="4" fill="#1e3a8a"/>
+  <text x="127" y="310" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="700" fill="#bfdbfe" text-anchor="middle">Follower</text>
+  <text x="42" y="330" font-family="'Courier New', Consolas, monospace" font-size="11" fill="#94a3b8">:8006</text>
+  <text x="42" y="346" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">lag=1ms  commit=42</text>
+  <text x="42" y="358" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#6b7280">(last contact 52ms ago)</text>
+
+  <!-- Cluster stats row -->
+  <line x1="16" y1="382" x2="280" y2="382" stroke="#334155" stroke-width="1"/>
+  <text x="30" y="400" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">Revision</text>
+  <text x="30" y="416" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="18" font-weight="700" fill="#f8fafc">42</text>
+  <text x="108" y="400" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">Term</text>
+  <text x="108" y="416" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="18" font-weight="700" fill="#f8fafc">3</text>
+  <text x="178" y="400" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">Voters</text>
+  <text x="178" y="416" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="18" font-weight="700" fill="#f8fafc">3</text>
+
+  <!-- Replication lag mini-bar -->
+  <line x1="16" y1="434" x2="280" y2="434" stroke="#334155" stroke-width="1"/>
+  <text x="30" y="452" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">Replication lag (max)</text>
+  <rect x="30" y="455" width="234" height="6" rx="3" fill="#334155"/>
+  <rect x="30" y="455" width="4" height="6" rx="3" fill="#10b981"/>
+  <text x="268" y="462" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#10b981" text-anchor="end">1ms</text>
+
+  <!-- ── Right card: KV Explorer ── -->
+  <rect x="296" y="66" width="568" height="400" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+
+  <!-- Card header -->
+  <text x="314" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="13" font-weight="600" fill="#f8fafc">KV Explorer</text>
+
+  <!-- Tabs -->
+  <rect x="396" y="75" width="54" height="22" rx="5" fill="#334155"/>
+  <text x="423" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" font-weight="500" fill="#f8fafc" text-anchor="middle">Browse</text>
+  <text x="460" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#94a3b8">Get</text>
+  <text x="492" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#94a3b8">Put</text>
+  <text x="518" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#94a3b8">Watch</text>
+  <text x="560" y="90" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#94a3b8">Txn</text>
+
+  <line x1="296" y1="100" x2="864" y2="100" stroke="#334155" stroke-width="1"/>
+
+  <!-- Search bar -->
+  <rect x="314" y="110" width="400" height="30" rx="6" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="326" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">Prefix filter: e.g. user/</text>
+  <rect x="726" y="110" width="80" height="30" rx="6" fill="#1d4ed8"/>
+  <text x="766" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#f8fafc" text-anchor="middle">Refresh</text>
+  <rect x="818" y="110" width="44" height="30" rx="6" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="840" y="130" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#94a3b8" text-anchor="middle">☰</text>
+
+  <!-- Table header -->
+  <rect x="296" y="148" width="568" height="24" fill="#0f172a"/>
+  <text x="314" y="164" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b">KEY</text>
+  <text x="558" y="164" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b">VALUE</text>
+  <text x="782" y="164" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" font-weight="600" fill="#64748b">REVISION</text>
+  <line x1="296" y1="172" x2="864" y2="172" stroke="#334155" stroke-width="1"/>
+
+  <!-- Row 1: user/1 -->
+  <rect x="296" y="172" width="568" height="38" fill="#1e293b"/>
+  <text x="314" y="196" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">user/1</text>
+  <text x="558" y="196" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">alice</text>
+  <text x="782" y="196" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:42</text>
+  <text x="842" y="196" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="210" x2="864" y2="210" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Row 2: user/2 -->
+  <rect x="296" y="210" width="568" height="38" fill="#162032"/>
+  <text x="314" y="234" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">user/2</text>
+  <text x="558" y="234" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">bob</text>
+  <text x="782" y="234" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:44</text>
+  <text x="842" y="234" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="248" x2="864" y2="248" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Row 3: config/theme -->
+  <rect x="296" y="248" width="568" height="38" fill="#1e293b"/>
+  <text x="314" y="272" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">config/theme</text>
+  <text x="558" y="272" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">dark</text>
+  <text x="782" y="272" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:7</text>
+  <text x="842" y="272" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="286" x2="864" y2="286" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Row 4: metrics/host -->
+  <rect x="296" y="286" width="568" height="38" fill="#162032"/>
+  <text x="314" y="310" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">metrics/scrape_interval</text>
+  <text x="558" y="310" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">15s</text>
+  <text x="782" y="310" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:3</text>
+  <text x="842" y="310" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="324" x2="864" y2="324" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Row 5: feature/ -->
+  <rect x="296" y="324" width="568" height="38" fill="#1e293b"/>
+  <text x="314" y="348" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">feature/new-ui</text>
+  <text x="558" y="348" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">enabled</text>
+  <text x="782" y="348" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:31</text>
+  <text x="842" y="348" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="362" x2="864" y2="362" stroke="#1e3a5f" stroke-width="1"/>
+
+  <!-- Row 6: service/ -->
+  <rect x="296" y="362" width="568" height="38" fill="#162032"/>
+  <text x="314" y="386" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#60a5fa">service/maintenance</text>
+  <text x="558" y="386" font-family="'Courier New', Consolas, monospace" font-size="13" fill="#d1d5db">false</text>
+  <text x="782" y="386" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">rev:18</text>
+  <text x="842" y="386" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#475569">▶</text>
+  <line x1="296" y1="400" x2="864" y2="400" stroke="#334155" stroke-width="1"/>
+
+  <!-- Footer: pagination + count -->
+  <rect x="296" y="400" width="568" height="66" rx="0" fill="#1e293b"/>
+  <rect x="296" y="452" width="568" height="14" rx="0" fill="#1e293b"/>
+  <path d="M296 452 L864 452" stroke="#334155" stroke-width="0" fill="none"/>
+
+  <text x="314" y="422" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="12" fill="#64748b">Showing 6 of 6 keys  •  total revision: 42</text>
+
+  <!-- Stale read toggle -->
+  <rect x="600" y="410" width="100" height="24" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="650" y="426" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">stale read: off</text>
+
+  <rect x="714" y="410" width="60" height="24" rx="5" fill="#1d4ed8"/>
+  <text x="744" y="426" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#f8fafc" text-anchor="middle">Put key</text>
+
+  <rect x="786" y="410" width="66" height="24" rx="5" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="819" y="426" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8" text-anchor="middle">Delete…</text>
+
+  <!-- Watch indicator bottom -->
+  <rect x="296" y="436" width="568" height="30" rx="0" fill="#0f172a"/>
+  <circle cx="314" cy="451" r="4" fill="#10b981"/>
+  <text x="324" y="456" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#6ee7b7">Watch active: listening on user/</text>
+  <text x="600" y="456" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#94a3b8">PUT user/1 = alice  rev=44</text>
+  <text x="820" y="456" font-family="system-ui, -apple-system, Arial, sans-serif" font-size="11" fill="#64748b">0.1s ago</text>
+</svg>

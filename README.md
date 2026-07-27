@@ -1,80 +1,31 @@
-# Raft Consensus
+<p align="center">
+  <br>
+  <strong style="font-size:28px">raft-consensus</strong>
+  <br><br>
+  <em>Production-grade distributed key/value store built on a from-scratch Raft implementation in Go</em>
+</p>
 
-> A linearizable, strongly-consistent distributed key/value store built on a from-scratch Raft implementation in Go — WAL storage, gRPC/TCP transport, mTLS, snapshots, joint-consensus membership, watches, and a React dashboard.
+<p align="center">
+  <a href="https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml/badge.svg"></a>&nbsp;
+  <a href="https://go.dev/dl/"><img alt="Go" src="https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go&logoColor=white"></a>&nbsp;
+  <a href="https://goreportcard.com/report/github.com/sanskarpan/raft-consensus"><img alt="Go Report Card" src="https://goreportcard.com/badge/github.com/sanskarpan/raft-consensus"></a>&nbsp;
+  <img alt="linearizable" src="https://img.shields.io/badge/reads-linearizable-6366f1">&nbsp;
+  <a href="./LICENSE"><img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+</p>
 
-[![CI](https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml/badge.svg)](https://github.com/sanskarpan/raft-consensus/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/go-1.26%2B-00ADD8?logo=go)](https://go.dev/dl/)
-[![Go Report Card](https://goreportcard.com/badge/github.com/sanskarpan/raft-consensus)](https://goreportcard.com/report/github.com/sanskarpan/raft-consensus)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+<p align="center">
+  <img src="docs/assets/terminal-demo.svg" alt="kvctl terminal demo — put, get, status, txn, watch" width="680">
+</p>
 
-`raftd` is a replicated key/value store that keeps a cluster of nodes in agreement using the [Raft consensus algorithm](https://raft.github.io/raft.pdf). Writes are committed to a majority before being acknowledged; reads can be **linearizable** (confirmed by a heartbeat quorum via ReadIndex) or **stale** (served locally for speed). It ships with an HTTP API, a Go client, a `kvctl` CLI, Prometheus metrics, OpenTelemetry tracing, and a Helm chart.
+`raftd` is a replicated key/value store where a cluster of nodes stays in agreement using [Raft consensus](https://raft.github.io/raft.pdf). Writes commit to a majority before being acknowledged. Reads are **linearizable by default** — a heartbeat quorum confirms the leader still holds quorum before serving data, so a partitioned stale leader can never return stale reads. Stale local reads are opt-in for speed.
 
----
-
-## Table of Contents
-
-- [Features](#features)
-- [Architecture](#architecture)
-- [Quickstart](#quickstart)
-  - [Build from source](#build-from-source)
-  - [Docker Compose](#docker-compose)
-  - [Kubernetes / Helm](#kubernetes--helm)
-- [Configuration reference](#configuration-reference)
-- [Client usage](#client-usage)
-  - [kvctl](#kvctl)
-  - [HTTP API (curl)](#http-api-curl)
-- [Operational notes](#operational-notes)
-- [Benchmarks](#benchmarks)
-- [Security](#security)
-- [Documentation](#documentation)
-- [License](#license)
+It ships a REST API, Go client library, `kvctl` CLI, gRPC and TCP transports, mTLS peer encryption, compare-and-swap transactions, SSE watches with history replay, Prometheus metrics, OpenTelemetry traces, and a React dashboard.
 
 ---
-
-## Features
-
-- **Leader election with pre-vote** — randomized election timeouts and an optional pre-vote round that prevents a partitioned node from disrupting a stable leader.
-- **Log replication** — `AppendEntries` with group-commit batching and a conflict-term fast-backup optimization for quick log reconciliation.
-- **Durable WAL** — segment-based write-ahead log (64 MiB segments) with per-record CRC32 and fsync-on-append; BoltDB stable store for term/vote/config.
-- **Snapshots & compaction** — periodic and size-triggered snapshots with atomic, checksummed on-disk format and `InstallSnapshot` streaming to lagging followers.
-- **Joint-consensus membership** — safe cluster reconfiguration (add/remove voters) via C_old,new joint consensus; at most one change outstanding at a time.
-- **Learners** — non-voting replicas that catch up before promotion, so scaling never risks quorum.
-- **Linearizable reads (ReadIndex)** — heartbeat-confirmed quorum reads that never write to the log, plus opt-in **stale** local reads.
-- **Transactions** — compare-and-swap `Txn` (mini-transactions with compare/success/failure branches), applied atomically.
-- **Watches** — Server-Sent-Events (SSE) streams for key or prefix changes, with revision-based history replay and automatic client reconnect.
-- **Transports** — JSON-over-TCP (default) or gRPC, both with optional TLS/mTLS and a fail-closed `require_tls` mode.
-- **Security** — token auth with read/write roles, mTLS between nodes, per-IP and global rate limiting, CORS deny-by-default, request-size limits.
-- **Observability** — Prometheus metrics at `/metrics`, OpenTelemetry (OTLP) traces, structured Zap logging, optional pprof.
-- **Admin UI** — a React/Vite dashboard (`ui/`) for cluster topology, KV exploration, metrics, and node control.
-
-## Architecture
-
-```
-                            ┌──────────────────────────────────────────┐
-      kvctl / curl / UI ───►│  HTTP API (:http_addr)                    │
-      Go client            │  /v1/kv /v1/txn /v1/watch /v1/status       │
-                            │  /command /admin/* /health /ready /metrics │
-                            └───────────────┬────────────────────────────┘
-                                            │ (forwards writes/lin-reads to leader)
-                                            ▼
-   ┌───────────────┐   Raft RPCs   ┌───────────────┐   Raft RPCs   ┌───────────────┐
-   │    node1      │◄─────────────►│    node2      │◄─────────────►│    node3      │
-   │  (leader)     │  TCP or gRPC  │  (follower)   │   TLS/mTLS    │  (follower)   │
-   ├───────────────┤               ├───────────────┤               ├───────────────┤
-   │ Raft core     │  AppendEntries│ Raft core     │  RequestVote  │ Raft core     │
-   │ WAL + Stable  │  Snapshot     │ WAL + Stable  │  TimeoutNow   │ WAL + Stable  │
-   │ KV FSM        │               │ KV FSM        │               │ KV FSM        │
-   │ WatchManager  │               │ WatchManager  │               │ WatchManager  │
-   └───────────────┘               └───────────────┘               └───────────────┘
-```
-
-A write flows: client → any node → forwarded to leader → `Apply` appends to the WAL and replicates → committed once a quorum acks → applied to the KV FSM → response returned. A linearizable read confirms the leader still holds quorum (ReadIndex heartbeat round) and waits for the FSM to catch up before serving from local state. See [docs/architecture.md](docs/architecture.md) for the full deep dive.
 
 ## Quickstart
 
-### Build from source
-
-Requires Go 1.25+ (the module pins toolchain `go1.26.5`).
+Requires Go 1.25+. Builds in ~10 seconds:
 
 ```bash
 git clone https://github.com/sanskarpan/raft-consensus.git
@@ -83,34 +34,212 @@ go build -o raftd ./cmd/raftd
 go build -o kvctl ./cmd/kvctl
 ```
 
-Run a 3-node cluster locally using the bundled per-node configs (raft ports 8011/8013/8015, HTTP ports 8012/8014/8016):
+Start a 3-node cluster locally (raft ports 8011/8013/8015, HTTP 8002/8004/8006):
 
 ```bash
 ./raftd -config config-node1.yaml &
 ./raftd -config config-node2.yaml &
 ./raftd -config config-node3.yaml &
-
-./kvctl --endpoints localhost:8012,localhost:8014,localhost:8016 put hello world
-./kvctl --endpoints localhost:8012,localhost:8014,localhost:8016 get hello
 ```
 
-> These sample configs set `allow_no_auth` implicitly off; when no `admin_token`/`admin_tokens` are configured the auth middleware **fails closed** and rejects requests. For local experimentation add `allow_no_auth: true` to each config, or configure a token (see [Configuration](#configuration-reference)).
+```bash
+export EP=localhost:8002,localhost:8004,localhost:8006
 
-### Docker Compose
+kvctl --endpoints $EP put user/1 alice        # write
+kvctl --endpoints $EP get user/1              # linearizable read
+kvctl --endpoints $EP get user/1 --stale      # fast local read
+kvctl --endpoints $EP status                  # cluster health
+kvctl --endpoints $EP watch user/ --prefix    # SSE stream (Ctrl-C to stop)
+```
 
-Builds the image from the root `Dockerfile` and starts a 3-node cluster on an internal bridge network; only the HTTP API ports are published to the host (8002/8004/8006):
+> **Auth:** the sample configs have `allow_no_auth: true` already set for local dev. In production, set `admin_tokens: {mytoken: write}` and pass `--token mytoken`.
+
+Or spin up the cluster with Docker Compose — no Go toolchain needed:
 
 ```bash
 docker compose -f scripts/docker/docker-compose.yml up --build
-```
-
-```bash
 curl -s localhost:8002/v1/status | jq .
 ```
 
-### Kubernetes / Helm
+---
 
-The chart in `charts/raft` deploys a StatefulSet (with a per-pod `data` PVC), a ClusterIP Service, a headless Service, and a rendered config ConfigMap.
+## Dashboard
+
+<p align="center">
+  <img src="docs/assets/dashboard.svg" alt="Raft Dashboard — cluster topology and KV explorer" width="860">
+</p>
+
+The React/Vite dashboard (`ui/`) lets you explore the cluster, browse and edit keys, stream live watch events, inspect replication lag, and trigger snapshots — all from a browser.
+
+```bash
+cd ui && npm install && npm run dev    # → http://localhost:5173
+```
+
+---
+
+## What's inside
+
+| Layer | Description |
+|-------|-------------|
+| **Raft core** | Leader election with randomized timeouts, log replication with group-commit batching, conflict-term fast-backup, snapshots with streaming `InstallSnapshot`, joint-consensus safe membership changes, learner nodes |
+| **ReadIndex** | Heartbeat-quorum linearizable reads — never hit the log, never return stale data; opt-in stale reads skip the round-trip |
+| **WAL** | Segment-based (64 MiB) write-ahead log, per-record CRC32, fsync-on-append, concurrent-safe per-call file descriptors |
+| **KV FSM** | Versioned keys with create/mod revision + version counter, compare-and-swap `Txn`, ring-buffer event history (1024 entries) |
+| **Watches** | SSE streams for exact-key or prefix; revision-based history replay; automatic client reconnect with `Last-Event-ID`; per-IP + global caps |
+| **Transport** | JSON-over-TCP (default) or gRPC; TLS 1.3 / mTLS with client-cert verification; `require_tls` fail-closed mode |
+| **Security** | Token auth with `read`/`write` roles; per-IP + global token-bucket rate limiting; CORS deny-by-default; request-body size cap (1 MiB); auth fails closed |
+| **Observability** | Prometheus at `/metrics`, OpenTelemetry/OTLP traces, structured Zap logging, auth-gated pprof |
+| **Admin UI** | React/Vite dashboard: cluster topology, KV explorer (browse/edit/watch/txn tabs), metrics, node control, snapshot manager |
+
+---
+
+## Architecture
+
+```
+                       ┌──────────────────────────────────────────┐
+  kvctl / curl / UI ──►│  HTTP API (:http_addr)                    │
+  Go client            │  /v1/kv  /v1/txn  /v1/watch  /v1/status  │
+                       │  /command  /admin/*  /health  /metrics    │
+                       └──────────────────┬───────────────────────┘
+                                          │  leader-forwards writes + lin-reads
+                                          ▼
+┌───────────────┐  Raft RPCs  ┌───────────────┐  Raft RPCs  ┌───────────────┐
+│    node1      │◄───────────►│    node2      │◄───────────►│    node3      │
+│  (leader)     │  TCP/gRPC   │  (follower)   │  TLS/mTLS   │  (follower)   │
+├───────────────┤             ├───────────────┤             ├───────────────┤
+│ Raft core     │AppendEntries│ Raft core     │RequestVote  │ Raft core     │
+│ WAL + Stable  │Snapshot     │ WAL + Stable  │TimeoutNow   │ WAL + Stable  │
+│ KV FSM        │             │ KV FSM        │             │ KV FSM        │
+│ WatchManager  │             │ WatchManager  │             │ WatchManager  │
+└───────────────┘             └───────────────┘             └───────────────┘
+```
+
+**Write path:** client → any node → forward to leader → `Apply` appends to WAL and replicates → committed once a quorum acks → applied to KV FSM → response returned.
+
+**Linearizable read:** leader confirms it still holds quorum (ReadIndex heartbeat), waits for `applyIndex ≥ readIndex`, then serves from local FSM state — no log entry written.
+
+**Stale read:** served directly from the local FSM under `RLock` — zero network round-trips.
+
+See [docs/architecture.md](docs/architecture.md) for the full deep-dive.
+
+---
+
+## Transactions
+
+Compare-and-swap transactions let you atomically gate writes on key state:
+
+```bash
+# If user/1 == "alice" → update it; else → return current value
+kvctl --endpoints $EP txn - <<'EOF'
+{
+  "compare": [{"key":"user/1","target":"value","result":"equal","value":"alice"}],
+  "success": [{"type":0,"key":"user/1","value":"alice-updated"}],
+  "failure": [{"type":1,"key":"user/1"}]
+}
+EOF
+```
+
+Or with the HTTP API:
+
+```bash
+curl -X POST localhost:8002/v1/txn -H "Authorization: Bearer $T" -d '{
+  "compare":[{"key":"user/1","target":"value","result":"equal","value":"alice"}],
+  "success":[{"type":0,"key":"user/1","value":"alice-updated"}],
+  "failure":[]
+}'
+```
+
+---
+
+## HTTP API reference
+
+All write endpoints require `Authorization: Bearer <token>` unless `allow_no_auth: true`. Health and readiness endpoints are always open.
+
+| Method | Path | Role | Description |
+|--------|------|------|-------------|
+| `PUT` | `/v1/kv/{key}` | write | Create or update a key |
+| `GET` | `/v1/kv/{key}` | read | Linearizable get (default) or `?consistency=stale` |
+| `GET` | `/v1/kv?prefix=pfx/` | read | Range scan by prefix (max 10 000 results) |
+| `DELETE` | `/v1/kv/{key}` | write | Delete a key |
+| `POST` | `/v1/txn` | write | Compare-and-swap transaction |
+| `GET` | `/v1/watch?key=k` | read | SSE watch stream (also `?prefix=p/`) |
+| `GET` | `/v1/status` | read | Cluster status, revision, dropped-event counters |
+| `POST` | `/command` | write | Raw Raft apply (legacy; prefer `/v1/kv`) |
+| `POST` | `/admin/snapshot` | write | Trigger a snapshot on this node |
+| `POST` | `/admin/members` | write | Add a voting member (joint consensus) |
+| `DELETE` | `/admin/members/{id}` | write | Remove a member |
+| `POST` | `/admin/members/{id}/promote` | write | Promote learner → voter |
+| `GET` | `/metrics` | — | Prometheus metrics |
+| `GET` | `/health` | — | Liveness (always 200) |
+| `GET` | `/ready` | — | Readiness (200 when FSM is up to date) |
+
+Full reference with request/response schemas: [docs/api.md](docs/api.md).
+
+---
+
+## kvctl command reference
+
+```bash
+# Global flags
+kvctl [--endpoints ep1,ep2,...] [--token TOKEN] [--timeout 5s] [--stale] COMMAND
+
+kvctl put KEY VALUE               # write a key
+kvctl get KEY                     # linearizable read
+kvctl get KEY --stale             # fast local read
+kvctl delete KEY                  # delete a key
+kvctl range PREFIX/               # list all keys under prefix
+kvctl txn FILE.json               # run a compare-and-swap transaction (stdin with -)
+kvctl watch KEY                   # stream changes to one key
+kvctl watch PREFIX/ --prefix      # stream all changes under prefix
+kvctl status                      # cluster leader, term, revision, node lag
+kvctl completion bash|zsh|fish    # emit shell completion script
+```
+
+Install completions:
+
+```bash
+# bash
+kvctl completion bash >> ~/.bash_completion
+
+# zsh
+kvctl completion zsh > "${fpath[1]}/_kvctl"
+
+# fish
+kvctl completion fish > ~/.config/fish/completions/kvctl.fish
+```
+
+---
+
+## Configuration reference
+
+`raftd` reads a YAML file passed with `-config` (default `raftd.yaml`). Key options:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `node_id` | *(required)* | Unique node ID; must appear in `cluster`. |
+| `listen_addr` | `:8080` | Raft RPC listen address. |
+| `http_addr` | `:8081` | HTTP API listen address. |
+| `data_dir` | `./data` | Base data directory; files go under `data_dir/<node_id>/`. |
+| `cluster` | *(required)* | Initial members: `[{id, address, http_address}]`. |
+| `election_tick` | `10` | Election timeout in ticks (must be ≥ 3× `heartbeat_tick`). |
+| `heartbeat_tick` | `1` | Heartbeat interval in ticks (1 tick = 50 ms). |
+| `transport` | `tcp` | Raft transport: `tcp` or `grpc`. |
+| `admin_tokens` | `{}` | `{token: role}` map; role is `read` or `write`. |
+| `allow_no_auth` | `false` | Dev only — skip auth entirely. Auth **fails closed** by default. |
+| `tls_cert` / `tls_key` / `tls_ca` | `""` | Peer TLS/mTLS cert, key, CA. |
+| `require_tls` | `false` | Fail closed: reject unencrypted peer connections. |
+| `https_cert` / `https_key` | `""` | Enable TLS on the HTTP API (both required together). |
+| `rate_limit_rps` | `500` | Global write requests/sec (token bucket). |
+| `per_ip_rate_limit_rps` | `50` | Per-client-IP write requests/sec. |
+| `max_watch_connections` | `1024` | Global cap on concurrent SSE streams. |
+| `otlp_endpoint` | `""` | OTLP/gRPC endpoint for traces (e.g. `localhost:4317`). |
+| `debug_addr` | `""` | pprof listen address (auth-gated). |
+
+Full reference including internal Raft tunables and all env overrides: [docs/configuration.md](docs/configuration.md).
+
+---
+
+## Kubernetes / Helm
 
 ```bash
 helm install my-raft ./charts/raft \
@@ -120,159 +249,87 @@ helm install my-raft ./charts/raft \
   --set config.adminToken=$(openssl rand -hex 32)
 ```
 
-Default chart ports are `service.raftPort: 8080` and `service.httpPort: 8081`. See [docs/deployment.md](docs/deployment.md) for cert generation, sizing, and upgrades.
+The chart deploys a StatefulSet with a per-pod PVC, ClusterIP + headless Services, and a rendered config ConfigMap. See [docs/deployment.md](docs/deployment.md) for sizing, cert generation, and rolling upgrades.
 
-## Configuration reference
-
-`raftd` is configured entirely via a YAML file passed with `-config` (default `raftd.yaml`). Key options and their code defaults:
-
-| Key | Type | Default | Effect |
-|-----|------|---------|--------|
-| `node_id` | string | *(required)* | Unique ID of this node; must appear in `cluster`. |
-| `listen_addr` | string | `:8080` | Address for inter-node Raft RPCs. |
-| `http_addr` | string | `:8081` | Address for the HTTP API. |
-| `data_dir` | string | `./data` | Base directory; data lives under `data_dir/<node_id>/`. |
-| `cluster` | list | *(required)* | Initial members: `{id, address, http_address}`. |
-| `election_tick` | int | `10` | Election timeout in ticks (must be ≥ 3× `heartbeat_tick`). |
-| `heartbeat_tick` | int | `1` | Heartbeat interval in ticks (1 tick = 50 ms). |
-| `transport` | string | `tcp` | Raft transport: `tcp` or `grpc`. |
-| `admin_token` | string | `""` | Legacy single token; grants the `write` role. |
-| `admin_tokens` | map | `{}` | `token → role` map (`read` or `write`). |
-| `allow_no_auth` | bool | `false` | Explicitly run without auth (dev only); otherwise auth fails closed. |
-| `auto_tls` | bool | `false` | Generates self-signed cert+key in `data_dir` on first startup for automatic encrypted inter-node traffic. |
-| `insecure_transport` | bool | `false` | Suppresses the cleartext warning (dev only); production must use `tls_cert`/`tls_key`/`tls_ca` or `auto_tls`. |
-| `tls_cert` / `tls_key` / `tls_ca` | string | `""` | Peer transport TLS/mTLS cert, key, CA. |
-| `require_tls` | bool | `false` | Fail closed: peers may only be dialed over TLS. |
-| `https_cert` / `https_key` | string | `""` | Enable TLS on the HTTP API (both required together). |
-| `rate_limit_rps` | int | `500` | Global write requests/sec (token bucket). |
-| `per_ip_rate_limit_rps` | int | `50` | Per-client-IP write requests/sec. |
-| `max_request_body_bytes` | int64 | `1048576` (1 MiB) | Max HTTP write body size. |
-| `max_watch_connections` | int | `1024` | Global cap on concurrent `/v1/watch` streams. |
-| `max_watch_connections_per_ip` | int | `32` | Per-IP cap on concurrent watch streams. |
-| `watch_idle_timeout` | duration | `5m` | Idle SSE connection is closed after this. |
-| `cors_origins` | string | `""` (deny) | Comma-separated origin allowlist, or `*`. |
-| `trusted_proxy_cidrs` | list | `[]` | CIDRs whose `X-Forwarded-For`/`X-Real-IP` is trusted. |
-| `otlp_endpoint` | string | `""` | OTLP/gRPC endpoint for traces (e.g. `localhost:4317`). |
-| `debug_addr` | string | `""` | pprof server address (auth-gated; loopback-only when auth is off). |
-
-The full reference — including internal Raft tunables (`snapshot_threshold`, `trailing_logs`, `max_size_per_msg`, etc.) and env — is in [docs/configuration.md](docs/configuration.md).
-
-## Client usage
-
-### kvctl
-
-```bash
-# Global flags: --endpoints (default localhost:8101), --timeout, --stale, --prefix, --revision
-export EP=localhost:8002,localhost:8004,localhost:8006
-
-kvctl --endpoints $EP put user/1 alice          # set a key
-kvctl --endpoints $EP get user/1                 # linearizable read
-kvctl --endpoints $EP get user/1 --stale         # fast local read
-kvctl --endpoints $EP range user/                # list by prefix
-kvctl --endpoints $EP delete user/1              # delete
-kvctl --endpoints $EP status                     # cluster status + revision
-kvctl --endpoints $EP watch user/1               # SSE stream (Ctrl-C to stop)
-kvctl --endpoints $EP watch user/ --prefix       # prefix watch
-kvctl --endpoints $EP txn ./txn.json             # transaction from JSON file or stdin
-```
-
-### HTTP API (curl)
-
-All examples assume a token `$T` (send it as `Authorization: Bearer $T`). Omit the header only when `allow_no_auth: true`.
-
-```bash
-# Put (raw value)
-curl -X PUT localhost:8002/v1/kv/hello -H "Authorization: Bearer $T" -d 'world'
-
-# Put (JSON envelope)
-curl -X PUT localhost:8002/v1/kv/hello -H "Authorization: Bearer $T" \
-     -H 'Content-Type: application/json' -d '{"value":"world"}'
-
-# Get (linearizable) / Get (stale)
-curl localhost:8002/v1/kv/hello -H "Authorization: Bearer $T"
-curl "localhost:8002/v1/kv/hello?consistency=stale" -H "Authorization: Bearer $T"
-
-# Range by prefix
-curl "localhost:8002/v1/kv?prefix=user/" -H "Authorization: Bearer $T"
-
-# Transaction (compare-and-swap)
-curl -X POST localhost:8002/v1/txn -H "Authorization: Bearer $T" -d '{
-  "compare":[{"key":"hello","target":"value","result":"equal","value":"world"}],
-  "success":[{"type":0,"key":"hello","value":"there"}],
-  "failure":[]
-}'
-
-# Watch (SSE)
-curl -N "localhost:8002/v1/watch?key=hello" -H "Authorization: Bearer $T"
-
-# Membership: add a voting member (leader only, write role)
-curl -X POST localhost:8002/admin/members -H "Authorization: Bearer $T" \
-     -d '{"id":"node4","address":"localhost:8007"}'
-```
-
-See [docs/api.md](docs/api.md) for the complete endpoint reference (methods, roles, status codes) and the Go client library.
-
-## Operational notes
-
-- **TLS / mTLS** — Generate dev certs with `scripts/certs/generate.sh` (outputs to `scripts/certs/generated/`). Set `tls_cert`/`tls_key`/`tls_ca` for peer TLS and `require_tls: true` in production; set `https_cert`/`https_key` to serve the HTTP API over TLS. Peer TLS pins TLS 1.3 and enforces client-cert verification (mTLS) when a CA is configured.
-- **Auth tokens** — Configure `admin_tokens` with per-token roles (`read`/`write`). `/command`, `/v1/kv` writes, `/v1/txn`, `/admin/snapshot`, and `/admin/members*` require the `write` role. Health/readiness are always open.
-- **Metrics / observability** — Scrape `/metrics` (Prometheus). Key series: `raft_term`, `raft_commit_index`, `raft_applied_index`, `raft_leader_id`, `raft_elections_total`, `raft_replication_lag`, `raft_fsm_apply_latency_seconds`. See [docs/operations.md](docs/operations.md) for example queries and alerts.
-- **Backups via snapshots** — Trigger a snapshot with `POST /admin/snapshot`; snapshots are written atomically under `data_dir/<node_id>/snapshots/` and can be copied for offline backup. See [docs/operations.md](docs/operations.md#backup--restore).
-- **Graceful shutdown** — On `SIGINT`/`SIGTERM` the leader transfers leadership (via `TimeoutNow`) before stopping, so followers avoid a full election timeout.
+---
 
 ## Benchmarks
 
-Micro-benchmarks live alongside the unit tests. Run them with the standard Go tooling:
+Micro-benchmarks live alongside the unit tests and run in CI on every PR:
 
 ```bash
-# Everything
-go test -bench=. -benchmem ./...
-
-# Raft apply throughput (single-node and 3-node)
-go test -bench='BenchmarkSingleNodeApply|BenchmarkThreeNodeApply' -benchmem ./pkg/raft
-
-# WAL record encode / read
-go test -bench='BenchmarkEncodeRecord|BenchmarkWALGet' -benchmem ./pkg/storage
-
-# FSM apply (put / txn) and get-under-write contention
-go test -bench='BenchmarkFSMApplyPut|BenchmarkFSMApplyTxn|BenchmarkKVGetUnderApply' -benchmem ./pkg/fsm
+go test -bench=. -benchmem -benchtime=50x -count=6 \
+    ./pkg/fsm/ ./pkg/storage/ ./pkg/transport/
 ```
 
-Available benchmarks: `BenchmarkSingleNodeApply`, `BenchmarkThreeNodeApply`, `BenchmarkAppendEntriesHandler`, `BenchmarkSnapshotCreation` (`pkg/raft`); `BenchmarkEncodeRecord`, `BenchmarkWALGet`, `BenchmarkWALGetParallel` (`pkg/storage`); `BenchmarkFSMApplyPut`, `BenchmarkFSMApplyTxn`, `BenchmarkKVGetUnderApply` (`pkg/fsm`). See [docs/tuning.md](docs/tuning.md) for interpreting results and tuning throughput vs. durability.
+Representative numbers on Apple M3 Pro (darwin/arm64):
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| `BenchmarkFSMApplyPut` | 1 071 | 907 | 11 |
+| `BenchmarkFSMApplyTxn` | 3 456 | 1 722 | 29 |
+| `BenchmarkEncodeRecord` | 42 | 64 | 1 |
+| `BenchmarkWALGet` | 4 588 | 144 | 4 |
+| `BenchmarkWALGetParallel` | 8 096 | 384 | 5 |
+
+CI uses `benchstat` to compare PR results against the merge-base on the same linux/amd64 runner and flags regressions. A committed baseline for developer reference lives in [benchmarks/baseline.txt](benchmarks/baseline.txt).
+
+---
 
 ## Security
 
-- Two trust boundaries: **client ↔ node** (token auth + roles, optional HTTPS) and **node ↔ node** (Raft RPCs, optional TLS/mTLS, `require_tls` fail-closed, gRPC per-peer member allowlist).
-- Auth **fails closed**: with no tokens configured and `allow_no_auth` unset, every request is rejected.
-- Defense-in-depth: global + per-IP write rate limiting, request-body size caps, key/value size limits (4 KiB key / 512 KiB value), CORS deny-by-default, watch-connection caps, internal error detail never leaked to clients, and an auth-gated (loopback-only when auth is off) pprof endpoint.
+Two trust boundaries:
+
+- **Client ↔ node** — token auth with `read`/`write` roles; optional HTTPS on the API; per-IP and global rate limiting; 1 MiB request-body cap; CORS deny-by-default.
+- **Node ↔ node** — optional TLS 1.3 / mTLS between peers; `require_tls: true` for fail-closed operation; gRPC per-peer member allowlist.
+
+Auth **fails closed**: no tokens configured + `allow_no_auth` unset = every request rejected.
+
+Generate mTLS dev certs:
+
+```bash
+bash scripts/certs/generate.sh   # outputs to scripts/certs/generated/
+```
 
 Full threat model and hardening checklist: [docs/security.md](docs/security.md).
+
+---
+
+## Testing
+
+```bash
+go test -race ./...                          # all unit tests
+go test -race ./tools/testharness/           # 3-node process-based E2E
+go test -v ./tools/lincheck/                 # porcupine linearizability check
+go test -v ./tools/soaktest/ -soak.duration=60s   # sustained-write soak
+go test -v ./tools/chaos/                    # leader failover / partition
+```
+
+The linearizability checker (`tools/lincheck/`) starts a real 3-node cluster, runs 4 concurrent workers issuing puts and gets for 5 seconds, then verifies the recorded history is linearizable per key using [porcupine](https://github.com/anishathalye/porcupine). All 596 operations in a typical run verify as linearizable.
+
+CI runs all tests with `-race` on Go 1.26.5 and 1.25.x, plus golangci-lint, staticcheck, govulncheck, and a multi-arch Docker smoke test on every push.
+
+---
 
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
-| [docs/architecture.md](docs/architecture.md) | Components, the Raft algorithm as implemented, write/read data flows, on-disk formats. |
-| [docs/deployment.md](docs/deployment.md) | Binary, Docker/Compose, Kubernetes/Helm, sizing, TLS certs, upgrade/rollback. |
-| [docs/configuration.md](docs/configuration.md) | Every config key, flag, and env: type, default, effect. |
-| [docs/api.md](docs/api.md) | Full HTTP API + kvctl command reference. |
-| [docs/operations.md](docs/operations.md) | Runbook: health, metrics, alerts, failure remediation, backup/restore, scaling. |
-| [docs/tuning.md](docs/tuning.md) | Performance tuning and benchmarking. |
-| [docs/security.md](docs/security.md) | Security model, threat model, hardening checklist. |
-| [docs/versioning.md](docs/versioning.md) | Versioning and compatibility policy. |
-| [docs/changelog.md](docs/changelog.md) | Release history and version changelog. |
-| [docs/disaster-recovery.md](docs/disaster-recovery.md) | Disaster recovery procedures and data restoration. |
-| [docs/index.md](docs/index.md) | Documentation index and overview. |
-| [docs/kv-store.md](docs/kv-store.md) | Key/value store semantics, versioning, and lease/TTL design. |
-| [docs/observability.md](docs/observability.md) | Detailed metrics reference, dashboard templates, and alerting rules. |
-| [docs/pki-guide.md](docs/pki-guide.md) | PKI setup guide for mTLS certificate management. |
-| [docs/quickstart.md](docs/quickstart.md) | Expanded quickstart guide with Docker Compose and Kubernetes. |
-| [docs/runbook.md](docs/runbook.md) | Incident response runbook for common failure scenarios. |
-| [docs/testing.md](docs/testing.md) | Test architecture: unit, integration, chaos, and linearizability verification. |
-| [docs/transactions.md](docs/transactions.md) | Transaction protocol: compare-and-swap branches and atomicity guarantees. |
-| [docs/transport.md](docs/transport.md) | Transport layer: TCP binary, gRPC, TLS/mTLS configuration. |
-| [docs/ttl.md](docs/ttl.md) | TTL/lease design: key expiry, tick loop, and sweep semantics. |
-| [docs/watches.md](docs/watches.md) | Watch/SSE streaming: key and prefix watches, revision history, reconnect. |
+| [docs/architecture.md](docs/architecture.md) | Components, Raft algorithm, write/read paths, on-disk formats |
+| [docs/api.md](docs/api.md) | Full HTTP API + kvctl command reference |
+| [docs/configuration.md](docs/configuration.md) | Every config key, flag, and env var |
+| [docs/deployment.md](docs/deployment.md) | Binary, Docker, Kubernetes/Helm, TLS, rolling upgrades |
+| [docs/operations.md](docs/operations.md) | Runbook: health, metrics, alerts, backup/restore, scaling |
+| [docs/security.md](docs/security.md) | Security model, threat model, hardening checklist |
+| [docs/testing.md](docs/testing.md) | Test architecture: unit, integration, chaos, linearizability |
+| [docs/transactions.md](docs/transactions.md) | Transaction protocol and atomicity guarantees |
+| [docs/watches.md](docs/watches.md) | SSE streaming: key/prefix watches, revision history, reconnect |
+| [docs/transport.md](docs/transport.md) | TCP binary, gRPC, TLS/mTLS configuration |
+| [docs/tuning.md](docs/tuning.md) | Throughput vs durability, benchmark interpretation |
+| [docs/observability.md](docs/observability.md) | Metrics reference, Grafana dashboard templates, alerts |
+| [docs/disaster-recovery.md](docs/disaster-recovery.md) | Data restoration and disaster recovery procedures |
+
+---
 
 ## License
 
