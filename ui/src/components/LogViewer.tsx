@@ -164,7 +164,7 @@ export default function LogViewer({ nodeAddrs, token }: Props) {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
         <h2 className="text-xl font-bold text-gray-900 dark:text-gray-100">Cluster Event Log</h2>
         <div className="flex gap-2">
           <button

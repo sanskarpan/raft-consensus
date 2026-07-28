@@ -77,7 +77,7 @@ function HistogramCard({ label, buckets, totalCount }: HistogramCardProps) {
             const barWidth = maxCount > 0 ? (actualCount / maxCount) * 100 : 0
             return (
               <div key={bucket.le} className="flex items-center gap-2 text-xs">
-                <span className="w-16 text-right font-mono text-gray-500 dark:text-gray-400">
+                <span className="w-12 sm:w-16 text-right font-mono text-gray-500 dark:text-gray-400">
                   {parseFloat(bucket.le) < 0.001
                     ? `${(parseFloat(bucket.le) * 1000000).toFixed(0)}µs`
                     : parseFloat(bucket.le) < 1

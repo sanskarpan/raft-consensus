@@ -29,7 +29,12 @@ function loadNodes(): string[] {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('Cluster')
-  const [dark, setDark] = useState(() => localStorage.getItem('raft_dark') === 'true')
+  const [dark, setDark] = useState(() => {
+    const stored = localStorage.getItem('raft-theme')
+    if (stored === 'dark') return true
+    if (stored === 'light') return false
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+  })
   const [nodes, setNodes] = useState<string[]>(loadNodes)
   const [nodeInput, setNodeInput] = useState(() => loadNodes().join('\n'))
   const [selectedMetricsNode, setSelectedMetricsNode] = useState<string>(() => loadNodes()[0] ?? '')
@@ -37,7 +42,7 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
-    localStorage.setItem('raft_dark', String(dark))
+    localStorage.setItem('raft-theme', dark ? 'dark' : 'light')
   }, [dark])
 
   // Derived during render (no setState-in-effect): fall back to the first node
@@ -58,8 +63,8 @@ export default function App() {
       <header className="bg-gray-900 dark:bg-gray-800 text-white shadow-lg">
         <div className="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <span className="text-2xl">⚙️</span>
-            <h1 className="text-xl font-bold tracking-tight">Raft Admin</h1>
+            <span className="text-2xl" aria-hidden="true">⚙️</span>
+            <h1 className="text-xl font-bold tracking-tight hidden sm:block">Raft Admin</h1>
           </div>
           <div className="flex items-center gap-4">
             {token && (
@@ -69,16 +74,27 @@ export default function App() {
             )}
             <button
               onClick={() => setDark(d => !d)}
-              className="text-sm px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 transition-colors"
+              className="p-2 rounded bg-gray-700 hover:bg-gray-600 transition-colors"
+              aria-label="Toggle dark mode"
               title="Toggle dark mode"
             >
-              {dark ? '☀️ Light' : '🌙 Dark'}
+              {dark ? (
+                /* Sun icon — shown in dark mode to switch to light */
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 text-yellow-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 3v2m0 14v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M3 12H1m22 0h-2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />
+                </svg>
+              ) : (
+                /* Moon icon — shown in light mode to switch to dark */
+                <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5 text-gray-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                </svg>
+              )}
             </button>
           </div>
         </div>
 
-        {/* Tab nav */}
-        <nav className="max-w-7xl mx-auto px-4 flex gap-1 pb-0" role="tablist" aria-label="Dashboard sections">
+        {/* Tab nav — horizontally scrollable on mobile */}
+        <nav className="max-w-7xl mx-auto px-4 flex gap-1 overflow-x-auto scrollbar-none pb-px" role="tablist" aria-label="Dashboard sections">
           {TABS.map(t => (
             <button
               key={t}
@@ -87,7 +103,7 @@ export default function App() {
               aria-controls={`panel-${t}`}
               onClick={() => setTab(t)}
               onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); const idx = TABS.indexOf(t); const next = e.key === 'ArrowLeft' ? (idx - 1 + TABS.length) % TABS.length : (idx + 1) % TABS.length; setTab(TABS[next]); } }}
-              className={`px-4 py-2 text-sm font-medium rounded-t transition-colors ${
+              className={`px-4 py-2 text-sm font-medium rounded-t transition-colors whitespace-nowrap shrink-0 ${
                 tab === t
                   ? 'bg-white dark:bg-gray-900 text-gray-900 dark:text-white'
                   : 'text-gray-300 hover:text-white hover:bg-gray-700'
@@ -118,7 +134,7 @@ export default function App() {
         {tab === 'Metrics' && (
           <div className="space-y-4">
             {nodes.length > 1 && (
-              <div className="flex items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
                 <label className="text-sm font-medium text-gray-700 dark:text-gray-300">
                   Node:
                 </label>

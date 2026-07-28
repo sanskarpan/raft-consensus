@@ -46,7 +46,7 @@ function EntryRow({ entry, onDelete }: { entry: KVEntry; onDelete?: (key: string
       </button>
       {expanded && (
         <div className="border-t border-gray-100 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-4 py-3 space-y-2 text-sm">
-          <div className="grid grid-cols-3 gap-4 text-xs text-gray-500 dark:text-gray-400">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 sm:gap-4 text-xs text-gray-500 dark:text-gray-400">
             <div><span className="font-medium">Create Rev:</span> {entry.create_revision}</div>
             <div><span className="font-medium">Mod Rev:</span> {entry.mod_revision}</div>
             <div><span className="font-medium">Version:</span> {entry.version}</div>
@@ -291,7 +291,7 @@ function EditTab({ nodeAddrs, token }: Props) {
       {result && (
         <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
           <p className="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">Result</p>
-          <div className="grid grid-cols-3 gap-4 text-xs text-gray-500 dark:text-gray-400 mb-3">
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 sm:gap-4 text-xs text-gray-500 dark:text-gray-400 mb-3">
             <div><span className="font-medium">Create Rev:</span> {result.create_revision}</div>
             <div><span className="font-medium">Mod Rev:</span> {result.mod_revision}</div>
             <div><span className="font-medium">Version:</span> {result.version}</div>
@@ -369,7 +369,7 @@ function WatchTab({ nodeAddrs }: Props) {
           onChange={(e) => setKeyOrPrefix(e.target.value)}
           placeholder={isPrefix ? 'Prefix (e.g. myapp/)' : 'Exact key (e.g. myapp/config)'}
           disabled={watching}
-          className="flex-1 min-w-48 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+          className="flex-1 min-w-0 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
         />
         <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400 cursor-pointer">
           <input
@@ -787,13 +787,13 @@ export default function KVExplorer({ nodeAddrs, token }: Props) {
         </p>
       ) : (
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow">
-          {/* Inner tab bar */}
-          <div className="flex border-b border-gray-200 dark:border-gray-700">
+          {/* Inner tab bar — horizontally scrollable on mobile */}
+          <div className="flex overflow-x-auto scrollbar-none border-b border-gray-200 dark:border-gray-700">
             {tabs.map((t) => (
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`px-5 py-3 text-sm font-medium transition-colors ${
+                className={`px-5 py-3 text-sm font-medium transition-colors whitespace-nowrap shrink-0 ${
                   tab === t.id
                     ? 'border-b-2 border-blue-600 text-blue-600 dark:text-blue-400 dark:border-blue-400'
                     : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'

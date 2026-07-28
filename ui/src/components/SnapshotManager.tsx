@@ -73,7 +73,7 @@ export default function SnapshotManager({ nodeAddrs, token }: Props) {
         ) : (
           <div className="space-y-3">
             {nodeAddrs.map((addr) => (
-              <div key={addr} className="flex items-center justify-between py-2 border-b border-gray-100 dark:border-gray-700 last:border-0">
+              <div key={addr} className="flex flex-wrap items-center justify-between gap-2 py-2 border-b border-gray-100 dark:border-gray-700 last:border-0">
                 <div>
                   <p className="font-mono text-sm text-gray-900 dark:text-gray-100">{addr}</p>
                 </div>

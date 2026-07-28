@@ -109,10 +109,11 @@ export default function NodeControl({ nodeAddrs, token }: Props) {
           No nodes configured. Add node addresses in Settings.
         </p>
       ) : (
+        <div className="overflow-x-auto -mx-4 sm:mx-0 px-4 sm:px-0">
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
-          <table className="w-full text-sm">
+          <table className="w-full text-sm min-w-[580px]">
             <thead>
-              <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-750">
+              <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700">
                 <th className="text-left px-4 py-3 text-xs uppercase text-gray-500 dark:text-gray-400">
                   Node
                 </th>
@@ -137,7 +138,7 @@ export default function NodeControl({ nodeAddrs, token }: Props) {
                 return (
                   <tr
                     key={addr}
-                    className="border-b border-gray-100 dark:border-gray-700 last:border-0 hover:bg-gray-50 dark:hover:bg-gray-750"
+                    className="border-b border-gray-100 dark:border-gray-700 last:border-0 hover:bg-gray-50 dark:hover:bg-gray-700"
                   >
                     <td className="px-4 py-3">
                       <p className="font-mono font-medium text-gray-900 dark:text-gray-100">
@@ -194,6 +195,7 @@ export default function NodeControl({ nodeAddrs, token }: Props) {
               })}
             </tbody>
           </table>
+        </div>
         </div>
       )}
     </div>
