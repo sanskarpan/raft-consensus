@@ -26,6 +26,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sanskarpan/raft-consensus/pkg/backup"
+	"github.com/sanskarpan/raft-consensus/pkg/etcdcompat"
 	"github.com/sanskarpan/raft-consensus/pkg/fsm"
 	"github.com/sanskarpan/raft-consensus/pkg/metrics"
 	"github.com/sanskarpan/raft-consensus/pkg/raft"
@@ -183,6 +184,13 @@ type Config struct {
 		CredentialsFile string `yaml:"credentials_file"`
 		Compress        bool   `yaml:"compress"`
 	} `yaml:"backup_gcs"`
+
+	// EtcdListenAddr, when non-empty, starts an etcd v3 gRPC compatibility
+	// server on the given address (e.g. ":2379"). Clients that speak the etcd
+	// v3 gRPC protocol can connect here and use KV / Watch RPCs transparently
+	// against the raft-consensus cluster.
+	// Leave empty (the default) to disable the compatibility layer.
+	EtcdListenAddr string `yaml:"etcd_listen_addr"`
 }
 
 type ClusterMember struct {
@@ -406,6 +414,7 @@ type Server struct {
 	watchPerIP      sync.Map                // map[string]*int64 — open watch streams per client IP
 	trustedNets     []*net.IPNet            // parsed from config TrustedProxyCIDRs
 	tracingProvider *tracing.Provider       // shutdown on exit
+	etcdServer      *etcdcompat.EtcdCompatServer // etcd v3 gRPC compat layer (nil when disabled)
 	logger          *zap.Logger
 	http            *http.Server
 	debugServer     *http.Server
@@ -672,6 +681,17 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 
 	if err := s.initRaft(); err != nil {
 		return nil, err
+	}
+
+	// Wire etcd v3 gRPC compatibility layer when etcd_listen_addr is configured.
+	if config.EtcdListenAddr != "" {
+		s.etcdServer = etcdcompat.NewEtcdCompatServer(etcdcompat.EtcdCompatConfig{
+			ListenAddr: config.EtcdListenAddr,
+			Raft:       s.raftNode,
+			KV:         s.kv,
+			WatchMgr:   s.watchMgr,
+			Logger:     logger.Named("etcdcompat"),
+		})
 	}
 
 	s.initHTTP()
@@ -1226,6 +1246,15 @@ func (s *Server) Start() error {
 		}
 	}()
 
+	// Start the etcd v3 gRPC compatibility server if configured.
+	if s.etcdServer != nil {
+		go func() {
+			if err := s.etcdServer.Serve(s.config.EtcdListenAddr); err != nil {
+				s.logger.Error("etcd-compat gRPC server error", zap.Error(err))
+			}
+		}()
+	}
+
 	if s.config.DebugAddr != "" {
 		// H12: pprof exposes heap/goroutine dumps. Require auth for it
 		// unconditionally. When no tokens are configured (i.e. auth is
@@ -1308,6 +1337,11 @@ func (s *Server) Shutdown() {
 		if err := s.debugServer.Shutdown(ctx); err != nil {
 			s.logger.Error("debug server shutdown error", zap.Error(err))
 		}
+	}
+
+	// Gracefully stop the etcd-compat gRPC server (waits for in-flight RPCs).
+	if s.etcdServer != nil {
+		s.etcdServer.Stop()
 	}
 
 	if err := s.raftNode.Shutdown(); err != nil {
