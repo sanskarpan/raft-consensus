@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -685,12 +686,29 @@ func NewServer(config *Config, logger *zap.Logger) (*Server, error) {
 
 	// Wire etcd v3 gRPC compatibility layer when etcd_listen_addr is configured.
 	if config.EtcdListenAddr != "" {
+		// Derive stable ClusterID from a hash of all cluster member IDs (sorted
+		// by position in the config).  Derive MemberID from the local node ID.
+		// Using FNV-1a gives a deterministic uint64 without requiring stable
+		// storage for the IDs; real etcd uses random 64-bit numbers but any
+		// non-zero value that is consistent across restarts satisfies conforming
+		// clients.
+		clusterHash := fnv.New64a()
+		for _, m := range config.Cluster {
+			fmt.Fprint(clusterHash, m.ID)
+		}
+		etcdClusterID := clusterHash.Sum64()
+		memberHash := fnv.New64a()
+		fmt.Fprint(memberHash, config.NodeID)
+		etcdMemberID := memberHash.Sum64()
+
 		s.etcdServer = etcdcompat.NewEtcdCompatServer(etcdcompat.EtcdCompatConfig{
 			ListenAddr: config.EtcdListenAddr,
 			Raft:       s.raftNode,
 			KV:         s.kv,
 			WatchMgr:   s.watchMgr,
 			Logger:     logger.Named("etcdcompat"),
+			ClusterID:  etcdClusterID,
+			MemberID:   etcdMemberID,
 		})
 	}
 

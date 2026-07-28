@@ -156,6 +156,12 @@ type kvCommand struct {
 	// commands — the binary codec appends them only when non-zero.
 	LeaderTimestampMs int64 `json:"leader_timestamp_ms,omitempty"`
 	TTLSeconds        int64 `json:"ttl_seconds,omitempty"`
+
+	// ReturnPrevKV instructs the FSM to include the previous KeyValue in the
+	// KvResult.PrevKV field of the response. This avoids the TOCTOU race that
+	// would otherwise occur when the caller does a stale pre-read before Apply.
+	// Only meaningful for mutating ops (put, delete).
+	ReturnPrevKV bool `json:"return_prev_kv,omitempty"`
 }
 
 // dedupEntry caches the last applied result per client for idempotency.
@@ -169,8 +175,13 @@ type dedupEntry struct {
 
 // KvResult is the response type for legacy and simple v2 operations.
 type KvResult struct {
-	Value string `json:"value"`
-	Error string `json:"error,omitempty"`
+	Value  string    `json:"value"`
+	Error  string    `json:"error,omitempty"`
+	// PrevKV is the value of the key immediately before the mutation was applied.
+	// It is only populated when the kvCommand.ReturnPrevKV flag is set, which
+	// allows callers (e.g. the etcdcompat layer) to obtain the atomically-prior
+	// value without a TOCTOU race.
+	PrevKV *KeyValue `json:"prev_kv,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -255,15 +266,20 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 		} else if k.revisionExhausted() {
 			res, applyErr = json.Marshal(KvResult{Error: errRevisionExhausted})
 		} else {
+			prevClone := kvClone(kv)
 			k.revision++
 			delete(k.data, cmd.Key)
 			k.emitEvents([]Event{{
 				Type:     EventDelete,
 				Key:      cmd.Key,
-				PrevKV:   kvClone(kv),
+				PrevKV:   prevClone,
 				Revision: k.revision,
 			}})
-			res, applyErr = json.Marshal(KvResult{Value: "ok"})
+			delRes := KvResult{Value: "ok"}
+			if cmd.ReturnPrevKV {
+				delRes.PrevKV = prevClone
+			}
+			res, applyErr = json.Marshal(delRes)
 			isMutation = true
 		}
 
@@ -298,19 +314,24 @@ func (k *KVStore) Apply(entry []byte) (result []byte, err error) {
 			expiresAt = k.applyTimeMs + cmd.TTLSeconds*1000
 		}
 		prev := k.data[cmd.Key]
+		prevClone := kvClone(prev) // capture before applyPutLocked mutates
 		kv := k.applyPutLocked(cmd.Key, cmd.Value, prev, expiresAt)
 		k.emitEvents([]Event{{
 			Type:     EventPut,
 			Key:      cmd.Key,
 			KV:       kvClone(kv),
-			PrevKV:   kvClone(prev),
+			PrevKV:   prevClone,
 			Revision: k.revision,
 		}})
 		kvJSON, err := json.Marshal(kv)
 		if err != nil {
 			return nil, err
 		}
-		res, applyErr = json.Marshal(KvResult{Value: string(kvJSON)})
+		putRes := KvResult{Value: string(kvJSON)}
+		if cmd.ReturnPrevKV {
+			putRes.PrevKV = prevClone
+		}
+		res, applyErr = json.Marshal(putRes)
 		isMutation = true
 
 	case "get_v2":
@@ -1147,6 +1168,23 @@ func EncodeCommandWithID(op, key, value, clientID string, seqNum uint64) ([]byte
 		ClientID: clientID,
 		SeqNum:   seqNum,
 	}), nil
+}
+
+// EncodePutWithPrevKV encodes a "put" command that instructs the FSM to
+// include the atomically-prior KeyValue in KvResult.PrevKV.  Use this instead
+// of a stale pre-read followed by Apply to avoid the TOCTOU race for prev_kv.
+func EncodePutWithPrevKV(key, value string) ([]byte, error) {
+	// ReturnPrevKV must travel through the Raft log so all replicas apply the
+	// same command; JSON encoding is used here because the binary codec does not
+	// yet carry ReturnPrevKV (adding it to the binary codec would require a
+	// version bump; JSON encoding is already supported and functionally correct).
+	return json.Marshal(kvCommand{Op: "put", Key: key, Value: value, ReturnPrevKV: true})
+}
+
+// EncodeDeleteWithPrevKV encodes a "delete" command that instructs the FSM to
+// include the atomically-prior KeyValue in KvResult.PrevKV.
+func EncodeDeleteWithPrevKV(key string) ([]byte, error) {
+	return json.Marshal(kvCommand{Op: "delete", Key: key, ReturnPrevKV: true})
 }
 
 // cmdBinaryMagic tags a binary-encoded kvCommand. It is deliberately not '{'

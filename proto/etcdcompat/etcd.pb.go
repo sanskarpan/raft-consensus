@@ -1028,10 +1028,10 @@ type DeleteRangeResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Header *ResponseHeader        `protobuf:"bytes,1,opt,name=header,proto3" json:"header,omitempty"`
 	// deleted is the number of keys deleted by the delete range request.
-	Deleted int64 `protobuf:"varint,1000,opt,name=deleted,proto3" json:"deleted,omitempty"` // use a high field number to avoid clash with header
+	Deleted int64 `protobuf:"varint,2,opt,name=deleted,proto3" json:"deleted,omitempty"`
 	// prev_kvs is a list of all key-value pairs deleted by the request
 	// (only populated when prev_kv is set in the request).
-	PrevKvs       []*KeyValue `protobuf:"bytes,2,rep,name=prev_kvs,json=prevKvs,proto3" json:"prev_kvs,omitempty"`
+	PrevKvs       []*KeyValue `protobuf:"bytes,3,rep,name=prev_kvs,json=prevKvs,proto3" json:"prev_kvs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2108,11 +2108,11 @@ const file_proto_etcdcompat_etcd_proto_rawDesc = "" +
 	"\x12DeleteRangeRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1b\n" +
 	"\trange_end\x18\x02 \x01(\fR\brangeEnd\x12\x17\n" +
-	"\aprev_kv\x18\x03 \x01(\bR\x06prevKv\"\x95\x01\n" +
+	"\aprev_kv\x18\x03 \x01(\bR\x06prevKv\"\x94\x01\n" +
 	"\x13DeleteRangeResponse\x122\n" +
-	"\x06header\x18\x01 \x01(\v2\x1a.etcdcompat.ResponseHeaderR\x06header\x12\x19\n" +
-	"\adeleted\x18\xe8\a \x01(\x03R\adeleted\x12/\n" +
-	"\bprev_kvs\x18\x02 \x03(\v2\x14.etcdcompat.KeyValueR\aprevKvs\"\xc2\x03\n" +
+	"\x06header\x18\x01 \x01(\v2\x1a.etcdcompat.ResponseHeaderR\x06header\x12\x18\n" +
+	"\adeleted\x18\x02 \x01(\x03R\adeleted\x12/\n" +
+	"\bprev_kvs\x18\x03 \x03(\v2\x14.etcdcompat.KeyValueR\aprevKvs\"\xc2\x03\n" +
 	"\aCompare\x129\n" +
 	"\x06result\x18\x01 \x01(\x0e2!.etcdcompat.Compare.CompareResultR\x06result\x129\n" +
 	"\x06target\x18\x02 \x01(\x0e2!.etcdcompat.Compare.CompareTargetR\x06target\x12\x10\n" +

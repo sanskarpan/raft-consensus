@@ -190,10 +190,10 @@ message DeleteRangeRequest {
 message DeleteRangeResponse {
     ResponseHeader header = 1;
     // deleted is the number of keys deleted by the delete range request.
-    int64 deleted = 1000; // use a high field number to avoid clash with header
+    int64 deleted = 2;
     // prev_kvs is a list of all key-value pairs deleted by the request
     // (only populated when prev_kv is set in the request).
-    repeated KeyValue prev_kvs = 2;
+    repeated KeyValue prev_kvs = 3;
 }
 
 // ---------------------------------------------------------------------------

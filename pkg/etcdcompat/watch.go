@@ -46,9 +46,10 @@ func NewWatchServer(watchMgr *fsm.WatchManager, kv *fsm.KVStore, clusterID, memb
 
 // watchSession tracks a single active subscription within one Watch RPC stream.
 type watchSession struct {
-	etcdWatchID int64         // ID echoed to the etcd client
-	fsmWatchID  fsm.WatchID   // internal ID used by WatchManager.Cancel
-	eventCh     <-chan fsm.WatchEvent
+	etcdWatchID  int64              // ID echoed to the etcd client
+	fsmWatchID   fsm.WatchID        // internal ID used by WatchManager.Cancel
+	eventCh      <-chan fsm.WatchEvent
+	cancelEntry  context.CancelFunc // cancels entryCtx; used by handleCancel to stop the forwarder
 }
 
 // Watch implements the Watch.Watch bidirectional streaming RPC.
@@ -67,6 +68,12 @@ func (s *WatchServer) Watch(stream pb.Watch_WatchServer) error {
 	// sendCh serialises WatchResponse writes from multiple forwarding goroutines.
 	sendCh := make(chan *pb.WatchResponse, 256)
 
+	// doneCh is closed when the stream ends to signal forwarder goroutines to
+	// stop.  We deliberately do NOT close sendCh because a forwarder goroutine
+	// that is mid-send would panic on "send on closed channel"; using a separate
+	// done channel avoids that race entirely.
+	doneCh := make(chan struct{})
+
 	// errCh captures the first terminal error from the sender goroutine.
 	errCh := make(chan error, 1)
 
@@ -74,10 +81,7 @@ func (s *WatchServer) Watch(stream pb.Watch_WatchServer) error {
 	go func() {
 		for {
 			select {
-			case msg, ok := <-sendCh:
-				if !ok {
-					return
-				}
+			case msg := <-sendCh:
 				if err := stream.Send(msg); err != nil {
 					select {
 					case errCh <- err:
@@ -87,16 +91,21 @@ func (s *WatchServer) Watch(stream pb.Watch_WatchServer) error {
 				}
 			case <-ctx.Done():
 				return
+			case <-doneCh:
+				return
 			}
 		}
 	}()
 
 	defer func() {
-		// Cancel every active watcher when the stream ends.
+		// Signal forwarder goroutines to stop, then cancel every active watcher.
+		// Close doneCh first so that forwarders exit before we cancel their FSM
+		// subscriptions; this prevents a forwarder from attempting to send on
+		// sendCh after the stream is gone.
+		close(doneCh)
 		for _, sess := range sessions {
 			s.watchMgr.Cancel(sess.fsmWatchID)
 		}
-		close(sendCh)
 	}()
 
 	for {
@@ -119,7 +128,7 @@ func (s *WatchServer) Watch(stream pb.Watch_WatchServer) error {
 
 		switch v := req.RequestUnion.(type) {
 		case *pb.WatchRequest_CreateRequest:
-			s.handleCreate(ctx, v.CreateRequest, sessions, sendCh)
+			s.handleCreate(ctx, v.CreateRequest, sessions, sendCh, doneCh)
 		case *pb.WatchRequest_CancelRequest:
 			s.handleCancel(v.CancelRequest, sessions, sendCh)
 		case *pb.WatchRequest_ProgressRequest:
@@ -140,10 +149,21 @@ func (s *WatchServer) handleCreate(
 	req *pb.WatchCreateRequest,
 	sessions map[int64]*watchSession,
 	sendCh chan<- *pb.WatchResponse,
+	doneCh <-chan struct{},
 ) {
 	key := string(req.Key)
 	rangeEnd := string(req.RangeEnd)
+
+	// Translate StartRevision per the etcd v3 spec:
+	//   StartRevision == 0  (proto3 default / unset) → "watch from now", no history replay.
+	//   StartRevision >  0                           → replay buffered history from that revision.
+	//
+	// The FSM's WatchManager.subscribe uses sinceRevision >= 0 to trigger history
+	// replay, so we pass -1 when StartRevision is 0 to suppress it.
 	sinceRevision := req.StartRevision
+	if sinceRevision == 0 {
+		sinceRevision = -1 // tell FSM: do not replay history
+	}
 
 	// Assign an etcd-facing watch_id.
 	var etcdWatchID int64
@@ -155,21 +175,27 @@ func (s *WatchServer) handleCreate(
 
 	isPrefix := isRangeEndPrefix(key, rangeEnd)
 
+	// Create a per-watcher context derived from the stream context.  Canceling
+	// entryCancel stops the forwarder goroutine for this individual watcher
+	// without tearing down the whole stream (used by handleCancel).
+	entryCtx, entryCancel := context.WithCancel(ctx)
+
 	var (
 		eventCh <-chan fsm.WatchEvent
 		fsmWID  fsm.WatchID
 	)
 	if isPrefix {
 		prefix := rangePrefix(key, rangeEnd)
-		eventCh, fsmWID = s.watchMgr.WatchPrefix(ctx, prefix, sinceRevision)
+		eventCh, fsmWID = s.watchMgr.WatchPrefix(entryCtx, prefix, sinceRevision)
 	} else {
-		eventCh, fsmWID = s.watchMgr.Watch(ctx, key, sinceRevision)
+		eventCh, fsmWID = s.watchMgr.Watch(entryCtx, key, sinceRevision)
 	}
 
 	sess := &watchSession{
 		etcdWatchID: etcdWatchID,
 		fsmWatchID:  fsmWID,
 		eventCh:     eventCh,
+		cancelEntry: entryCancel,
 	}
 	sessions[etcdWatchID] = sess
 
@@ -181,16 +207,20 @@ func (s *WatchServer) handleCreate(
 		Created: true,
 	}:
 	case <-ctx.Done():
+		entryCancel()
 		return
 	}
 
-	// Forward FSM events to the gRPC stream until the watcher is canceled or
-	// the stream context is done.
+	// Forward FSM events to the gRPC stream until this individual watcher is
+	// canceled (entryCtx), the stream ends (ctx / doneCh), or the event channel
+	// is closed by WatchManager.
 	go func() {
+		defer entryCancel() // ensure the entryCtx is released when we exit
 		for {
 			select {
 			case we, ok := <-eventCh:
 				if !ok {
+					// WatchManager closed the channel (e.g. after Cancel).
 					return
 				}
 				pbEvents := make([]*pb.Event, 0, len(we.Events))
@@ -203,10 +233,14 @@ func (s *WatchServer) handleCreate(
 					WatchId: etcdWatchID,
 					Events:  pbEvents,
 				}:
-				case <-ctx.Done():
+				case <-entryCtx.Done():
+					return
+				case <-doneCh:
 					return
 				}
-			case <-ctx.Done():
+			case <-entryCtx.Done():
+				return
+			case <-doneCh:
 				return
 			}
 		}
@@ -223,6 +257,12 @@ func (s *WatchServer) handleCancel(
 	if !ok {
 		return
 	}
+	// Cancel the per-watcher context first so the forwarder goroutine exits
+	// promptly, then cancel the FSM subscription.  Without this ordering the
+	// forwarder goroutine would keep blocking on eventCh (which WatchManager
+	// does not close) until the whole stream context is done, leaking a
+	// goroutine for the lifetime of the connection.
+	sess.cancelEntry()
 	s.watchMgr.Cancel(sess.fsmWatchID)
 	delete(sessions, req.WatchId)
 

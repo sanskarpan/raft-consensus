@@ -134,8 +134,13 @@ func (s *KVServer) linearizableGet(ctx context.Context, key string, req *pb.Rang
 
 // linearizableRange routes a prefix/range read through the Raft log.
 func (s *KVServer) linearizableRange(ctx context.Context, key, rangeEnd string, req *pb.RangeRequest) (*pb.RangeResponse, error) {
-	prefix := rangePrefix(key, rangeEnd)
-	cmd, err := fsm.EncodeCommand("range", prefix, "")
+	// Always send "" as the FSM prefix to fetch all keys; filterAndSortRange
+	// will trim the result to the exact [key, rangeEnd) bounds.  Sending a
+	// narrower prefix here is only correct for the pure prefix-scan case
+	// (rangeEnd == key+"\x00"), but the FSM "range" op uses HasPrefix
+	// internally, so for arbitrary range_end values it would silently drop
+	// keys that do not share key as a prefix.
+	cmd, err := fsm.EncodeCommand("range", "", "")
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode range: %v", err)
 	}
@@ -236,16 +241,18 @@ func (s *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse
 		return nil, status.Error(codes.InvalidArgument, "key must not be empty")
 	}
 
-	// prev_kv: fetch the previous value before the put, stale-read is OK here.
-	var prevKV *pb.KeyValue
+	// Encode the command. When prev_kv is requested we use EncodePutWithPrevKV
+	// so the FSM captures the prior value atomically at apply time, avoiding the
+	// TOCTOU race that would occur if we did a stale pre-read here before Apply.
+	var (
+		cmd []byte
+		err error
+	)
 	if req.PrevKv {
-		prev, err := s.kv.Get(key)
-		if err == nil && prev != nil {
-			prevKV = fsmKVToPb(prev)
-		}
+		cmd, err = fsm.EncodePutWithPrevKV(key, value)
+	} else {
+		cmd, err = fsm.EncodeCommand("put", key, value)
 	}
-
-	cmd, err := fsm.EncodeCommand("put", key, value)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode put: %v", err)
 	}
@@ -260,6 +267,11 @@ func (s *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse
 	}
 	if res.Error != "" {
 		return nil, status.Errorf(codes.Internal, "put failed: %s", res.Error)
+	}
+
+	var prevKV *pb.KeyValue
+	if req.PrevKv && res.PrevKV != nil {
+		prevKV = fsmKVToPb(res.PrevKV)
 	}
 
 	return &pb.PutResponse{
@@ -292,15 +304,17 @@ func (s *KVServer) DeleteRange(ctx context.Context, req *pb.DeleteRangeRequest) 
 
 // deleteSingleKey deletes exactly one key.
 func (s *KVServer) deleteSingleKey(ctx context.Context, key string, req *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
-	var prevKV *pb.KeyValue
+	// When prev_kv is requested use EncodeDeleteWithPrevKV so the FSM captures
+	// the prior value atomically, avoiding a TOCTOU race with a stale pre-read.
+	var (
+		cmd []byte
+		err error
+	)
 	if req.PrevKv {
-		prev, err := s.kv.Get(key)
-		if err == nil && prev != nil {
-			prevKV = fsmKVToPb(prev)
-		}
+		cmd, err = fsm.EncodeDeleteWithPrevKV(key)
+	} else {
+		cmd, err = fsm.EncodeCommand("delete", key, "")
 	}
-
-	cmd, err := fsm.EncodeCommand("delete", key, "")
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode delete: %v", err)
 	}
@@ -322,8 +336,8 @@ func (s *KVServer) deleteSingleKey(ctx context.Context, key string, req *pb.Dele
 		Header:  s.header(),
 		Deleted: deleted,
 	}
-	if req.PrevKv && prevKV != nil {
-		resp.PrevKvs = []*pb.KeyValue{prevKV}
+	if req.PrevKv && res.PrevKV != nil {
+		resp.PrevKvs = []*pb.KeyValue{fsmKVToPb(res.PrevKV)}
 	}
 	return resp, nil
 }
@@ -331,32 +345,45 @@ func (s *KVServer) deleteSingleKey(ctx context.Context, key string, req *pb.Dele
 // deletePrefixRange deletes all keys in the given range by issuing individual
 // deletes through Raft for each matching key. A future optimization would add
 // a native "delete_range" op to the FSM; for now the implementation is
-// correct and atomic at the Raft-log level per key.
+// correct at the Raft-log level per key.
+//
+// Note: prev_kv is captured atomically by EncodeDeleteWithPrevKV so there is
+// no TOCTOU race between the stale range scan and the individual deletes.
+// The range scan below is only used to discover which keys to delete; the
+// actual prev_kv values are taken from the FSM response of each delete.
 func (s *KVServer) deletePrefixRange(ctx context.Context, key, rangeEnd string, req *pb.DeleteRangeRequest) (*pb.DeleteRangeResponse, error) {
 	prefix := rangePrefix(key, rangeEnd)
+
+	// Stale scan to discover which keys fall in [key, rangeEnd).  Keys that are
+	// concurrently deleted between this scan and the individual Apply calls will
+	// simply return "key not found" from the FSM and not increment deleted.
 	existing, err := s.kv.Range(prefix)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "range before delete: %v", err)
 	}
 
 	// Filter to exact range bounds.
-	var toDelete []*fsm.KeyValue
+	var toDelete []string
 	for _, kv := range existing {
 		if inRange(kv.Key, key, rangeEnd) {
-			toDelete = append(toDelete, kv)
+			toDelete = append(toDelete, kv.Key)
 		}
 	}
 
-	var prevKVs []*pb.KeyValue
-	if req.PrevKv {
-		for _, kv := range toDelete {
-			prevKVs = append(prevKVs, fsmKVToPb(kv))
+	var (
+		deleted int64
+		prevKVs []*pb.KeyValue
+	)
+	for _, k := range toDelete {
+		var (
+			cmd    []byte
+			encErr error
+		)
+		if req.PrevKv {
+			cmd, encErr = fsm.EncodeDeleteWithPrevKV(k)
+		} else {
+			cmd, encErr = fsm.EncodeCommand("delete", k, "")
 		}
-	}
-
-	var deleted int64
-	for _, kv := range toDelete {
-		cmd, encErr := fsm.EncodeCommand("delete", kv.Key, "")
 		if encErr != nil {
 			return nil, status.Errorf(codes.Internal, "encode delete: %v", encErr)
 		}
@@ -370,6 +397,9 @@ func (s *KVServer) deletePrefixRange(ctx context.Context, key, rangeEnd string, 
 		}
 		if res.Error == "" {
 			deleted++
+			if req.PrevKv && res.PrevKV != nil {
+				prevKVs = append(prevKVs, fsmKVToPb(res.PrevKV))
+			}
 		}
 	}
 
@@ -602,16 +632,29 @@ func isRangeEndPrefix(key, rangeEnd string) bool {
 }
 
 // rangePrefix returns the FSM-level prefix to pass to kv.Range() based on the
-// etcd range semantics. Returns "" to mean "all keys".
+// etcd range semantics. Returns "" to mean "fetch all keys", which is always
+// safe because filterAndSortRange / inRange will trim the result to [key, rangeEnd).
+//
+// The only case where we can use a tighter prefix is the pure prefix-scan
+// convention (rangeEnd == key+"\x00"), where every matching key shares the
+// prefix key.  For all-keys (key=="" && rangeEnd=="\x00"), the prefix is also
+// "".  For any other rangeEnd we must fetch everything so that inRange can
+// correctly filter to [key, rangeEnd) without missing keys that do not share
+// key as a prefix.
 func rangePrefix(key, rangeEnd string) string {
+	// All-keys: both sentinels or key=="" with rangeEnd=="\x00".
 	if rangeEnd == "\x00" && key == "" {
 		return "" // all keys
 	}
-	if rangeEnd == "\x00" {
-		return key // all keys >= key — use key as prefix
+	// Pure prefix scan: rangeEnd == key + "\x00".
+	if len(rangeEnd) == len(key)+1 &&
+		strings.HasPrefix(rangeEnd, key) &&
+		rangeEnd[len(rangeEnd)-1] == 0 {
+		return key
 	}
-	// rangeEnd == key+"\x00" → prefix scan with key as prefix
-	return key
+	// For all-keys-gte (rangeEnd=="\x00" with non-empty key) and arbitrary
+	// [key, rangeEnd) ranges, fetch everything and let filterAndSortRange trim.
+	return ""
 }
 
 // inRange reports whether a key falls within [start, end) using etcd's range
