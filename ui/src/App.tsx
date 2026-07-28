@@ -174,12 +174,12 @@ export default function App() {
           <div className="space-y-6">
             <AuthLogin />
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-6">
-              <h2 className="text-lg font-semibold mb-4">Node Addresses</h2>
+              <h2 className="text-lg font-semibold mb-4 text-gray-900 dark:text-gray-100">Node Addresses</h2>
               <p className="text-sm text-gray-500 dark:text-gray-400 mb-3">
                 One HTTP address per line (e.g. <code>localhost:8081</code>)
               </p>
               <textarea
-                className="w-full h-32 text-sm font-mono border rounded p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+                className="w-full h-32 text-sm font-mono border rounded p-2 bg-gray-50 dark:bg-gray-700 dark:border-gray-600 text-gray-900 dark:text-gray-100 resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
                 value={nodeInput}
                 onChange={e => setNodeInput(e.target.value)}
               />

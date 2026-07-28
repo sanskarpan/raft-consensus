@@ -420,12 +420,13 @@ function WatchTab({ nodeAddrs }: Props) {
         </div>
       )}
 
+      {/* Intentionally always-dark terminal — ring provides visible boundary in light mode */}
       <div
         ref={listRef}
-        className="h-80 overflow-y-auto bg-gray-900 rounded-lg p-3 space-y-2 font-mono text-xs"
+        className="h-80 overflow-y-auto bg-gray-900 rounded-lg p-3 space-y-2 font-mono text-xs ring-1 ring-gray-300 dark:ring-transparent"
       >
         {events.length === 0 ? (
-          <p className="text-gray-500">
+          <p className="text-gray-400">
             {watching ? 'Waiting for events…' : 'Start a watch to see live events.'}
           </p>
         ) : (

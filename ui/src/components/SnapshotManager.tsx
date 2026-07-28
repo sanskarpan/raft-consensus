@@ -111,14 +111,14 @@ export default function SnapshotManager({ nodeAddrs, token }: Props) {
                   >
                     {record.success ? 'Success' : 'Failed'}
                   </span>
-                  <span className="ml-2 font-mono text-gray-600 dark:text-gray-400">
+                  <span className="ml-2 font-mono text-gray-600 dark:text-gray-400 truncate">
                     {record.nodeAddr}
                   </span>
                   {!record.success && (
                     <p className="mt-1 text-xs text-red-600 dark:text-red-400">{record.message}</p>
                   )}
                 </div>
-                <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap ml-4">
+                <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap ml-4 shrink-0">
                   {record.timestamp.toLocaleTimeString()}
                 </span>
               </div>

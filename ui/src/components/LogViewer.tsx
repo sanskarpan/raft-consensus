@@ -191,7 +191,8 @@ export default function LogViewer({ nodeAddrs, token }: Props) {
           No nodes configured. Add node addresses in Settings.
         </p>
       ) : (
-        <div className="bg-gray-900 rounded-lg shadow overflow-hidden">
+        /* Intentionally always-dark terminal — ring provides visible boundary in light mode */
+        <div className="bg-gray-900 rounded-lg shadow overflow-hidden ring-1 ring-gray-300 dark:ring-0">
           <div className="flex items-center justify-between px-3 py-2 bg-gray-800 border-b border-gray-700">
             <span className="text-xs font-mono text-gray-400">
               {entries.length} events (last {MAX_EVENTS} kept)
@@ -206,7 +207,6 @@ export default function LogViewer({ nodeAddrs, token }: Props) {
             value={logText}
             placeholder="Waiting for cluster events..."
             className="w-full h-96 bg-gray-900 text-green-400 font-mono text-xs p-3 resize-none focus:outline-none"
-            style={{ fontFamily: "'Courier New', Courier, monospace" }}
           />
         </div>
       )}
