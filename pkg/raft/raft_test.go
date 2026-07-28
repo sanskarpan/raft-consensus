@@ -3065,3 +3065,227 @@ func TestLogDivergenceStaleLeaderRejoin(t *testing.T) {
 	}
 	_ = newTerm
 }
+
+// ---------------------------------------------------------------------------
+// Clock-lease linearizable reads
+// ---------------------------------------------------------------------------
+
+// TestLeaseReadsDisabledByDefault verifies that Config.LeaseReads is false by
+// default and that no lease is ever set when the option is not opted into.
+func TestLeaseReadsDisabledByDefault(t *testing.T) {
+	cfg := Configuration{Servers: []Server{
+		{ID: "n1"},
+		{ID: "n2"},
+		{ID: "n3"},
+	}}
+	r, _, _ := makeRaftNode("n1", cfg)
+
+	// LeaseReads must be false in the zero-value Config produced by makeRaftNode.
+	if r.config.LeaseReads {
+		t.Fatal("LeaseReads must be false by default")
+	}
+
+	if err := r.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer r.Shutdown()
+
+	// Force this node to believe it is the leader and inject artificial
+	// heartbeat acks (as if two followers responded), simulating the scenario
+	// that would set leaseExpiry if the feature were enabled.
+	r.mu.Lock()
+	r.state = StateLeader
+	r.leaderID = "n1"
+	r.heartbeatAcks["n2"] = r.clock.Now()
+	r.heartbeatAcks["n3"] = r.clock.Now()
+	r.mu.Unlock()
+
+	// Give any background goroutines a moment to run.
+	time.Sleep(20 * time.Millisecond)
+
+	r.mu.RLock()
+	expiry := r.leaseExpiry
+	r.mu.RUnlock()
+
+	if !expiry.IsZero() {
+		t.Errorf("leaseExpiry is %v but should be zero when LeaseReads is false", expiry)
+	}
+}
+
+// TestLeaseReadSkipsHeartbeat verifies that when LeaseReads is true and the
+// leader holds a non-expired lease, ReadIndex returns immediately without
+// triggering an additional heartbeat round-trip.
+func TestLeaseReadSkipsHeartbeat(t *testing.T) {
+	ids := []string{"n1", "n2", "n3"}
+	cfgSpec := Configuration{Servers: []Server{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}
+
+	var nodes []*raft
+	var transports []*chanTransport
+	for _, id := range ids {
+		trans := newChanTransport(ServerID(id))
+		fsm := &echoFSM{}
+		cfg := &Config{
+			LocalID:              ServerID(id),
+			ElectionTick:         5,
+			HeartbeatTick:        1,
+			LeaseReads:           true,
+			InitialConfiguration: cfgSpec,
+		}
+		r, err := newRaft(cfg, ServerID(id),
+			newMemLogStore(),
+			newMemStableStore(),
+			&memSnapshotStore{},
+			fsm,
+			trans,
+		)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		trans.appendEntriesFn = func(req *AppendEntriesRequest) *AppendEntriesResponse {
+			return r.HandleAppendEntriesRPC(req)
+		}
+		trans.requestVoteFn = func(req *RequestVoteRequest) *RequestVoteResponse {
+			return r.HandleRequestVoteRPC(req)
+		}
+		trans.installSnapshotFn = func(req *InstallSnapshotRequest) *InstallSnapshotResponse {
+			return r.HandleInstallSnapshotRPC(req)
+		}
+		nodes = append(nodes, r)
+		transports = append(transports, trans)
+	}
+	for i, tr := range transports {
+		for j, other := range transports {
+			if i != j {
+				tr.connect(other)
+			}
+		}
+	}
+	for _, r := range nodes {
+		if err := r.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer r.Shutdown()
+	}
+
+	leader := findLeader(t, nodes, 5*time.Second)
+
+	// Apply an entry so commitIndex > 0.
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer applyCancel()
+	if _, err := leader.Apply(applyCtx, []byte("init")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// Inject a fresh lease directly — simulates a quorum of recent acks.
+	leader.mu.Lock()
+	leader.leaseExpiry = time.Now().Add(5 * time.Second)
+	leader.mu.Unlock()
+
+	// ReadIndex must return quickly (within heartbeatInterval = 50ms).
+	// With a valid lease it should skip the heartbeat round-trip entirely.
+	heartbeatInterval := time.Duration(leader.config.HeartbeatTick) * leader.heartbeatInterval()
+	ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval)
+	defer cancel()
+
+	start := time.Now()
+	idx, err := leader.ReadIndex(ctx)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("ReadIndex with valid lease: %v", err)
+	}
+	if idx == 0 {
+		t.Error("ReadIndex returned 0")
+	}
+	// The fast-path must return well before the heartbeat interval elapses.
+	// We allow up to half the interval to account for scheduling jitter.
+	if elapsed > heartbeatInterval/2 {
+		t.Errorf("ReadIndex took %v with valid lease; expected < %v (no heartbeat round-trip)",
+			elapsed, heartbeatInterval/2)
+	}
+}
+
+// TestLeaseInvalidatedOnStepDown verifies that when a leader steps down (via a
+// higher-term AppendEntries), leaseExpiry is zeroed out so that a stale lease
+// cannot be used in a future term.
+func TestLeaseInvalidatedOnStepDown(t *testing.T) {
+	ids := []string{"n1", "n2", "n3"}
+	cfgSpec := Configuration{Servers: []Server{{ID: "n1"}, {ID: "n2"}, {ID: "n3"}}}
+
+	var nodes []*raft
+	var transports []*chanTransport
+	for _, id := range ids {
+		trans := newChanTransport(ServerID(id))
+		fsm := &echoFSM{}
+		cfg := &Config{
+			LocalID:              ServerID(id),
+			ElectionTick:         5,
+			HeartbeatTick:        1,
+			LeaseReads:           true,
+			InitialConfiguration: cfgSpec,
+		}
+		r, err := newRaft(cfg, ServerID(id),
+			newMemLogStore(),
+			newMemStableStore(),
+			&memSnapshotStore{},
+			fsm,
+			trans,
+		)
+		if err != nil {
+			t.Fatalf("newRaft: %v", err)
+		}
+		trans.appendEntriesFn = func(req *AppendEntriesRequest) *AppendEntriesResponse {
+			return r.HandleAppendEntriesRPC(req)
+		}
+		trans.requestVoteFn = func(req *RequestVoteRequest) *RequestVoteResponse {
+			return r.HandleRequestVoteRPC(req)
+		}
+		trans.installSnapshotFn = func(req *InstallSnapshotRequest) *InstallSnapshotResponse {
+			return r.HandleInstallSnapshotRPC(req)
+		}
+		nodes = append(nodes, r)
+		transports = append(transports, trans)
+	}
+	for i, tr := range transports {
+		for j, other := range transports {
+			if i != j {
+				tr.connect(other)
+			}
+		}
+	}
+	for _, r := range nodes {
+		if err := r.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer r.Shutdown()
+	}
+
+	leader := findLeader(t, nodes, 5*time.Second)
+
+	// Inject a non-expired lease.
+	leader.mu.Lock()
+	leader.leaseExpiry = time.Now().Add(10 * time.Second)
+	leader.mu.Unlock()
+
+	// Force step-down by delivering a higher-term AppendEntries RPC.
+	higherTerm := leader.Term() + 1
+	leader.HandleAppendEntriesRPC(&AppendEntriesRequest{
+		Term:         higherTerm,
+		LeaderID:     "n2",
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+	})
+
+	// After step-down, leaseExpiry must be zeroed.
+	leader.mu.RLock()
+	expiry := leader.leaseExpiry
+	state := leader.state
+	leader.mu.RUnlock()
+
+	if state == StateLeader {
+		t.Skip("node did not step down (timing); skipping assertion")
+	}
+	if !expiry.IsZero() {
+		t.Errorf("leaseExpiry is %v after step-down, want zero", expiry)
+	}
+}

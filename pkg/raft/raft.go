@@ -110,6 +110,15 @@ type raft struct {
 	// validity for ReadIndex.
 	heartbeatAcks map[ServerID]time.Time
 
+	// leaseExpiry is the wall-clock deadline through which clock-lease
+	// linearizable reads may skip the heartbeat round-trip. Zero means no
+	// valid lease. Only accessed from the run() goroutine (via the replicateOnce
+	// ack path) and from ReadIndex (under r.mu.RLock), so no additional locking
+	// is needed beyond the r.mu that already protects heartbeatAcks.
+	// Cleared on every step-down to prevent a stale lease from surviving across
+	// terms. Only meaningful when config.LeaseReads is true.
+	leaseExpiry time.Time
+
 	// pendingFutures maps log index -> ApplyFuture waiting for commit+apply.
 	pendingFutures map[uint64]*ApplyFuture
 
@@ -614,6 +623,7 @@ func (r *raft) checkQuorum() {
 	r.leaderID = ""
 	r.electionTicks = r.randomElectionTickCount()
 	r.heartbeatAcks = make(map[ServerID]time.Time)
+	r.leaseExpiry = time.Time{} // invalidate lease; cannot hold reads without quorum contact
 	metrics.RecordLeaderID(false)
 	r.failPendingFutures()
 	if r.leadershipTransfer != nil {
@@ -962,6 +972,7 @@ func (r *raft) becomeLeader() {
 	// A freshly elected leader must re-confirm quorum before serving
 	// linearizable reads.  Clear stale acks from the previous term.
 	r.heartbeatAcks = make(map[ServerID]time.Time)
+	r.leaseExpiry = time.Time{} // invalidate any stale lease from the previous term
 
 	metrics.RecordLeaderID(true)
 
@@ -1236,6 +1247,7 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 		r.votedFor = ""
 		r.leaderID = ""
 		r.heartbeatAcks = make(map[ServerID]time.Time) // stale acks from old term
+		r.leaseExpiry = time.Time{}                     // stale lease; new term, new leader
 		metrics.RecordLeaderID(false)
 		r.persistTermAndVotedForLogged()
 		return false
@@ -1257,6 +1269,28 @@ func (r *raft) replicateOnce(serverID ServerID) bool {
 	if resp.Success {
 		// Record the ack time for leader-lease / ReadIndex.
 		r.heartbeatAcks[serverID] = r.clock.Now()
+
+		// Clock-lease: after recording this ack, check whether a quorum of
+		// voters has acked within the election-timeout window. If so, extend
+		// the leader lease by (electionTimeout/2 - maxClockDrift). This is the
+		// same accounting used by checkQuorum and ReadIndex, re-used here so
+		// the lease is refreshed on every successful ack without a separate scan.
+		if r.config.LeaseReads {
+			now := r.clock.Now()
+			cutoff := now.Add(-r.electionTimeout())
+			leaseCount := 1 // self
+			for id, ackTime := range r.heartbeatAcks {
+				if ackTime.After(cutoff) && r.configuration.IsVoter(id) {
+					leaseCount++
+				}
+			}
+			if leaseCount >= r.configuration.QuorumSize() {
+				leaseDur := r.electionTimeout()/2 - r.config.MaxClockDrift
+				if leaseDur > 0 {
+					r.leaseExpiry = now.Add(leaseDur)
+				}
+			}
+		}
 
 		if len(entries) > 0 {
 			if lastSentIdx > r.matchIndex[serverID] {
@@ -1429,6 +1463,7 @@ func (r *raft) sendSnapshotTo(serverID ServerID) {
 			r.votedFor = ""
 			r.leaderID = ""
 			r.heartbeatAcks = make(map[ServerID]time.Time)
+			r.leaseExpiry = time.Time{} // stale lease; new term, new leader
 			metrics.RecordLeaderID(false)
 			r.persistTermAndVotedForLogged()
 			r.mu.Unlock()
@@ -1984,6 +2019,7 @@ func (r *raft) stepDownIfNotVoter() {
 	r.leaderID = ""
 	r.votedFor = ""
 	r.heartbeatAcks = make(map[ServerID]time.Time)
+	r.leaseExpiry = time.Time{} // lease is meaningless once no longer a voter
 	r.electionTicks = r.randomElectionTickCount()
 	metrics.RecordLeaderID(false)
 }
@@ -2063,6 +2099,21 @@ func (r *raft) ReadIndex(ctx context.Context) (uint64, error) {
 	// Single-node cluster: we are always the quorum — return immediately.
 	if quorum == 1 {
 		return readIndex, nil
+	}
+
+	// Clock-lease fast-path: if the leader holds a valid lease (a quorum of
+	// voters acked a heartbeat within the lease window), the local commitIndex
+	// is already linearizable without another heartbeat round. readIndex was
+	// captured under r.mu above; leaseExpiry is read here under a fresh RLock
+	// to avoid a TOCTOU race where a concurrent step-down could zero it between
+	// the initial state/commitIndex capture and this check.
+	if r.config.LeaseReads {
+		r.mu.RLock()
+		expiry := r.leaseExpiry
+		r.mu.RUnlock()
+		if !expiry.IsZero() && r.clock.Now().Before(expiry) {
+			return readIndex, nil
+		}
 	}
 
 	// Reference instant on the leader's monotonic clock; only acks recorded
@@ -3053,6 +3104,7 @@ func (r *raft) handleAppendEntries(req *AppendEntriesRequest) *AppendEntriesResp
 		r.votedFor = ""
 		// Clear stale acks: a re-elected leader must re-confirm quorum.
 		r.heartbeatAcks = make(map[ServerID]time.Time)
+		r.leaseExpiry = time.Time{} // new term: any old lease is invalid
 		metrics.RecordTerm(r.term)
 		r.persistTermAndVotedForLogged()
 	}
@@ -3300,6 +3352,7 @@ func (r *raft) handleInstallSnapshot(req *InstallSnapshotRequest) *InstallSnapsh
 		// Clear heartbeat acks so that if this node re-becomes leader it
 		// must re-confirm quorum rather than using stale acks from the old term.
 		r.heartbeatAcks = make(map[ServerID]time.Time)
+		r.leaseExpiry = time.Time{} // new term: any old lease is invalid
 		metrics.RecordTerm(r.term)
 		r.persistTermAndVotedForLogged()
 	}

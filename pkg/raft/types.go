@@ -296,6 +296,19 @@ type Config struct {
 	// before a new leader on the majority side can take over.
 	CheckQuorum bool
 
+	// LeaseReads enables clock-lease linearizable reads. When true, the leader
+	// skips the heartbeat round-trip for ReadIndex if a quorum of voters acked
+	// within the current lease window. Requires monotonic clocks (Go guarantees
+	// this on all platforms). CAUTION: unsafe if MaxClockDrift is set too low
+	// for the actual clock skew between nodes. Default: false (opt-in).
+	LeaseReads bool
+
+	// MaxClockDrift is the maximum assumed clock skew between nodes. The leader
+	// subtracts this from its lease duration to ensure the lease expires on
+	// followers before a new election can be won. Default: 150ms. Only used
+	// when LeaseReads is true.
+	MaxClockDrift time.Duration
+
 	InitialConfiguration Configuration
 
 	// StartAsLearner causes the node to start in StateLearner mode instead of
@@ -380,6 +393,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxInflight <= 0 {
 		c.MaxInflight = defaultConfigMaxInflight
+	}
+	if c.MaxClockDrift == 0 {
+		c.MaxClockDrift = 150 * time.Millisecond
 	}
 	return nil
 }
