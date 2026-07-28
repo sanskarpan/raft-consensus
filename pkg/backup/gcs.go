@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -126,7 +127,10 @@ func NewGCSUploader(ctx context.Context, cfg GCSConfig, logger *zap.Logger) (*GC
 		return nil, fmt.Errorf("GCSConfig.Bucket is required")
 	}
 
-	opts := buildClientOptions(cfg)
+	opts, err := buildClientOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
 	client, err := storage.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("storage.NewClient: %w", err)
@@ -157,7 +161,7 @@ func NewGCSUploader(ctx context.Context, cfg GCSConfig, logger *zap.Logger) (*GC
 }
 
 // buildClientOptions returns the GCS client options for the given config.
-func buildClientOptions(cfg GCSConfig) []option.ClientOption {
+func buildClientOptions(cfg GCSConfig) ([]option.ClientOption, error) {
 	var opts []option.ClientOption
 	if cfg.TestEndpoint != "" {
 		// Integration test mode: use the fake-gcs-server with no auth.
@@ -166,14 +170,19 @@ func buildClientOptions(cfg GCSConfig) []option.ClientOption {
 			option.WithoutAuthentication(),
 			option.WithHTTPClient(&http.Client{}),
 		)
-		return opts
+		return opts, nil
 	}
 	if cfg.CredentialsFile != "" {
-		opts = append(opts, option.WithCredentialsFile(cfg.CredentialsFile))
+		// Read and pass JSON directly; option.WithCredentialsFile is deprecated.
+		data, err := os.ReadFile(cfg.CredentialsFile)
+		if err != nil {
+			return nil, fmt.Errorf("reading credentials file %q: %w", cfg.CredentialsFile, err)
+		}
+		opts = append(opts, option.WithCredentialsJSON(data))
 	}
 	// No options = ADC (Application Default Credentials). This is the
 	// recommended path for GKE Workload Identity and Cloud Run.
-	return opts
+	return opts, nil
 }
 
 // isNotFound reports whether the GCS error indicates a 404 / object-not-found.
