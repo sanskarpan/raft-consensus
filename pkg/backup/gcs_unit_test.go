@@ -285,25 +285,32 @@ func TestIsNotFoundStorageSentinels(t *testing.T) {
 // TestBuildClientOptionsTestEndpoint exercises the TestEndpoint branch of buildClientOptions.
 func TestBuildClientOptionsTestEndpoint(t *testing.T) {
 	cfg := GCSConfig{TestEndpoint: "http://localhost:4443/storage/v1/"}
-	opts := buildClientOptions(cfg)
+	opts, err := buildClientOptions(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(opts) == 0 {
 		t.Error("expected non-empty options for TestEndpoint config")
 	}
 }
 
 // TestBuildClientOptionsCredentialsFile exercises the CredentialsFile branch.
+// The file does not exist, so buildClientOptions must return an error.
 func TestBuildClientOptionsCredentialsFile(t *testing.T) {
 	cfg := GCSConfig{CredentialsFile: "/nonexistent/creds.json"}
-	opts := buildClientOptions(cfg)
-	if len(opts) == 0 {
-		t.Error("expected non-empty options for CredentialsFile config")
+	_, err := buildClientOptions(cfg)
+	if err == nil {
+		t.Error("expected error for non-existent credentials file")
 	}
 }
 
 // TestBuildClientOptionsDefault exercises the ADC (no-option) path.
 func TestBuildClientOptionsDefault(t *testing.T) {
 	cfg := GCSConfig{}
-	opts := buildClientOptions(cfg)
+	opts, err := buildClientOptions(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(opts) != 0 {
 		t.Errorf("expected empty options for default config, got %d", len(opts))
 	}
