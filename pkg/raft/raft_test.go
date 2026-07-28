@@ -3181,10 +3181,14 @@ func TestLeaseReadSkipsHeartbeat(t *testing.T) {
 	leader.leaseExpiry = time.Now().Add(5 * time.Second)
 	leader.mu.Unlock()
 
-	// ReadIndex must return quickly (within heartbeatInterval = 50ms).
-	// With a valid lease it should skip the heartbeat round-trip entirely.
-	heartbeatInterval := time.Duration(leader.config.HeartbeatTick) * leader.heartbeatInterval()
-	ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval)
+	// ReadIndex must return quickly — with a valid lease it should skip the
+	// heartbeat round-trip entirely. heartbeatInterval() already incorporates
+	// HeartbeatTick, so do not multiply again.
+	heartbeatInterval := leader.heartbeatInterval()
+	// Use 2x the interval as a generous context deadline so that scheduling
+	// jitter cannot cause a spurious timeout while still distinguishing the
+	// fast lease path from a real heartbeat round-trip.
+	ctx, cancel := context.WithTimeout(context.Background(), heartbeatInterval*2)
 	defer cancel()
 
 	start := time.Now()
@@ -3197,11 +3201,11 @@ func TestLeaseReadSkipsHeartbeat(t *testing.T) {
 	if idx == 0 {
 		t.Error("ReadIndex returned 0")
 	}
-	// The fast-path must return well before the heartbeat interval elapses.
-	// We allow up to half the interval to account for scheduling jitter.
-	if elapsed > heartbeatInterval/2 {
+	// The fast-path must complete before a full heartbeat interval elapses,
+	// distinguishing it from a real heartbeat round-trip.
+	if elapsed > heartbeatInterval {
 		t.Errorf("ReadIndex took %v with valid lease; expected < %v (no heartbeat round-trip)",
-			elapsed, heartbeatInterval/2)
+			elapsed, heartbeatInterval)
 	}
 }
 

@@ -112,9 +112,10 @@ type raft struct {
 
 	// leaseExpiry is the wall-clock deadline through which clock-lease
 	// linearizable reads may skip the heartbeat round-trip. Zero means no
-	// valid lease. Only accessed from the run() goroutine (via the replicateOnce
-	// ack path) and from ReadIndex (under r.mu.RLock), so no additional locking
-	// is needed beyond the r.mu that already protects heartbeatAcks.
+	// valid lease. Written from replication goroutines (under r.mu write lock,
+	// in replicateOnce) and from step-down paths (under r.mu write lock); read
+	// from ReadIndex and other paths (under r.mu read lock). All accesses must
+	// hold r.mu in the appropriate mode.
 	// Cleared on every step-down to prevent a stale lease from surviving across
 	// terms. Only meaningful when config.LeaseReads is true.
 	leaseExpiry time.Time
@@ -856,6 +857,7 @@ func (r *raft) sendPreVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 		r.state = StateFollower
 		r.votedFor = ""
 		r.inPreVote = false
+		r.leaseExpiry = time.Time{}
 		r.persistTermAndVotedForLogged()
 		return
 	}
@@ -909,6 +911,7 @@ func (r *raft) sendVoteRequest(serverID ServerID, req *RequestVoteRequest) {
 		r.term = resp.Term
 		r.state = StateFollower
 		r.votedFor = ""
+		r.leaseExpiry = time.Time{}
 		r.persistTermAndVotedForLogged()
 		return
 	}
@@ -3289,6 +3292,7 @@ func (r *raft) handleRequestVote(req *RequestVoteRequest) *RequestVoteResponse {
 		r.failPendingFutures()
 		r.state = StateFollower
 		r.votedFor = ""
+		r.leaseExpiry = time.Time{}
 		metrics.RecordTerm(r.term)
 		r.persistTermAndVotedForLogged()
 	}
