@@ -16,6 +16,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"go.uber.org/zap"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -173,12 +174,16 @@ func buildClientOptions(cfg GCSConfig) ([]option.ClientOption, error) {
 		return opts, nil
 	}
 	if cfg.CredentialsFile != "" {
-		// Read and pass JSON directly; option.WithCredentialsFile is deprecated.
 		data, err := os.ReadFile(cfg.CredentialsFile)
 		if err != nil {
 			return nil, fmt.Errorf("reading credentials file %q: %w", cfg.CredentialsFile, err)
 		}
-		opts = append(opts, option.WithCredentialsJSON(data))
+		creds, err := google.CredentialsFromJSON(context.Background(), data,
+			storage.ScopeReadWrite, storage.ScopeFullControl)
+		if err != nil {
+			return nil, fmt.Errorf("parsing credentials from %q: %w", cfg.CredentialsFile, err)
+		}
+		opts = append(opts, option.WithCredentials(creds))
 	}
 	// No options = ADC (Application Default Credentials). This is the
 	// recommended path for GKE Workload Identity and Cloud Run.

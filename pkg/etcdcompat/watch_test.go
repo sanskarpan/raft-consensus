@@ -89,9 +89,6 @@ func (m *mockWatchStream) SendMsg(v any) error          { return nil }
 // send enqueues a WatchRequest from the test side.
 func (m *mockWatchStream) send(req *pb.WatchRequest) { m.reqCh <- req }
 
-// closeRequests simulates the client closing the request stream.
-func (m *mockWatchStream) closeRequests() { close(m.reqCh) }
-
 // recv waits for the next WatchResponse with a timeout.
 func (m *mockWatchStream) recv(t *testing.T, timeout time.Duration) *pb.WatchResponse {
 	t.Helper()

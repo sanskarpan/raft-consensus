@@ -65,7 +65,7 @@ func (s *WatchServer) Watch(stream pb.Watch_WatchServer) error {
 	// sessions maps etcdWatchID → active watchSession for this stream.
 	sessions := make(map[int64]*watchSession)
 
-	// sendCh serialises WatchResponse writes from multiple forwarding goroutines.
+	// sendCh serializes WatchResponse writes from multiple forwarding goroutines.
 	sendCh := make(chan *pb.WatchResponse, 256)
 
 	// doneCh is closed when the stream ends to signal forwarder goroutines to

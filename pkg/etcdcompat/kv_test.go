@@ -526,13 +526,6 @@ func kvKeys(kvs []*pb.KeyValue) []string {
 	return out
 }
 
-// fsmKVValue is a nil-safe value accessor for fsm.KeyValue used in error messages.
-func fsmKVValue(kv *fsm.KeyValue) string {
-	if kv == nil {
-		return "<nil>"
-	}
-	return kv.Value
-}
 
 // ---------------------------------------------------------------------------
 // Helper used to encode txn for integration assertion
