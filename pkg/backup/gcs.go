@@ -8,15 +8,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path"
 	"sort"
 	"strings"
 	"time"
 
+	authcreds "cloud.google.com/go/auth/credentials"
 	"cloud.google.com/go/storage"
 	"go.uber.org/zap"
-	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 )
@@ -174,16 +173,14 @@ func buildClientOptions(cfg GCSConfig) ([]option.ClientOption, error) {
 		return opts, nil
 	}
 	if cfg.CredentialsFile != "" {
-		data, err := os.ReadFile(cfg.CredentialsFile)
+		creds, err := authcreds.DetectDefault(&authcreds.DetectOptions{
+			Scopes:          []string{storage.ScopeReadWrite, storage.ScopeFullControl},
+			CredentialsFile: cfg.CredentialsFile,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("reading credentials file %q: %w", cfg.CredentialsFile, err)
+			return nil, fmt.Errorf("loading credentials from %q: %w", cfg.CredentialsFile, err)
 		}
-		creds, err := google.CredentialsFromJSON(context.Background(), data,
-			storage.ScopeReadWrite, storage.ScopeFullControl)
-		if err != nil {
-			return nil, fmt.Errorf("parsing credentials from %q: %w", cfg.CredentialsFile, err)
-		}
-		opts = append(opts, option.WithCredentials(creds))
+		opts = append(opts, option.WithAuthCredentials(creds))
 	}
 	// No options = ADC (Application Default Credentials). This is the
 	// recommended path for GKE Workload Identity and Cloud Run.
