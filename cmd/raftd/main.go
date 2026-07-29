@@ -30,6 +30,7 @@ import (
 	"github.com/sanskarpan/raft-consensus/pkg/etcdcompat"
 	"github.com/sanskarpan/raft-consensus/pkg/fsm"
 	"github.com/sanskarpan/raft-consensus/pkg/metrics"
+	multiraftpkg "github.com/sanskarpan/raft-consensus/pkg/multiraft"
 	"github.com/sanskarpan/raft-consensus/pkg/raft"
 	"github.com/sanskarpan/raft-consensus/pkg/storage"
 	"github.com/sanskarpan/raft-consensus/pkg/tracing"
@@ -192,6 +193,12 @@ type Config struct {
 	// against the raft-consensus cluster.
 	// Leave empty (the default) to disable the compatibility layer.
 	EtcdListenAddr string `yaml:"etcd_listen_addr"`
+
+	// Groups, when non-empty, enables multi-Raft horizontal key-range
+	// partitioning. Each entry configures one shard. When this field is set the
+	// single-group Raft initialization is skipped; all KV/Watch/Txn operations
+	// are routed through MultiRaft instead.
+	Groups []multiraftpkg.GroupConfig `yaml:"groups"`
 }
 
 type ClusterMember struct {
@@ -404,6 +411,7 @@ type Server struct {
 	reloadTLS       func() error      // #204: reload TLS certs on SIGHUP (nil if no TLS)
 	kv              *fsm.KVStore      // direct FSM reference for stale reads and watches
 	watchMgr        *fsm.WatchManager // SSE event fan-out
+	multiRaft       *multiraftpkg.MultiRaft // non-nil when multi-Raft mode is active
 	uploader        backup.Uploader   // pluggable snapshot uploader (#216)
 	watchCtxCancel  context.CancelFunc
 	sweepCancel     context.CancelFunc      // cancels sweepPerIPLimiters goroutine on shutdown
@@ -750,6 +758,21 @@ func (s *Server) applyAllowedMembers(trans raft.Transport) {
 }
 
 func (s *Server) initRaft() error {
+	// Multi-Raft mode: when groups are configured, skip the single-group
+	// initialization entirely and wire all KV/Watch/Txn through MultiRaft.
+	if len(s.config.Groups) > 0 {
+		mr, err := multiraftpkg.New(s.config.Groups, s.config.DataDir, s.logger)
+		if err != nil {
+			return fmt.Errorf("multiraft init: %w", err)
+		}
+		if err := mr.Start(); err != nil {
+			mr.Stop()
+			return fmt.Errorf("multiraft start: %w", err)
+		}
+		s.multiRaft = mr
+		return nil
+	}
+
 	dataDir := s.config.DataDir
 	nodeDir := fmt.Sprintf("%s/%s", dataDir, s.config.NodeID)
 
@@ -1182,6 +1205,12 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("/v1/watch", instrument("v1_watch", s.authMiddleware(s.handleV1Watch)))
 	mux.HandleFunc("/v1/status", instrument("v1_status", s.authMiddleware(s.handleV1Status)))
 
+	// Multi-Raft shard topology — requires read role so dashboards can inspect
+	// shard layout without full admin credentials.
+	if s.multiRaft != nil {
+		mux.HandleFunc("/admin/groups", instrument("admin_groups", s.requireRole("read", s.handleAdminGroups)))
+	}
+
 	return mux
 }
 
@@ -1362,8 +1391,14 @@ func (s *Server) Shutdown() {
 		s.etcdServer.Stop()
 	}
 
-	if err := s.raftNode.Shutdown(); err != nil {
-		s.logger.Error("raft shutdown error", zap.Error(err))
+	if s.multiRaft != nil {
+		s.multiRaft.Stop()
+	}
+
+	if s.raftNode != nil {
+		if err := s.raftNode.Shutdown(); err != nil {
+			s.logger.Error("raft shutdown error", zap.Error(err))
+		}
 	}
 
 	// Stop SPIFFE workload identity source — this terminates the background
@@ -2893,4 +2928,21 @@ func (g *grpcHandlerWrapper) HandleInstallSnapshot(req *proto.InstallSnapshotReq
 func (g *grpcHandlerWrapper) HandleTimeoutNow(_ *proto.TimeoutNowRequest) *proto.TimeoutNowResponse {
 	g.raftWrapper.HandleTimeoutNow(nil)
 	return &proto.TimeoutNowResponse{}
+}
+
+// handleAdminGroups serves GET /admin/groups and returns the current topology
+// of all multi-Raft shards as a JSON array of GroupInfo objects.
+// It requires the "read" role so dashboards can inspect shard layout without
+// needing full admin credentials.
+func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.multiRaft == nil {
+		w.WriteHeader(http.StatusNotFound)
+		writeJSON(w, map[string]string{"error": "multi-Raft not enabled"})
+		return
+	}
+	writeJSON(w, s.multiRaft.Groups())
 }
