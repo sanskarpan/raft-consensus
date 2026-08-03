@@ -5,7 +5,7 @@ go 1.25.0
 toolchain go1.26.5
 
 require (
-	cloud.google.com/go/auth v0.20.0
+	cloud.google.com/go/auth v0.22.0
 	cloud.google.com/go/storage v1.64.0
 	github.com/anishathalye/porcupine v1.3.0
 	github.com/minio/minio-go/v7 v7.2.1
