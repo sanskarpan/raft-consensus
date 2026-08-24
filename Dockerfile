@@ -13,7 +13,7 @@
 # Dependabot's docker ecosystem (see .github/dependabot.yml) keeps this current.
 # Run the builder on the native BUILDPLATFORM and cross-compile to the requested
 # TARGETOS/TARGETARCH, so multi-arch (amd64+arm64) images build fast without QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine AS builder
 WORKDIR /app
 
 # Download dependencies first (better layer caching)
